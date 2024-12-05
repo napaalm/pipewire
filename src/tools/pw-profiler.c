@@ -61,6 +61,7 @@ struct measurement {
 	int64_t signal;
 	int64_t awake;
 	int64_t finish;
+	int64_t run_time;
 	int32_t status;
 	struct spa_fraction latency;
 	int32_t xrun_count;
@@ -175,6 +176,7 @@ static int process_driver_block(struct data *d, const struct spa_pod *pod, struc
 			SPA_POD_Long(&driver.signal),
 			SPA_POD_Long(&driver.awake),
 			SPA_POD_Long(&driver.finish),
+			SPA_POD_Long(&driver.run_time),
 			SPA_POD_Int(&driver.status),
 			SPA_POD_Fraction(&driver.latency),
 			SPA_POD_Int(&driver.xrun_count))) < 0)
@@ -245,6 +247,7 @@ static int process_follower_block(struct data *d, const struct spa_pod *pod, str
 			SPA_POD_Long(&m.signal),
 			SPA_POD_Long(&m.awake),
 			SPA_POD_Long(&m.finish),
+			SPA_POD_Long(&m.run_time),
 			SPA_POD_Int(&m.status),
 			SPA_POD_Fraction(&m.latency),
 			SPA_POD_Int(&m.xrun_count))) < 0)

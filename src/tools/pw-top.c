@@ -42,6 +42,7 @@ struct measurement {
 	int64_t signal;
 	int64_t awake;
 	int64_t finish;
+	int64_t run_time;
 	struct spa_fraction latency;
 	uint32_t xrun_count;
 	bool async;
@@ -385,6 +386,7 @@ static int process_driver_block(struct data *d, const struct spa_pod *pod, struc
 			SPA_POD_Long(&m.signal),
 			SPA_POD_Long(&m.awake),
 			SPA_POD_Long(&m.finish),
+			SPA_POD_Long(&m.run_time),
 			SPA_POD_Int(&m.status),
 			SPA_POD_Fraction(&m.latency),
 			SPA_POD_OPT_Int(&m.xrun_count))) < 0)
@@ -418,6 +420,7 @@ static int process_follower_block(struct data *d, const struct spa_pod *pod, str
 			SPA_POD_Long(&m.signal),
 			SPA_POD_Long(&m.awake),
 			SPA_POD_Long(&m.finish),
+			SPA_POD_Long(&m.run_time),
 			SPA_POD_Int(&m.status),
 			SPA_POD_Fraction(&m.latency),
 			SPA_POD_OPT_Int(&m.xrun_count),
@@ -497,7 +500,9 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	char buf2[64];
 	char buf3[64];
 	char buf4[64];
-	uint64_t waiting, busy;
+	char buf5[64];
+	char buf6[64];
+	uint64_t waiting, busy, run_time;
 	float quantum;
 	struct spa_fraction frac;
 	bool active;
@@ -523,21 +528,24 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	else
 		waiting = -1;
 
-	if (n->measurement.finish >= n->measurement.awake)
+	if (n->measurement.finish >= n->measurement.awake) {
 		busy = n->measurement.finish - n->measurement.awake;
-	else if (n->measurement.awake > n->measurement.prev_signal)
-		busy = -2;
+		run_time = n->measurement.run_time;
+	} else if (n->measurement.awake > n->measurement.prev_signal)
+		run_time = busy = -2;
 	else
-		busy = -1;
+		run_time = busy = -1;
 
-	print_mode_dependent(d, y, 0, "%s %4.1u %6.1u %6.1u %s %s %s %s  %3.1u %16.16s %s%s",
+	print_mode_dependent(d, y, 0, "%s %4.1u %6.1u %6.1u %s %s %s %s %s %s  %3.1u %16.16s %s%s",
 			state_as_string(n->state, i->transport_state),
 			n->id,
 			frac.num, frac.denom,
 			print_time(buf1, active, 64, waiting),
 			print_time(buf2, active, 64, busy),
-			print_perc(buf3, active, 64, waiting, quantum),
-			print_perc(buf4, active, 64, busy, quantum),
+			print_time(buf3, active, 64, run_time),
+			print_perc(buf4, active, 64, waiting, quantum),
+			print_perc(buf5, active, 64, busy, quantum),
+			print_perc(buf6, active, 64, run_time, quantum),
 			n->measurement.xrun_count == XRUN_INVALID ?
 					i->xrun_count - dr->info_base :
 					n->measurement.xrun_count - n->measurement_base,
@@ -553,7 +561,7 @@ static void clear_node(struct node *n)
 	spa_zero(n->info);
 }
 
-#define HEADER	"S   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME "
+#define HEADER	"S   ID  QUANT   RATE    WAIT    BUSY RUNTIME   W/Q   B/Q   R/Q  ERR FORMAT           NAME "
 
 static void do_refresh(struct data *d, bool force_refresh)
 {
