@@ -51,6 +51,7 @@ enum spa_profiler {
 							  *      Long : driver signal,
 							  *      Long : driver awake,
 							  *      Long : driver finish,
+							  *      Long : driver effective run time,
 							  *      Int : driver status,
 							  *      Fraction : latency,
 							  *      Int : xrun_count))  */
@@ -64,6 +65,7 @@ enum spa_profiler {
 							  *      Long : signal,
 							  *      Long : awake,
 							  *      Long : finish,
+							  *      Long : effective run time,
 							  *      Int : status,
 							  *      Fraction : latency,
 							  *      Int : xrun_count))
