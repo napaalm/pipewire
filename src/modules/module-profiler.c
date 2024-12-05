@@ -216,6 +216,7 @@ static void context_do_profile(void *data)
 			SPA_POD_Long(a->signal_time),
 			SPA_POD_Long(a->awake_time),
 			SPA_POD_Long(a->finish_time),
+			SPA_POD_Long(a->finish_cputime - a->awake_cputime),
 			SPA_POD_Int(a->status),
 			SPA_POD_Fraction(&node->latency),
 			SPA_POD_Int(a->xrun_count));
@@ -249,6 +250,7 @@ static void context_do_profile(void *data)
 			SPA_POD_Long(n->async ? na->prev_signal_time : na->signal_time),
 			SPA_POD_Long(n->async ? na->prev_awake_time : na->awake_time),
 			SPA_POD_Long(n->async ? na->prev_finish_time : na->finish_time),
+			SPA_POD_Long(n->async ? na->prev_run_time : na->finish_cputime - na->awake_cputime),
 			SPA_POD_Int(na->status),
 			SPA_POD_Fraction(&latency),
 			SPA_POD_Int(na->xrun_count));

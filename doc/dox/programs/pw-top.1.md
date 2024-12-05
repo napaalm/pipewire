@@ -114,6 +114,15 @@ A value of \-\-- means that the node was not started. A value of +++
 means that the node was started but did not complete.
 \endparblock
 
+\par RUNTIME
+\parblock
+The actual time spent processing the node, excluding other tasks
+which might have been scheduled in the meantime.
+
+A value of \-\-- means that the node was not started. A value of +++
+means that the node was started but did not complete.
+\endparblock
+
 \par W/Q
 \parblock
 Ratio of WAIT / QUANT.
@@ -134,6 +143,16 @@ This is a good measure of the load of a particular driver or
 follower node.
 
 Values of \-\-- and +++ are copied from the BUSY column.
+\endparblock
+
+\par R/Q
+\parblock
+Ratio of RUNTIME / QUANT
+
+This is a better measure of the load of a particular driver or
+follower node.
+
+Values of \-\-- are copied from the RUNTIME column.
 \endparblock
 
 \par ERR

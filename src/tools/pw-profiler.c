@@ -57,6 +57,7 @@ struct measurement {
 	int64_t signal;
 	int64_t awake;
 	int64_t finish;
+	int64_t run_time;
 	int32_t status;
 };
 
@@ -107,6 +108,7 @@ static int process_driver_block(struct data *d, const struct spa_pod *pod, struc
 			SPA_POD_Long(&driver.signal),
 			SPA_POD_Long(&driver.awake),
 			SPA_POD_Long(&driver.finish),
+			SPA_POD_Long(&driver.run_time),
 			SPA_POD_Int(&driver.status))) < 0)
 		return res;
 
@@ -163,6 +165,7 @@ static int process_follower_block(struct data *d, const struct spa_pod *pod, str
 			SPA_POD_Long(&m.signal),
 			SPA_POD_Long(&m.awake),
 			SPA_POD_Long(&m.finish),
+			SPA_POD_Long(&m.run_time),
 			SPA_POD_Int(&m.status))) < 0)
 		return res;
 
