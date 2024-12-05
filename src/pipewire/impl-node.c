@@ -12,6 +12,13 @@
 #include <time.h>
 #include <malloc.h>
 #include <limits.h>
+#include <sys/syscall.h>
+#if defined(__FreeBSD__) || defined(__MidnightBSD__)
+#include <sys/thr.h>
+#endif
+#if defined(__GNU__)
+#include <hurd.h>
+#endif
 
 #include <spa/support/system.h>
 #include <spa/pod/parser.h>
@@ -69,6 +76,7 @@ static const char * const global_keys[] = {
 	PW_KEY_NODE_NAME,
 	PW_KEY_NODE_NICK,
 	PW_KEY_NODE_SESSION,
+	PW_KEY_NODE_LOOP_TID,
 	PW_KEY_MEDIA_CLASS,
 	PW_KEY_MEDIA_TYPE,
 	PW_KEY_MEDIA_CATEGORY,
@@ -95,6 +103,24 @@ struct resource_data {
 	int end;
 	struct spa_hook listener;
 };
+
+static pid_t _gettid(void)
+{
+#if defined(HAVE_GETTID)
+	return (pid_t) gettid();
+#elif defined(__linux__)
+	return syscall(SYS_gettid);
+#elif defined(__FreeBSD__) || defined(__MidnightBSD__)
+	long tid;
+	thr_self(&tid);
+	return (pid_t)tid;
+#elif defined(__GNU__)
+       mach_port_t thread = hurd_thread_self();
+       return (pid_t)thread;
+#else
+#error "No gettid impl"
+#endif
+}
 
 SPA_EXPORT
 struct pw_node_peer *pw_node_peer_ref(struct pw_impl_node *onode, struct pw_impl_node *inode)
@@ -1623,6 +1649,17 @@ static void reset_position(struct pw_impl_node *this, struct spa_io_position *po
 		reset_segment(&pos->segments[i]);
 }
 
+static int do_gettid(struct spa_loop *loop,
+                bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct pw_properties *props = user_data;
+
+	pid_t tid = _gettid();
+	pw_properties_setf(props, PW_KEY_NODE_LOOP_TID, "%d", tid);
+
+	return 0;
+}
+
 SPA_EXPORT
 struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 			    struct pw_properties *properties,
@@ -1659,6 +1696,13 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 		pw_log_error("can't find data-loop");
 		res = -ENOENT;
 		goto error_clean;
+	}
+
+	if (this->data_loop != context->main_loop) {
+		pw_loop_invoke(this->data_loop,
+				do_gettid, SPA_ID_INVALID, NULL, 0, true, properties);
+	} else {
+		pw_properties_set(properties, PW_KEY_NODE_LOOP_TID, NULL);
 	}
 
 	if (user_data_size > 0)

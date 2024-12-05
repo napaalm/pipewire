@@ -207,6 +207,7 @@ extern "C" {
 #define PW_KEY_NODE_ASYNC		"node.async"		/**< the node wants async scheduling */
 #define PW_KEY_NODE_LOOP_NAME		"node.loop.name"	/**< the loop name fnmatch pattern to run in */
 #define PW_KEY_NODE_LOOP_CLASS		"node.loop.class"	/**< the loop class fnmatch pattern to run in */
+#define PW_KEY_NODE_LOOP_TID		"node.loop.tid"		/**< the tid of the loop it's running in */
 #define PW_KEY_NODE_STREAM		"node.stream"		/**< node is a stream, the server side should
 								  *  add a converter */
 #define PW_KEY_NODE_VIRTUAL		"node.virtual"		/**< the node is some sort of virtual
