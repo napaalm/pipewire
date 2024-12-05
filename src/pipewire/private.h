@@ -599,7 +599,12 @@ struct pw_node_activation {
 							 * CAS their node id in this array. */
 	uint64_t prev_awake_time;
 	uint64_t prev_finish_time;
-	uint32_t padding[7];				/* must be 0 */
+
+	uint64_t awake_cputime;				/* cputime of last awake to calculate effective run time */
+	uint64_t finish_cputime;			/* cputime of last finish to calculate effective run time */
+	uint64_t prev_run_time;				/* effective run time of previous cycle */
+
+	uint32_t padding[1];				/* must be 0 */
 
 	uint32_t client_version;			/* verions of client, see above */
 	uint32_t server_version;			/* verions of server, see above */
@@ -638,6 +643,13 @@ static inline uint64_t get_time_ns(struct spa_system *system)
 {
 	struct timespec ts;
 	spa_system_clock_gettime(system, CLOCK_MONOTONIC, &ts);
+	return SPA_TIMESPEC_TO_NSEC(&ts);
+}
+
+static inline uint64_t get_cputime_ns(struct spa_system *system)
+{
+	struct timespec ts;
+	spa_system_clock_gettime(system, CLOCK_THREAD_CPUTIME_ID, &ts);
 	return SPA_TIMESPEC_TO_NSEC(&ts);
 }
 

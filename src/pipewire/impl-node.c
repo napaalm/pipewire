@@ -1372,7 +1372,7 @@ static inline void debug_xrun_target(struct pw_impl_node *driver,
 		level = SPA_LOG_LEVEL_INFO;
 
 	pw_log(level, "(%s-%u) xrun state:%p pending:%d/%d s:%"PRIu64" a:%"PRIu64" f:%"PRIu64
-		" waiting:%"PRIu64" process:%"PRIu64" status:%s (%d suppressed)",
+		" waiting:%"PRIu64" process:%"PRIu64" runtime:%"PRIu64" status:%s (%d suppressed)",
 		t->name, t->id, state,
 		state->pending, state->required,
 		a->signal_time,
@@ -1380,6 +1380,7 @@ static inline void debug_xrun_target(struct pw_impl_node *driver,
 		a->finish_time,
 		a->awake_time - a->signal_time,
 		a->finish_time - a->awake_time,
+		a->finish_cputime - a->awake_cputime,
 		str_status(status), suppressed);
 }
 
@@ -1403,7 +1404,7 @@ static inline void debug_xrun_graph(struct pw_impl_node *driver, uint64_t nsec, 
 		if (status == PW_NODE_ACTIVATION_TRIGGERED ||
 		    status == PW_NODE_ACTIVATION_AWAKE) {
 			pw_log(level, "(%s-%u) xrun state:%p pending:%d/%d s:%"PRIu64" a:%"PRIu64" f:%"PRIu64
-					" waiting:%"PRIu64" process:%"PRIu64" status:%s",
+					" waiting:%"PRIu64" process:%"PRIu64" runtime:%"PRIu64" status:%s",
 					t->name, t->id, state,
 					state->pending, state->required,
 					a->signal_time,
@@ -1411,6 +1412,7 @@ static inline void debug_xrun_graph(struct pw_impl_node *driver, uint64_t nsec, 
 					a->finish_time,
 					a->awake_time - a->signal_time,
 					a->finish_time - a->awake_time,
+					a->finish_cputime - a->awake_cputime,
 					str_status(status));
 
 		}
@@ -1438,7 +1440,7 @@ static void debug_sync_timeout(struct pw_impl_node *driver, uint64_t nsec)
 			continue;
 
 		pw_log(level, "(%s-%u) sync state:%p pending:%d/%d s:%"PRIu64" a:%"PRIu64" f:%"PRIu64
-				" waiting:%"PRIu64" process:%"PRIu64" status:%s",
+				" waiting:%"PRIu64" process:%"PRIu64" runtime:%"PRIu64" status:%s",
 				t->name, t->id, state,
 				state->pending, state->required,
 				a->signal_time,
@@ -1446,6 +1448,7 @@ static void debug_sync_timeout(struct pw_impl_node *driver, uint64_t nsec)
 				a->finish_time,
 				a->awake_time - a->signal_time,
 				a->finish_time - a->awake_time,
+				a->finish_cputime - a->awake_cputime,
 				str_status(status));
 	}
 }
@@ -1454,7 +1457,7 @@ static inline void calculate_stats(struct pw_impl_node *this,  struct pw_node_ac
 {
 	uint64_t signal_time = a->signal_time;
 	uint64_t prev_signal_time = a->prev_signal_time;
-	uint64_t process_time = a->finish_time - a->signal_time;
+	uint64_t process_time = a->finish_cputime - a->awake_cputime;
 	uint64_t period_time = signal_time - prev_signal_time;
 
 	if (SPA_LIKELY(signal_time > prev_signal_time)) {
@@ -1465,9 +1468,8 @@ static inline void calculate_stats(struct pw_impl_node *this,  struct pw_node_ac
 	}
 	pw_log_trace_fp("%p: graph completed wait:%"PRIu64" run:%"PRIu64
 			" busy:%"PRIu64" period:%"PRIu64" cpu:%f:%f:%f", this,
-			a->awake_time - signal_time,
-			a->finish_time - a->awake_time,
-			process_time, period_time,
+			a->awake_time - signal_time, process_time,
+			a->finish_time - a->signal_time, period_time,
 			a->cpu_load[0], a->cpu_load[1], a->cpu_load[2]);
 }
 
@@ -1476,7 +1478,7 @@ static inline void calculate_stats(struct pw_impl_node *this,  struct pw_node_ac
  *
  * This code runs on the client and the server, depending on where the node is.
  */
-static inline int process_node(void *data, uint64_t nsec)
+static inline int process_node(void *data, uint64_t nsec, uint64_t cpu_nsec)
 {
 	struct pw_impl_node *this = data;
 	struct pw_impl_port *p;
@@ -1491,6 +1493,7 @@ static inline int process_node(void *data, uint64_t nsec)
 		return 0;
 
 	a->awake_time = nsec;
+	a->awake_cputime = cpu_nsec;
 	pw_log_trace_fp("%p: %s-%d process remote:%u exported:%u %"PRIu64" %"PRIu64,
 			this, this->name, this->info.id, this->remote, this->exported,
 			a->signal_time, nsec);
@@ -1522,10 +1525,12 @@ static inline int process_node(void *data, uint64_t nsec)
 	a->state[0].status = status;
 
 	nsec = get_time_ns(data_system);
+	cpu_nsec = get_cputime_ns(data_system);
 	was_awake = SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_AWAKE,
 				PW_NODE_ACTIVATION_FINISHED);
 	a->finish_time = nsec;
+	a->finish_cputime = cpu_nsec;
 
 	pw_log_trace_fp("%p: finished status:%d %"PRIu64" was_awake:%d",
 			this, status, nsec, was_awake);
@@ -1564,10 +1569,11 @@ static void node_on_fd_events(struct spa_source *source)
 		return;
 	}
 	if (SPA_LIKELY(source->rmask & SPA_IO_IN)) {
-		uint64_t cmd, nsec;
+		uint64_t cmd, nsec, cpu_nsec;
 		struct spa_system *data_system = this->rt.target.system;
 
 		nsec = get_time_ns(data_system);
+		cpu_nsec = get_cputime_ns(data_system);
 
 		if (SPA_UNLIKELY(spa_system_eventfd_read(data_system, this->source.fd, &cmd) < 0))
 			pw_log_warn("%p: read failed %m", this);
@@ -1582,7 +1588,7 @@ static void node_on_fd_events(struct spa_source *source)
 				this, this->remote, this->exported, this->name, this->info.id,
 				nsec);
 
-		process_node(this, nsec);
+		process_node(this, nsec, cpu_nsec);
 	}
 }
 
@@ -2077,7 +2083,7 @@ static int node_ready(void *data, int status)
 	struct spa_io_clock *cl = &node->rt.position->clock;
 	int sync_type, all_ready, update_sync, target_sync, old_status;
 	uint32_t owner[2], reposition_owner, pending;
-	uint64_t min_timeout = UINT64_MAX, nsec;
+	uint64_t min_timeout = UINT64_MAX, nsec, cpu_nsec;
 
 	pw_log_trace_fp("%p: ready driver:%d exported:%d %p status:%d prepared:%d", node,
 			node->driver, node->exported, driver, status, node->rt.prepared);
@@ -2096,6 +2102,7 @@ static int node_ready(void *data, int status)
 	}
 
 	nsec = get_time_ns(data_system);
+	cpu_nsec = get_cputime_ns(data_system);
 
 	while (true) {
 		old_status = SPA_ATOMIC_LOAD(a->status);
@@ -2113,7 +2120,7 @@ static int node_ready(void *data, int status)
 				pw_impl_node_rt_emit_incomplete(driver);
 			}
 			SPA_FLAG_SET(cl->flags, SPA_IO_CLOCK_FLAG_XRUN_RECOVER);
-			process_node(node, nsec);
+			process_node(node, nsec, cpu_nsec);
 			SPA_FLAG_CLEAR(cl->flags, SPA_IO_CLOCK_FLAG_XRUN_RECOVER);
 			break;
 		}
@@ -2186,6 +2193,7 @@ retry_status:
 		ta->prev_signal_time = ta->signal_time;
 		ta->prev_awake_time = ta->awake_time;
 		ta->prev_finish_time = ta->finish_time;
+		ta->prev_run_time = ta->finish_cputime - ta->awake_cputime;
 	}
 
 	node->driver_start = nsec;
