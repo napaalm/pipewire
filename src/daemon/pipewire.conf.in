@@ -23,10 +23,11 @@ context.properties = {
     #cpu.zero.denormals                    = false
     #rlimit.nofile                         = -1
 
-    #loop.rt-prio = -1            # -1 = use module-rt prio, 0 disable rt
+    #loop.rt-prio = -1                  # -1 = use module-rt prio, 0 disable rt
     #loop.class = data.rt
-    #thread.affinity = [ 0 1 ]    # optional array of CPUs
-    #context.num-data-loops = 1   # -1 = num-cpus, 0 = no data loops
+    #thread.affinity = [ 0 1 ]          # optional array of CPUs
+    #context.dynamic-data-loops = false # create a new data loop for each node
+    #context.num-data-loops = 1         # -1 = num-cpus, 0 = no data loops
     #
     #context.data-loops = [
     #    {   loop.rt-prio = -1

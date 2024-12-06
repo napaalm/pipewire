@@ -51,6 +51,8 @@ struct data_loop {
 	bool autostart;
 	bool started;
 	uint64_t last_used;
+	int ref;
+	struct spa_list link;
 };
 
 /** \cond */
@@ -65,6 +67,9 @@ struct impl {
 
 	uint32_t n_data_loops;
 	struct data_loop data_loops[MAX_LOOPS];
+
+	bool dynamic_data_loops;
+	struct spa_list dynamic_data_loop_list;
 };
 
 
@@ -201,6 +206,11 @@ static int setup_data_loops(struct impl *impl)
 	int res = 0;
 
 	pr = pw_properties_copy(this->properties);
+
+	if (pw_properties_get_bool(this->properties, "context.dynamic-data-loops", false)) {
+		spa_list_init(&impl->dynamic_data_loop_list);
+		impl->dynamic_data_loops = true;
+	}
 
 	lib_name = pw_properties_get(this->properties, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM);
 
@@ -617,6 +627,7 @@ void pw_context_destroy(struct pw_context *context)
 	struct factory_entry *entry;
 	struct pw_impl_metadata *metadata;
 	struct pw_impl_core *core_impl;
+	struct data_loop *dl;
 	uint32_t i;
 
 	pw_log_debug("%p: destroy", context);
@@ -640,6 +651,10 @@ void pw_context_destroy(struct pw_context *context)
 	for (i = 0; i < impl->n_data_loops; i++)
 		data_loop_stop(impl, &impl->data_loops[i]);
 
+	if (impl->dynamic_data_loops)
+		spa_list_for_each(dl, &impl->dynamic_data_loop_list, link)
+			data_loop_stop(impl, dl);
+
 	spa_list_consume(module, &context->module_list, link)
 		pw_impl_module_destroy(module);
 
@@ -659,6 +674,15 @@ void pw_context_destroy(struct pw_context *context)
 		if (impl->data_loops[i].impl)
 			pw_data_loop_destroy(impl->data_loops[i].impl);
 
+	}
+
+	if (impl->dynamic_data_loops) {
+		spa_list_consume(dl, &impl->dynamic_data_loop_list, link) {
+			if (dl->impl)
+				pw_data_loop_destroy(dl->impl);
+			spa_list_remove(&dl->link);
+			free(dl);
+		}
 	}
 
 	if (context->pool)
@@ -786,6 +810,47 @@ static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *nam
 	return best_loop->impl;
 }
 
+static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const char *name, const char *klass)
+{
+	struct pw_properties *pr;
+	struct data_loop *dl = NULL;
+	int res;
+
+	pr = pw_properties_copy(impl->this.properties);
+
+	if (name)
+		pw_properties_set(pr, SPA_KEY_THREAD_NAME, name);
+	if (klass)
+		pw_properties_set(pr, PW_KEY_LOOP_CLASS, klass);
+
+	dl = calloc(1, sizeof(struct data_loop));
+	dl->impl = pw_data_loop_new(&pr->dict);
+	if (dl->impl == NULL)  {
+		res = errno;
+		pw_data_loop_destroy(dl->impl);
+		free(dl);
+		errno = res;
+		return NULL;
+	}
+
+	pw_data_loop_set_thread_utils(dl->impl, impl->this.thread_utils);
+
+	spa_list_append(&impl->dynamic_data_loop_list, &dl->link);
+	pw_log_info("created dynamic data loop '%s'", dl->impl->loop->name);
+
+	dl->ref = 1;
+	if ((res = data_loop_start(impl, dl)) < 0) {
+		errno = -res;
+		return NULL;
+	}
+
+	pw_log_info("%p: using name:'%s' class:'%s' ref:%d", impl,
+			dl->impl->loop->name,
+			dl->impl->class, dl->ref);
+
+	return dl->impl;
+}
+
 SPA_EXPORT
 struct pw_data_loop *pw_context_get_data_loop(struct pw_context *context)
 {
@@ -817,6 +882,23 @@ struct pw_loop *pw_context_acquire_loop(struct pw_context *context, const struct
 }
 
 SPA_EXPORT
+struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, const struct spa_dict *props, bool remote)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	const char *name, *klass;
+	struct pw_data_loop *loop;
+
+	if (!impl->dynamic_data_loops || remote)
+		return pw_context_acquire_loop(context, props);
+
+	name = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_NAME) : NULL;
+	klass = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
+
+	loop = acquire_dynamic_data_loop(impl, name, klass);
+	return loop ? loop->loop : NULL;
+}
+
+SPA_EXPORT
 void pw_context_release_loop(struct pw_context *context, struct pw_loop *loop)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
@@ -830,6 +912,40 @@ void pw_context_release_loop(struct pw_context *context, struct pw_loop *loop)
 			return;
 		}
 	}
+}
+
+SPA_EXPORT
+void pw_context_release_node_loop(struct pw_context *context, struct pw_loop *loop)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	struct data_loop *dl, *t;
+
+	if (!impl->dynamic_data_loops)
+		return pw_context_release_loop(context, loop);
+
+	spa_list_for_each_safe(dl, t, &impl->dynamic_data_loop_list, link) {
+		if (dl->impl->loop == loop) {
+			dl->ref--;
+
+			pw_log_info("release dynamic name:'%s' class:'%s' ref:%d",
+					dl->impl->loop->name, dl->impl->class, dl->ref);
+
+			if (dl->ref != 0) {
+				pw_log_warn("dynamic data loop '%s' has still ref > 0",
+						dl->impl->loop->name);
+				return;
+			}
+
+			pw_data_loop_stop(dl->impl);
+			pw_data_loop_destroy(dl->impl);
+			spa_list_remove(&dl->link);
+			free(dl);
+
+			return;
+		}
+	}
+
+	return pw_context_release_loop(context, loop);
 }
 
 SPA_EXPORT

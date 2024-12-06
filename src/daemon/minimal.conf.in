@@ -22,6 +22,8 @@ context.properties = {
     #log.level                             = 2
     #cpu.zero.denormals                    = false
 
+    #context.dynamic-data-loops = false
+
     core.daemon = true              # listening for socket connections
     core.name   = pipewire-0        # core name and socket name
 
