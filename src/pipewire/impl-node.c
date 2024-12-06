@@ -1694,7 +1694,7 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 
 	this->remote = pw_properties_get_bool(properties, PW_KEY_NODE_REMOTE, false);
 
-	this->data_loop = pw_context_acquire_loop(context, &properties->dict);
+	this->data_loop = pw_context_acquire_node_loop(context, &properties->dict, this->remote);
 	if (this->data_loop == NULL) {
 		pw_log_error("can't find data-loop");
 		res = -ENOENT;
@@ -1789,7 +1789,7 @@ error_clean:
 	if (this->source.fd != -1)
 		spa_system_close(this->data_loop->system, this->source.fd);
 	if (this->data_loop)
-		pw_context_release_loop(context, this->data_loop);
+		pw_context_release_node_loop(context, this->data_loop);
 	free(this->name);
 	free(impl);
 error_exit:
@@ -2535,7 +2535,7 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 	spa_system_close(node->rt.target.system, node->source.fd);
 
 	if (node->data_loop)
-		pw_context_release_loop(context, node->data_loop);
+		pw_context_release_node_loop(context, node->data_loop);
 
 	free(impl->group);
 	free(impl->link_group);

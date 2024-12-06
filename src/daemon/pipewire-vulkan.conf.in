@@ -16,6 +16,8 @@ context.properties = {
     #log.level                             = 4
     #cpu.zero.denormals                    = false
 
+    #context.dynamic-data-loops = false
+
     #default.clock.quantum-limit = 8192
 }
 
