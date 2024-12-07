@@ -75,6 +75,7 @@ static const char * const global_keys[] = {
 	PW_KEY_NODE_DESCRIPTION,
 	PW_KEY_NODE_NAME,
 	PW_KEY_NODE_NICK,
+	PW_KEY_NODE_REMOTE,
 	PW_KEY_NODE_SESSION,
 	PW_KEY_NODE_LOOP_TID,
 	PW_KEY_MEDIA_CLASS,
@@ -1690,6 +1691,8 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 		res = -errno;
 		goto error_clean;
 	}
+
+	this->remote = pw_properties_get_bool(properties, PW_KEY_NODE_REMOTE, false);
 
 	this->data_loop = pw_context_acquire_loop(context, &properties->dict);
 	if (this->data_loop == NULL) {
