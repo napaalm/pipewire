@@ -1764,6 +1764,7 @@ struct pw_impl_client_node *pw_impl_client_node_new(struct pw_resource *resource
 		goto error_exit_free;
 	}
 
+	pw_properties_setf(properties, PW_KEY_NODE_REMOTE, "%s", "true");
 	pw_properties_setf(properties, PW_KEY_CLIENT_ID, "%d", client->global->id);
 
 	this = &impl->this;

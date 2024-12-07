@@ -149,6 +149,7 @@ extern "C" {
 #define PW_KEY_NODE_PLUGGED		"node.plugged"		/**< when the node was created. As a uint64 in
 								  *  nanoseconds. */
 
+#define PW_KEY_NODE_REMOTE		"node.remote"		/**< "true" if the node is remote */
 #define PW_KEY_NODE_SESSION		"node.session"		/**< the session id this node is part of */
 #define PW_KEY_NODE_GROUP		"node.group"		/**< the group id this node is part of. Nodes
 								  *  in the same group are always scheduled
