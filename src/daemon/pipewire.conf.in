@@ -26,7 +26,7 @@ context.properties = {
     #loop.rt-prio = -1                  # -1 = use module-rt prio, 0 disable rt
     #loop.class = data.rt
     #thread.affinity = [ 0 1 ]          # optional array of CPUs
-    #context.dynamic-data-loops = false # create a new data loop for each node
+    #context.dynamic-data-loops = true  # create a new data loop for each node
     #context.num-data-loops = 1         # -1 = num-cpus, 0 = no data loops
     #
     #context.data-loops = [

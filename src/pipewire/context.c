@@ -207,7 +207,7 @@ static int setup_data_loops(struct impl *impl)
 
 	pr = pw_properties_copy(this->properties);
 
-	if (pw_properties_get_bool(this->properties, "context.dynamic-data-loops", false)) {
+	if (pw_properties_get_bool(this->properties, "context.dynamic-data-loops", true)) {
 		spa_list_init(&impl->dynamic_data_loop_list);
 		impl->dynamic_data_loops = true;
 	}
