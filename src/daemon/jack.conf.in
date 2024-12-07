@@ -15,7 +15,7 @@ context.properties = {
     #mem.mlock-all   = false
     log.level        = 0
 
-    #context.dynamic-data-loops = false
+    #context.dynamic-data-loops = true
 
     #default.clock.quantum-limit = 8192
 }

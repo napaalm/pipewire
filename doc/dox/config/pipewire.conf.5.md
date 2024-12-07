@@ -165,8 +165,8 @@ An array of classes of the data loops. Normally nodes are assigned to a loop by 
 Nodes are by default assigned to the data.rt class so it is good to have a data loop
 of this class as well.
 
-@PAR@ pipewire.conf  context.dynamic-data-loops = false
-If set to true, spawns a new data-loop for every node in the context.
+@PAR@ pipewire.conf  context.dynamic-data-loops = true
+If set to true (default), spawns a new data-loop for every node in the context.
 
 @PAR@ pipewire.conf  context.num-data-loops = 1
 The number of data loops to create. By default 1 data-loop is created and all nodes are
