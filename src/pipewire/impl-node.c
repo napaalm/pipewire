@@ -1478,13 +1478,14 @@ static inline void calculate_stats(struct pw_impl_node *this,  struct pw_node_ac
  *
  * This code runs on the client and the server, depending on where the node is.
  */
-static inline int process_node(void *data, uint64_t nsec, uint64_t cpu_nsec)
+static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_cpu_nsec)
 {
 	struct pw_impl_node *this = data;
 	struct pw_impl_port *p;
 	struct pw_node_activation *a = this->rt.target.activation;
 	struct spa_system *data_system = this->rt.target.system;
 	int status;
+	uint64_t nsec, cpu_nsec;
 	bool was_awake;
 
 	if (!SPA_ATOMIC_CAS(a->status,
@@ -1492,8 +1493,6 @@ static inline int process_node(void *data, uint64_t nsec, uint64_t cpu_nsec)
 				PW_NODE_ACTIVATION_AWAKE))
 		return 0;
 
-	a->awake_time = nsec;
-	a->awake_cputime = cpu_nsec;
 	pw_log_trace_fp("%p: %s-%d process remote:%u exported:%u %"PRIu64" %"PRIu64,
 			this, this->name, this->info.id, this->remote, this->exported,
 			a->signal_time, nsec);
@@ -1529,6 +1528,8 @@ static inline int process_node(void *data, uint64_t nsec, uint64_t cpu_nsec)
 	was_awake = SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_AWAKE,
 				PW_NODE_ACTIVATION_FINISHED);
+	a->awake_time = awake_nsec;
+	a->awake_cputime = awake_cpu_nsec;
 	a->finish_time = nsec;
 	a->finish_cputime = cpu_nsec;
 
