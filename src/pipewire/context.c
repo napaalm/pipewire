@@ -882,20 +882,24 @@ struct pw_loop *pw_context_acquire_loop(struct pw_context *context, const struct
 }
 
 SPA_EXPORT
-struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, const struct spa_dict *props, bool remote)
+struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct pw_properties *props, bool remote)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
 	const char *name, *klass;
 	struct pw_data_loop *loop;
 
 	if (!impl->dynamic_data_loops || remote)
-		return pw_context_acquire_loop(context, props);
+		return pw_context_acquire_loop(context, &props->dict);
 
-	name = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_NAME) : NULL;
-	klass = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
+	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
+	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
 
 	loop = acquire_dynamic_data_loop(impl, name, klass);
-	return loop ? loop->loop : NULL;
+	if (loop) {
+		pw_properties_set(props, PW_KEY_NODE_LOOP_DYNAMIC, "true");
+		return loop->loop;
+	} else
+		return NULL;
 }
 
 SPA_EXPORT

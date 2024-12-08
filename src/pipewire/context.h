@@ -138,7 +138,7 @@ struct pw_data_loop *pw_context_get_data_loop(struct pw_context *context);
  * Since 1.1.0 */
 struct pw_loop *pw_context_acquire_loop(struct pw_context *context, const struct spa_dict *props);
 /** Get a data-loop for a node. */
-struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, const struct spa_dict *props, bool remote);
+struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct pw_properties *props, bool remote);
 /** Release a data-loop.
  * Since 1.1.0 */
 void pw_context_release_loop(struct pw_context *context, struct pw_loop *loop);
