@@ -78,6 +78,7 @@ static const char * const global_keys[] = {
 	PW_KEY_NODE_REMOTE,
 	PW_KEY_NODE_SESSION,
 	PW_KEY_NODE_LOOP_TID,
+	PW_KEY_NODE_LOOP_DYNAMIC,
 	PW_KEY_MEDIA_CLASS,
 	PW_KEY_MEDIA_TYPE,
 	PW_KEY_MEDIA_CATEGORY,
@@ -1694,7 +1695,7 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 
 	this->remote = pw_properties_get_bool(properties, PW_KEY_NODE_REMOTE, false);
 
-	this->data_loop = pw_context_acquire_node_loop(context, &properties->dict, this->remote);
+	this->data_loop = pw_context_acquire_node_loop(context, properties, this->remote);
 	if (this->data_loop == NULL) {
 		pw_log_error("can't find data-loop");
 		res = -ENOENT;
