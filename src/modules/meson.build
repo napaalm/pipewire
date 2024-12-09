@@ -9,6 +9,7 @@ module_sources = [
   'module-client-device.c',
   'module-client-node.c',
   'module-combine-stream.c',
+  'module-deadline.c',
   'module-echo-cancel.c',
   'module-example-filter.c',
   'module-example-sink.c',
@@ -90,6 +91,16 @@ pipewire_module_combine_stream = shared_library('pipewire-module-combine-stream'
   install_dir : modules_install_dir,
   install_rpath: modules_install_dir,
   dependencies : [spa_dep, dl_lib, pipewire_dep],
+)
+
+pipewire_module_deadline = shared_library('pipewire-module-deadline',
+  [ 'module-deadline.c',
+    'module-deadline/dag.c' ],
+  include_directories : [configinc],
+  install : true,
+  install_dir : modules_install_dir,
+  install_rpath: modules_install_dir,
+  dependencies : [spa_dep, mathlib, dl_lib, pipewire_dep],
 )
 
 pipewire_module_echo_cancel = shared_library('pipewire-module-echo-cancel',

@@ -123,6 +123,13 @@ context.modules = [
         condition = [ { module.rt = !false } ]
     }
 
+    { name = libpipewire-module-deadline
+        args = {
+            cpus.available   = [ 0 1 2 3 ]
+            cpus.utilization = 0.95
+        }
+    }
+
     # The native communication protocol.
     { name = libpipewire-module-protocol-native
         args = {
