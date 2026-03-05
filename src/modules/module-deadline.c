@@ -1,5 +1,5 @@
 /* PipeWire */
-/* SPDX-FileCopyrightText: Copyright © 2024 Antonio Napolitano */
+/* SPDX-FileCopyrightText: Copyright © 2024 Antonio Napolitano and Francesco Barcherini */
 /* SPDX-License-Identifier: MIT */
 /***
   Permission is hereby granted, free of charge, to any person
@@ -103,7 +103,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 			"( cpu.utilization=<percentage> ) "
 
 static const struct spa_dict_item module_props[] = {
-	{ PW_KEY_MODULE_AUTHOR, "Antonio Napolitano <antonio.napolitano@santannapisa.it>" },
+	{ PW_KEY_MODULE_AUTHOR, "Antonio Napolitano <antonio.napolitano@santannapisa.it> and Francesco Barcherini <francesco.barcherini@santannapisa.it>" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Use SCHED_DEADLINE for processing threads" },
 	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
@@ -244,6 +244,7 @@ static void recalc_params(void *data)
 	struct pw_impl_node *node = n->node;
 	struct impl *impl = n->impl;
 	struct pw_node_target *t;
+	struct pw_impl_node *node2;
 	bool abort = false;
 
 	if (node->target_rate.denom == 0 || node->target_quantum == 0)
@@ -254,10 +255,8 @@ static void recalc_params(void *data)
 	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
-		struct pw_impl_node *node = t->node, *node2;
+		struct pw_impl_node *node = t->node;
 		struct pw_node_activation *na;
-		struct pw_impl_port *p;
-		struct pw_impl_link *l;
 		pid_t tid = -1;
 
 		struct node *n = find_node(impl, node);
@@ -298,6 +297,12 @@ static void recalc_params(void *data)
 		}
 
 		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid);
+	}
+
+	spa_list_for_each(t, &node->rt.target_list, link) {
+		struct pw_impl_node *node = t->node;
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
 		spa_list_for_each(p, &node->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
 				node2 = l->input->node;
@@ -305,7 +310,7 @@ static void recalc_params(void *data)
 				dag_add_edge(dag, node->info.id, node2->info.id);
 			}
 		}
-
+		
 	}
 
 	if (!abort) {
