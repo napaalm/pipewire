@@ -8,7 +8,7 @@
  * T. Cucinotta, A. Amory, G. Ara, F. Paladino, M. Di Natale
  * https://doi.org/10.1145/3592609
  *
- * Copyright (C) 2024 Antonio Napolitano
+ * Copyright (C) 2024 Antonio Napolitano and Francesco Barcherini
  */
 
 #include <stdio.h>
@@ -209,7 +209,7 @@ typedef struct {
 
 static node_array_t dag_nodes_to_array(dag_t *g)
 {
-	int count = dag_list_len(&g->nodes);
+	size_t count = dag_list_len(&g->nodes);
 
 	node_array_t arr;
 	arr.count = count;
@@ -290,7 +290,7 @@ static int topological_sort(dag_t *g, dag_node_t **out)
 
 static void find_sources_and_sinks(dag_t *g, dag_node_t ***sources, int *nsources, dag_node_t ***sinks, int *nsinks)
 {
-	int count = dag_list_len(&g->nodes);
+	size_t count = dag_list_len(&g->nodes);
 
 	dag_node_t **sarr = calloc(count, sizeof(*sarr));
 	dag_node_t **tarr = calloc(count, sizeof(*tarr));
@@ -342,12 +342,10 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	}
 
 	uint64_t *dist = calloc(length, sizeof(uint64_t));
+	dist[src_idx] = topo[src_idx]->wcet;
 	int *parent = malloc(length * sizeof(int));
 	for (int i=0; i<length; i++) parent[i] = -1;
-
-	for (int i=0; i<length; i++)
-		dist[i] = (i == src_idx) ? topo[i]->wcet : 0;
-
+	
 	for (int i=src_idx; i<=dst_idx; i++) {
 		dag_node_t *u = topo[i];
 		dag_edge_t *e;
@@ -416,7 +414,14 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	if (path_len == 0 || L == 0) {
 		/* No path */
 		free(P);
-		return 0;
+		return -1;
+	}
+
+	uint64_t D_orig = D;
+	bool *excluded = calloc((size_t)path_len, sizeof(*excluded));
+	if (!excluded) {
+		free(P);
+		return -1;
 	}
 
 	bool changed = true;
@@ -424,16 +429,21 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 		changed = false;
 		double D_d = (double)D;
 		double L_d = (double)L;
+		if (D_d <= 0.0 || L_d <= 0.0)
+			break;
 
 		for (int i=0; i<path_len; i++) {
+			if (excluded[i])
+				continue;
+
 			dag_node_t *ni = P[i];
 			uint64_t C_i = ni->wcet;
 			uint64_t d_prime = (uint64_t)floor(D_d * ((double)C_i / L_d));
-			if (d_prime == 0) d_prime = 1;
 
 			if (ni->deadline_assigned && ni->deadline < d_prime) {
-				D -= ni->deadline;
-				L -= C_i;
+				D = (D > ni->deadline) ? (D - ni->deadline) : 0;
+				L = (L > C_i) ? (L - C_i) : 0;
+				excluded[i] = true;
 				changed = true;
 				break;
 			}
@@ -443,59 +453,56 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	double D_d = (double)D;
 	double L_d = (double)L;
 
-	uint64_t d_src = 0;
-	uint64_t d_dst = 0;
-
-	for (int i=0; i<path_len; i++) {
-		dag_node_t *ni = P[i];
-		uint64_t C_i = ni->wcet;
-		uint64_t d_prime = (uint64_t)floor(D_d * ((double)C_i / L_d));
-		if (d_prime == 0) d_prime = 1;
-
-		if (i == 0) {
-			d_src = d_prime;
-		} else if (i == path_len -1) {
-			d_dst = d_prime;
-		}
+	if (D_d <= 0.0 || L_d <= 0.0) {
+		free(excluded);
+		free(P);
+		return 0;
 	}
 
-	{
-		if (!src->deadline_assigned) {
-			src->deadline = d_src;
-			src->deadline_assigned = true;
-		} else {
-			if (src->deadline > d_src) src->deadline = d_src;
-		}
-		uint64_t assigned_src = src->deadline;
-		D -= assigned_src;
+	uint64_t assigned_src = 0;
+	dag_node_t *n_src = P[0];
+	uint64_t C_src = n_src->wcet;
+	uint64_t d_prime_src = (uint64_t)floor(D_d * ((double)C_src / L_d));
+	if (!n_src->deadline_assigned) {
+		n_src->deadline = d_prime_src;
+		n_src->deadline_assigned = true;
+	} else {
+		if (n_src->deadline > d_prime_src) n_src->deadline = d_prime_src;
 	}
-	{
-		if (!dst->deadline_assigned) {
-			dst->deadline = d_dst;
-			dst->deadline_assigned = true;
-		} else {
-			if (dst->deadline > d_dst) dst->deadline = d_dst;
-		}
+	assigned_src = n_src->deadline;
+	
+	dag_node_t *n_dst = P[path_len - 1];
+	uint64_t C_dst = n_dst->wcet;
+	uint64_t d_prime_dst = (uint64_t)floor(D_d * ((double)C_dst / L_d));
+	
+	if (!n_dst->deadline_assigned) {
+		n_dst->deadline = d_prime_dst;
+		n_dst->deadline_assigned = true;
+	} else {
+		if (n_dst->deadline > d_prime_dst) n_dst->deadline = d_prime_dst;
 	}
 
 	dag_edge_t *e;
 	spa_list_for_each(e, &src->outgoing, src_link) {
 		if (e->dst != dst) {
-			int r = assign_deadlines_recursive(g, e->dst, dst, D);
+			uint64_t D_residual = (D_orig > assigned_src) ? (D_orig - assigned_src) : 0;
+			int r = assign_deadlines_recursive(g, e->dst, dst, D_residual);
 			if (r < 0) {
+				free(excluded);
 				free(P);
 				return r;
 			}
 		}
 	}
 
+	free(excluded);
 	free(P);
 	return 0;
 }
 
 static int assign_cpus(dag_t *g)
 {
-	int count = dag_list_len(&g->nodes);
+	size_t count = dag_list_len(&g->nodes);
 	if (count == 0) return 0;
 
 	dag_node_t *node;
@@ -505,7 +512,7 @@ static int assign_cpus(dag_t *g)
 		arr[i++] = node;
 	}
 
-	for (int j=0; j<count; j++) {
+	for (size_t j=0; j<count; j++) {
 		if (!arr[j]->deadline_assigned) {
 			free(arr);
 			errno = EFAULT;
@@ -518,15 +525,20 @@ static int assign_cpus(dag_t *g)
 		double util;
 	} *info = malloc(count*sizeof(*info));
 
-	for (int j=0; j<count; j++) {
+	for (size_t j=0; j<count; j++) {
 		double denom = (double)((arr[j]->deadline < g->period) ? arr[j]->deadline : g->period);
-		if (denom == 0) denom = 1.0;
+		if (denom == 0) {
+			free(info);
+			free(arr);
+			errno = EFAULT;
+			return -1;
+		}
 		info[j].n = arr[j];
 		info[j].util = ((double)arr[j]->wcet) / denom;
 	}
 
-	for (int x=0; x<count-1; x++) {
-		for (int y=x+1; y<count; y++) {
+	for (size_t x=0; x<count-1; x++) {
+		for (size_t y=x+1; y<count; y++) {
 			if (info[x].util < info[y].util) {
 				double tmpu = info[x].util; info[x].util = info[y].util; info[y].util = tmpu;
 				dag_node_t *tmpn = info[x].n; info[x].n = info[y].n; info[y].n = tmpn;
@@ -541,7 +553,7 @@ static int assign_cpus(dag_t *g)
 		return -1;
 	}
 
-	for (int j=0; j<count; j++) {
+	for (size_t j=0; j<count; j++) {
 		double u = info[j].util;
 		int chosen = -1;
 		double max_margin = -1.0;
@@ -627,4 +639,16 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 		cb(data, n->tid, n->wcet, n->deadline, g->period, n->cpu);
 	}
 	return 0;
+}
+
+void dag_print(dag_t *g)
+{
+	dag_node_t *n;
+	spa_list_for_each(n, &g->nodes, link) {
+		pw_log_debug("Node %u|%u with wcet %lu and deadline %lu", n->id, n->tid, n->wcet, n->deadline);
+		dag_edge_t *e;
+		spa_list_for_each(e, &n->outgoing, src_link) {
+			pw_log_debug("  Edge to node %u|%u", e->dst->id, e->dst->tid);
+		}
+	}
 }
