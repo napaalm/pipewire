@@ -109,18 +109,6 @@ pipewire_exec = executable('pipewire',
   build_rpath : meson.global_build_root() / 'src' / 'pipewire',
 )
 
-sudo = find_program('sudo', required: true)
-setcap = find_program('setcap', required: true)
-
-custom_target('pipewire_setcap_sys_nice',
-  build_by_default: true,
-  install: false,
-  depends: pipewire_exec,
-  input: pipewire_exec,
-  output: 'fake',
-  command: [sudo, '-n', setcap, 'cap_sys_nice=ep', '@INPUT@'],
-)
-
 ln = find_program('ln')
 
 pipewire_aliases = [
