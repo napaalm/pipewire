@@ -54,7 +54,8 @@ enum spa_profiler {
 							  *      Long : driver effective run time,
 							  *      Int : driver status,
 							  *      Fraction : latency,
-							  *      Int : xrun_count))  */
+							  *      Int : xrun_count,
+							  *      Long : driver cycles))  */
 
 	SPA_PROFILER_START_Follower	= 0x20000,	/**< follower related profiler properties */
 	SPA_PROFILER_followerBlock,			/**< generic follower info block
@@ -68,8 +69,9 @@ enum spa_profiler {
 							  *      Long : effective run time,
 							  *      Int : status,
 							  *      Fraction : latency,
-							  *      Int : xrun_count))
-							  *      Bool : async))  */
+							  *      Int : xrun_count,
+							  *      Bool : async,
+							  *      Long : cycles))  */
 	SPA_PROFILER_followerClock,			/**< follower clock information
 							  *  (Struct(
 							  *      Int : clock id,

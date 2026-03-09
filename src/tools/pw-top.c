@@ -50,6 +50,7 @@ struct measurement {
 	struct spa_fraction latency;
 	uint32_t xrun_count;
 	bool async;
+	int64_t run_cycles;
 };
 
 struct node {
@@ -457,7 +458,8 @@ static int process_driver_block(struct data *d, const struct spa_pod *pod, struc
 			SPA_POD_Long(&m.run_time),
 			SPA_POD_Int(&m.status),
 			SPA_POD_Fraction(&m.latency),
-			SPA_POD_OPT_Int(&m.xrun_count))) < 0)
+			SPA_POD_OPT_Int(&m.xrun_count),
+			SPA_POD_OPT_Long(&m.run_cycles))) < 0)
 		return res;
 
 	if ((n = find_node(d, id)) == NULL)
@@ -492,7 +494,8 @@ static int process_follower_block(struct data *d, const struct spa_pod *pod, str
 			SPA_POD_Int(&m.status),
 			SPA_POD_Fraction(&m.latency),
 			SPA_POD_OPT_Int(&m.xrun_count),
-			SPA_POD_OPT_Bool(&m.async))) < 0)
+			SPA_POD_OPT_Bool(&m.async),
+			SPA_POD_OPT_Long(&m.run_cycles))) < 0)
 		return res;
 
 	if ((n = find_node(d, id)) == NULL)
@@ -561,6 +564,28 @@ static const char *state_as_string(enum pw_node_state state, uint32_t transport)
 	return "!";
 }
 
+/* Compact decimal-prefix formatter for CPU cycle counts. A typical
+ * per-cycle audio process() call consumes 1e5..1e7 cycles, so a
+ * raw integer would dominate the row; the prefix form fits in 6
+ * characters. Negative or zero counts (e.g. perf disabled at the
+ * server) show up as "---". */
+static const char *print_cycles(char *buf, size_t len, bool active, int64_t val)
+{
+	if (!active || val < 0)
+		snprintf(buf, len, "   ---");
+	else if (val == 0)
+		snprintf(buf, len, "     0");
+	else if (val < 1000ll)
+		snprintf(buf, len, "%5lld ", (long long)val);
+	else if (val < 1000000ll)
+		snprintf(buf, len, "%5.1fK", val / 1.0e3);
+	else if (val < 1000000000ll)
+		snprintf(buf, len, "%5.1fM", val / 1.0e6);
+	else
+		snprintf(buf, len, "%5.1fG", val / 1.0e9);
+	return buf;
+}
+
 static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 {
 	struct driver *i = &dr->info;
@@ -570,6 +595,7 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	char buf4[64];
 	char buf5[64];
 	char buf6[64];
+	char cycbuf[16];
 	char procbuf[16];
 	char tidbuf[16];
 	uint64_t waiting, busy, run_time;
@@ -617,7 +643,7 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	else
 		run_time = busy = -1;
 
-	print_mode_dependent(d, y, 0, "%s %4.1u %8s %3s %6.1u %6.1u %s %s %s %s %s %s  %3.1u %16.16s %s%s",
+	print_mode_dependent(d, y, 0, "%s %4.1u %8s %3s %6.1u %6.1u %s %s %s %s %s %s %s  %3.1u %16.16s %s%s",
 			state_as_string(n->state, i->transport_state),
 			n->id,
 			tidbuf,
@@ -629,6 +655,7 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 			print_perc(buf4, active, 64, waiting, quantum),
 			print_perc(buf5, active, 64, busy, quantum),
 			print_perc(buf6, active, 64, run_time, quantum),
+			print_cycles(cycbuf, 16, active, n->measurement.run_cycles),
 			n->measurement.xrun_count == XRUN_INVALID ?
 					i->xrun_count - dr->info_base :
 					n->measurement.xrun_count - n->measurement_base,
@@ -644,7 +671,7 @@ static void clear_node(struct node *n)
 	spa_zero(n->info);
 }
 
-#define HEADER	"S   ID      TID CPU  QUANT   RATE    WAIT    BUSY RUNTIME   W/Q   B/Q   R/Q  ERR FORMAT           NAME "
+#define HEADER	"S   ID      TID CPU  QUANT   RATE    WAIT    BUSY RUNTIME   W/Q   B/Q   R/Q CYCLES  ERR FORMAT           NAME "
 
 static void do_refresh(struct data *d, bool force_refresh)
 {
