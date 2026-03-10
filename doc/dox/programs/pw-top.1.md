@@ -155,6 +155,21 @@ follower node.
 Values of \-\-- are copied from the RUNTIME column.
 \endparblock
 
+\par TID
+\parblock
+Thread ID of the node loop thread.
+
+This is shown only for nodes with `node.loop.dynamic=true`.
+For other nodes, the field is shown as \-\--.
+\endparblock
+
+\par CPU
+\parblock
+Processor index where the node thread is currently running, when available.
+
+If unavailable, the field is shown as \-\--.
+\endparblock
+
 \par ERR
 \parblock
 Total of Xruns and Errors
