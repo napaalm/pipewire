@@ -3,9 +3,13 @@
 /* SPDX-License-Identifier: MIT */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <getopt.h>
 #include <locale.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <ncurses.h>
 
 #undef clear
@@ -53,6 +57,8 @@ struct node {
 	struct data *data;
 	uint32_t id;
 	char name[MAX_NAME+1];
+	pid_t loop_tid;
+	int processor;
 	enum pw_node_state state;
 	struct measurement measurement;
 	uint32_t measurement_base;
@@ -64,6 +70,7 @@ struct node {
 	struct pw_proxy *proxy;
 	struct spa_hook proxy_listener;
 	unsigned int inactive:1;
+	unsigned int loop_dynamic:1;
 	struct spa_hook object_listener;
 };
 
@@ -199,6 +206,65 @@ static void set_node_name(struct node *n, const char *name)
 		snprintf(n->name, sizeof(n->name), "%u", n->id);
 }
 
+static int get_processor_for_tid(pid_t tid)
+{
+	char path[64];
+	char stat_buf[2048];
+	int fd, processor = -1;
+	ssize_t size;
+	char *rparen, *p, *saveptr = NULL, *tok;
+	int field;
+
+	if (tid <= 0)
+		return -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/stat", tid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	size = read(fd, stat_buf, sizeof(stat_buf) - 1);
+	close(fd);
+	if (size <= 0)
+		return -1;
+
+	stat_buf[size] = '\0';
+	rparen = strrchr(stat_buf, ')');
+	if (rparen == NULL)
+		return -1;
+
+	p = rparen + 1;
+	while (*p == ' ')
+		p++;
+
+	field = 3;
+	for (tok = strtok_r(p, " ", &saveptr); tok != NULL; tok = strtok_r(NULL, " ", &saveptr), field++) {
+		if (field == 39) {
+			processor = (int)strtol(tok, NULL, 10);
+			break;
+		}
+	}
+
+	return processor;
+}
+
+static void update_node_loop_info(struct node *n, const struct spa_dict *props)
+{
+	const char *loop_dynamic;
+	const char *loop_tid;
+	char *endptr = NULL;
+
+	loop_dynamic = spa_dict_lookup(props, PW_KEY_NODE_LOOP_DYNAMIC);
+	n->loop_dynamic = loop_dynamic != NULL &&
+		(spa_streq(loop_dynamic, "true") || spa_streq(loop_dynamic, "1") || spa_streq(loop_dynamic, "yes") || spa_streq(loop_dynamic, "on"));
+
+	loop_tid = spa_dict_lookup(props, PW_KEY_NODE_LOOP_TID);
+	if (loop_tid != NULL && *loop_tid != '\0')
+		n->loop_tid = (pid_t)strtol(loop_tid, &endptr, 10);
+	else
+		n->loop_tid = -1;
+}
+
 static void node_info(void *data, const struct pw_node_info *info)
 {
 	struct node *n = data;
@@ -208,8 +274,10 @@ static void node_info(void *data, const struct pw_node_info *info)
 		do_refresh(n->data, !n->data->batch_mode);
 	}
 
-	if (info->change_mask & PW_NODE_CHANGE_MASK_PROPS)
+	if (info->change_mask & PW_NODE_CHANGE_MASK_PROPS) {
 		set_node_name(n, find_node_name(info->props));
+		update_node_loop_info(n, info->props);
+	}
 }
 
 static void node_param(void *data, int seq,
@@ -502,10 +570,23 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	char buf4[64];
 	char buf5[64];
 	char buf6[64];
+	char procbuf[16];
+	char tidbuf[16];
 	uint64_t waiting, busy, run_time;
 	float quantum;
 	struct spa_fraction frac;
 	bool active;
+
+	n->processor = get_processor_for_tid(n->loop_tid);
+	if (n->processor >= 0)
+		snprintf(procbuf, sizeof(procbuf), "%3d", n->processor);
+	else
+		snprintf(procbuf, sizeof(procbuf), "---");
+
+	if (n->loop_dynamic && n->loop_tid > 0)
+		snprintf(tidbuf, sizeof(tidbuf), "%8d", n->loop_tid);
+	else
+		snprintf(tidbuf, sizeof(tidbuf), "---");
 
 	active = n->state == PW_NODE_STATE_RUNNING || n->state == PW_NODE_STATE_IDLE;
 
@@ -536,9 +617,11 @@ static void print_node(struct data *d, struct node *dr, struct node *n, int y)
 	else
 		run_time = busy = -1;
 
-	print_mode_dependent(d, y, 0, "%s %4.1u %6.1u %6.1u %s %s %s %s %s %s  %3.1u %16.16s %s%s",
+	print_mode_dependent(d, y, 0, "%s %4.1u %8s %3s %6.1u %6.1u %s %s %s %s %s %s  %3.1u %16.16s %s%s",
 			state_as_string(n->state, i->transport_state),
 			n->id,
+			tidbuf,
+			procbuf,
 			frac.num, frac.denom,
 			print_time(buf1, active, 64, waiting),
 			print_time(buf2, active, 64, busy),
@@ -561,7 +644,7 @@ static void clear_node(struct node *n)
 	spa_zero(n->info);
 }
 
-#define HEADER	"S   ID  QUANT   RATE    WAIT    BUSY RUNTIME   W/Q   B/Q   R/Q  ERR FORMAT           NAME "
+#define HEADER	"S   ID      TID CPU  QUANT   RATE    WAIT    BUSY RUNTIME   W/Q   B/Q   R/Q  ERR FORMAT           NAME "
 
 static void do_refresh(struct data *d, bool force_refresh)
 {
