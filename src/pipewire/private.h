@@ -637,6 +637,38 @@ struct pw_node_activation {
 	uint32_t command;				/* next command */
 	uint32_t reposition_owner;			/* owner id with new reposition info, last one
 							 * to update wins */
+
+	/* Per-cycle CPU-cycle counters captured around the node's
+	 * spa_node_process callback. When the runtime can open a
+	 * thread-attached PERF_COUNT_HW_CPU_CYCLES counter, it reads
+	 * the count at the awake and finish points alongside the
+	 * existing CLOCK_THREAD_CPUTIME_ID captures, and prev_run_cycles
+	 * is set to (finish - awake) at the same point prev_run_time is.
+	 *
+	 * Cycle counts are frequency-invariant by construction: 1000
+	 * cycles is 1000 cycles regardless of the cpufreq state the
+	 * CPU was in. Consumers that want a frequency-invariant work
+	 * estimate (e.g. for SCHED_DEADLINE budget computation) can
+	 * derive it from prev_run_cycles divided by the CPU's known
+	 * maximum frequency, instead of inferring it from the
+	 * wall-clock prev_run_time which is sensitive to whatever
+	 * P-state the governor happened to pick.
+	 *
+	 * Zero means "no perf data available" -- either the kernel
+	 * refused perf_event_open (kernel.perf_event_paranoid > 1
+	 * with no CAP_PERFMON, an older kernel, or a non-Linux host),
+	 * the executor predates this field, or the read failed.
+	 * Consumers must treat zero as a "fall back on the existing
+	 * prev_run_time wall-clock value" signal.
+	 *
+	 * Fields appended at the end of pw_node_activation so old
+	 * clients with the smaller struct layout keep working: they
+	 * never read or write past the activation_size they were
+	 * built against, and the server writing into the trailing
+	 * region only affects readers that explicitly opt in. */
+	uint64_t awake_cycles;
+	uint64_t finish_cycles;
+	uint64_t prev_run_cycles;
 };
 
 static inline uint64_t get_time_ns(struct spa_system *system)
@@ -858,6 +890,19 @@ struct pw_impl_node {
 
 	uint64_t driver_start;
 	uint64_t elapsed;		/* elapsed time in playing */
+
+	/* perf_event_open fd for PERF_COUNT_HW_CPU_CYCLES, attached
+	 * to the thread that runs spa_node_process. Opened lazily on
+	 * first dispatch so the fd binds to the data-loop thread
+	 * (perf_event_open with pid=0 attaches to the calling
+	 * thread). -1 means "not yet attempted", -2 means
+	 * "permanently disabled" (open failed and we won't retry,
+	 * e.g. because the kernel refused or perf_event_paranoid is
+	 * too high). When >= 0 it is read once at awake and once at
+	 * finish; the delta is stamped into the activation's
+	 * prev_run_cycles. */
+	int cycle_fd;
+
 
 	void *user_data;                /**< extra user data */
 };
