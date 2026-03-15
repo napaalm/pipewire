@@ -11,7 +11,7 @@
  * T. Cucinotta, A. Amory, G. Ara, F. Paladino, M. Di Natale
  * https://doi.org/10.1145/3592609
  *
- * Copyright (C) 2024 Antonio Napolitano
+ * Copyright (C) 2024 Antonio Napolitano and Francesco Barcherini
  */
 
 #include <stdint.h>
@@ -21,6 +21,8 @@
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
+
+#include <pipewire/log.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +88,8 @@ int dag_recalculate(dag_t *g);
 /* Apply a function to all tids with current scheduling parameters */
 typedef void (*dag_node_callback_t)(void *data, pid_t tid, uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);
+
+void dag_print(dag_t *g);
 
 #ifdef __cplusplus
 }
