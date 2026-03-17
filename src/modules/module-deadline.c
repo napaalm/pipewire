@@ -35,6 +35,7 @@
 #include <stdbool.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <linux/capability.h>
 #include <linux/sched.h>
 
 #include "config.h"
@@ -172,6 +173,46 @@ int sched_getattr(pid_t pid, struct sched_attr *attr, unsigned int size, unsigne
 	return syscall(SYS_sched_getattr, pid, attr, size, flags);
 }
 
+static bool can_use_deadline_policy(void)
+{
+	struct __user_cap_header_struct hdr;
+	struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3];
+	unsigned int index, mask;
+
+	spa_zero(hdr);
+	spa_zero(data);
+	hdr.version = _LINUX_CAPABILITY_VERSION_3;
+	hdr.pid = 0;
+
+	if (syscall(SYS_capget, &hdr, data) != 0) {
+		switch (errno) {
+		case EPERM:
+		case EACCES:
+			pw_log_info("deadline scheduling unavailable: capget() permission denied");
+			break;
+		case ENOSYS:
+		case EOPNOTSUPP:
+			pw_log_info("deadline scheduling unavailable: capget() not supported");
+			break;
+		default:
+			pw_log_info("deadline scheduling unavailable: capget() failed: %m");
+			break;
+		}
+		return false;
+	}
+
+	index = CAP_SYS_NICE / 32;
+	mask = 1U << (CAP_SYS_NICE % 32);
+
+	if ((data[index].effective & mask) != 0) {
+		pw_log_debug("CAP_SYS_NICE available for current thread");
+		return true;
+	}
+
+	pw_log_info("deadline scheduling unavailable: CAP_SYS_NICE not in effective set");
+	return false;
+}
+
 static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, uint64_t period)
 {
 	int ret = 0;
@@ -199,6 +240,8 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, ui
 		else
 			pw_log_error("failed to set DEADLINE attributes for tid %d: %s", tid, strerror(errno));
 	}
+	else 
+		pw_log_debug("set DEADLINE scheduling for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
 
 	return ret;
 }
@@ -238,6 +281,20 @@ static struct node *find_node(struct impl *impl, struct pw_impl_node *node)
 	return NULL;
 }
 
+static bool is_audio_source_media_class(const char *media_class)
+{
+	return media_class != NULL &&
+		(spa_strstartswith(media_class, "Audio/Source") ||
+		 spa_strstartswith(media_class, "Stream/Output/Audio"));
+}
+
+static bool is_audio_sink_media_class(const char *media_class)
+{
+	return media_class != NULL &&
+		(spa_strstartswith(media_class, "Audio/Sink") ||
+		 spa_strstartswith(media_class, "Stream/Input/Audio"));
+}
+
 static void recalc_params(void *data)
 {
 	struct node *n = data;
@@ -257,6 +314,7 @@ static void recalc_params(void *data)
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *node = t->node;
 		struct pw_node_activation *na;
+		const char *media_class;
 		pid_t tid = -1;
 
 		struct node *n = find_node(impl, node);
@@ -296,7 +354,10 @@ static void recalc_params(void *data)
 			return;
 		}
 
-		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid);
+		media_class = pw_properties_get(node->properties, PW_KEY_MEDIA_CLASS);
+		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid,
+				is_audio_source_media_class(media_class),
+				is_audio_sink_media_class(media_class));
 	}
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
@@ -427,9 +488,19 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	spa_json_parse_float(cpu_utilization_str, strlen(cpu_utilization_str), &impl->cpu_utilization);
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
-
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
 	pw_impl_module_update_properties(module, &props->dict);
+
+	const char *disable_deadline = getenv("PIPEWIRE_DISABLE_MODULE_DEADLINE");
+	if (disable_deadline != NULL && disable_deadline[0] != '\0' && strcmp(disable_deadline, "0") != 0) {
+		pw_log_info("deadline scheduling disabled by PIPEWIRE_DISABLE_MODULE_DEADLINE");
+		goto done;
+	}
+
+	if (!can_use_deadline_policy()) {
+		pw_log_warn("deadline scheduling disabled");
+		goto done;
+	}
 
 	pw_context_add_listener(impl->context, &impl->context_listener, &context_events, impl);
 

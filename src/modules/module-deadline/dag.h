@@ -18,6 +18,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 #include <stdbool.h>
+#include <assert.h>
+
+#include "bitset.h"
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
@@ -38,10 +41,19 @@ struct dag_node {
 	struct spa_list incoming;    /* list of incoming edges (dag_edge_t) */
 
 	uint32_t id;
+	uint32_t index;      /* dense topological index for analysis caches */
 	uint64_t wcet;       /* worst case execution time */
 	uint64_t deadline;   /* assigned relative deadline */
 	uint32_t cpu;        /* assigned CPU */
 	pid_t tid;           /* associated thread id */
+	bool is_audio_source;
+	bool is_audio_sink;
+
+	bool fictitious;
+	uint64_t remaining_deadline;
+	uint64_t longest_len;
+	int longest_next;
+	bitset_t *successors;
 
 	bool deadline_assigned;
 };
@@ -62,6 +74,12 @@ struct dag {
 
 	struct spa_list nodes; /* list of dag_node_t */
 	struct spa_list edges; /* list of dag_edge_t */
+
+	dag_node_t **indexed_nodes;
+	uint32_t indexed_count;
+	bitset_t **unrelated;
+	uint32_t unrelated_size;
+	uint32_t unrelated_capacity;
 };
 
 /* Create and destroy a DAG */
@@ -72,7 +90,8 @@ void dag_destroy(dag_t *g);
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline);
 
 /* Add and remove nodes */
-int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid);
+int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid,
+		bool is_audio_source, bool is_audio_sink);
 int dag_remove_node(dag_t *g, uint32_t id);
 
 /* Add and remove edges */
