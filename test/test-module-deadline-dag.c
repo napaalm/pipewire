@@ -2,6 +2,9 @@
 /* SPDX-FileCopyrightText: Copyright © 2025 PipeWire contributors */
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
+#include <stdlib.h>
+
 #include "config.h"
 
 #include "pwtest.h"
@@ -42,6 +45,36 @@ static dag_t *create_test_dag(uint64_t deadline, uint32_t num_cpus)
 	return g;
 }
 
+static void force_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
+{
+	dag_node_t *src = find_node(g, src_id);
+	dag_node_t *dst = find_node(g, dst_id);
+	dag_edge_t *edge;
+
+	pwtest_ptr_notnull(src);
+	pwtest_ptr_notnull(dst);
+
+	edge = calloc(1, sizeof(*edge));
+	pwtest_ptr_notnull(edge);
+
+	edge->src = src;
+	edge->dst = dst;
+	spa_list_append(&g->edges, &edge->link);
+	spa_list_append(&src->outgoing, &edge->src_link);
+	spa_list_append(&dst->incoming, &edge->dst_link);
+}
+
+static void assert_deadlines_cleared(dag_t *g)
+{
+	dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		pwtest_bool_false(node->deadline_assigned);
+		pwtest_int_eq((int)node->deadline, 0);
+		pwtest_int_eq((int)node->cpu, 0);
+	}
+}
+
 PWTEST(single_node_deadline)
 {
 	dag_t *g = create_test_dag(25, 1);
@@ -54,6 +87,42 @@ PWTEST(single_node_deadline)
 	pwtest_ptr_notnull(node);
 	pwtest_bool_true(node->deadline_assigned);
 	pwtest_int_eq((int)node->deadline, 25);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(self_loop_rejected)
+{
+	dag_t *g = create_test_dag(10, 1);
+	dag_node_t *node;
+
+	pwtest_int_eq(dag_add_node(g, 1, 4, 1), 0);
+	pwtest_errno(dag_add_edge(g, 1, 1), ELOOP);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	node = find_node(g, 1);
+	pwtest_ptr_notnull(node);
+	pwtest_bool_true(node->deadline_assigned);
+	pwtest_int_eq((int)node->deadline, 10);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(cycle_edge_rejected)
+{
+	static const uint32_t path[] = { 1, 2, 3 };
+	dag_t *g = create_test_dag(15, 3);
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_errno(dag_add_edge(g, 3, 1), ELOOP);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -125,6 +194,40 @@ PWTEST(diamond_deadlines)
 	return PWTEST_PASS;
 }
 
+PWTEST(multiple_sources_and_sinks_skip_unreachable_pairs)
+{
+	static const uint32_t left_path[] = { 1, 3, 5 };
+	static const uint32_t upper_path[] = { 1, 4, 6 };
+	static const uint32_t lower_path[] = { 2, 4, 6 };
+	dag_t *g = create_test_dag(18, 6);
+	dag_node_t *node;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 1, 4), 0);
+	pwtest_int_eq(dag_add_node(g, 5, 1, 5), 0);
+	pwtest_int_eq(dag_add_node(g, 6, 1, 6), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 5), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 4, 6), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	spa_list_for_each(node, &g->nodes, link) {
+		pwtest_bool_true(node->deadline_assigned);
+		pwtest_bool_true(node->deadline > 0);
+	}
+	pwtest_bool_true(path_deadline_sum(g, left_path, SPA_N_ELEMENTS(left_path)) <= g->deadline);
+	pwtest_bool_true(path_deadline_sum(g, upper_path, SPA_N_ELEMENTS(upper_path)) <= g->deadline);
+	pwtest_bool_true(path_deadline_sum(g, lower_path, SPA_N_ELEMENTS(lower_path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(preassigned_tightening_residual_budget)
 {
 	static const uint32_t heavy_path[] = { 1, 2, 5, 6 };
@@ -173,12 +276,35 @@ PWTEST(preassigned_tightening_residual_budget)
 	return PWTEST_PASS;
 }
 
+PWTEST(topo_sort_rejects_forced_cycle)
+{
+	dag_t *g = create_test_dag(15, 3);
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	force_add_edge(g, 3, 1);
+	pwtest_errno(dag_recalculate(g), ELOOP);
+	assert_deadlines_cleared(g);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(single_node_deadline, PWTEST_NOARG);
+	pwtest_add(self_loop_rejected, PWTEST_NOARG);
+	pwtest_add(cycle_edge_rejected, PWTEST_NOARG);
 	pwtest_add(chain_deadlines, PWTEST_NOARG);
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);
+	pwtest_add(multiple_sources_and_sinks_skip_unreachable_pairs, PWTEST_NOARG);
 	pwtest_add(preassigned_tightening_residual_budget, PWTEST_NOARG);
+	pwtest_add(topo_sort_rejects_forced_cycle, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

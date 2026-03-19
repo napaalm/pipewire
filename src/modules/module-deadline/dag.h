@@ -64,6 +64,13 @@ struct dag {
 	struct spa_list edges; /* list of dag_edge_t */
 };
 
+/*
+ * This library supports generic finite DAGs, including multiple sources,
+ * multiple sinks, and disconnected components. Scheduling is computed over
+ * each reachable source -> sink subproblem; unreachable source/sink
+ * combinations are skipped.
+ */
+
 /* Create and destroy a DAG */
 dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus);
 void dag_destroy(dag_t *g);
@@ -75,14 +82,18 @@ int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid);
 int dag_remove_node(dag_t *g, uint32_t id);
 
-/* Add and remove edges */
+/* Add and remove edges.
+ * dag_add_edge() rejects self-loops and cycle-creating edges with ELOOP.
+ */
 int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 
 /* Update the WCET of a node */
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
 
-/* Recalculate scheduling parameters after changes */
+/* Recalculate scheduling parameters after changes.
+ * On failure, any previously assigned deadlines/CPUs are cleared.
+ */
 int dag_recalculate(dag_t *g);
 
 /* Apply a function to all tids with current scheduling parameters */
