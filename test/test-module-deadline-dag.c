@@ -3,6 +3,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,8 @@
 #include "pwtest.h"
 
 #include "module-deadline/dag.h"
+
+#define TEST_LOAD_EPSILON (64.0 * DBL_EPSILON)
 
 static dag_node_t *find_node(dag_t *g, uint32_t id)
 {
@@ -39,7 +42,22 @@ static uint64_t path_deadline_sum(dag_t *g, const uint32_t *ids, size_t n_ids)
 	return sum;
 }
 
-static dag_t *create_test_dag_with_util(uint64_t deadline, float utilization,
+static bool double_eq_eps(double a, double b)
+{
+	return fabs(a - b) <= TEST_LOAD_EPSILON;
+}
+
+static bool double_leq_eps(double a, double b)
+{
+	return a <= b + TEST_LOAD_EPSILON;
+}
+
+static bool double_gt_eps(double a, double b)
+{
+	return a > b + TEST_LOAD_EPSILON;
+}
+
+static dag_t *create_test_dag_with_util(uint64_t deadline, double utilization,
 		uint32_t num_cpus)
 {
 	dag_t *g = dag_create(deadline, deadline, utilization, num_cpus);
@@ -50,7 +68,7 @@ static dag_t *create_test_dag_with_util(uint64_t deadline, float utilization,
 
 static dag_t *create_test_dag(uint64_t deadline, uint32_t num_cpus)
 {
-	return create_test_dag_with_util(deadline, 1.0f, num_cpus);
+	return create_test_dag_with_util(deadline, 1.0, num_cpus);
 }
 
 static double node_density(dag_t *g, dag_node_t *node)
@@ -430,7 +448,7 @@ PWTEST(independent_tasks_load_sums_densities)
 
 PWTEST(diamond_cpu_load_captures_parallelism)
 {
-	dag_t *g = create_test_dag_with_util(12, 0.6f, 1);
+	dag_t *g = create_test_dag_with_util(12, 0.6, 1);
 	double exact_load, raw_load;
 
 	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
@@ -447,8 +465,8 @@ PWTEST(diamond_cpu_load_captures_parallelism)
 	exact_load = cpu_exact_unrelated_load(g, 0);
 	raw_load = cpu_raw_density_sum(g, 0);
 	pwtest_bool_true(fabs(exact_load - 0.5) < 1.0e-9);
-	pwtest_bool_true(raw_load > g->utilization);
-	pwtest_bool_true(exact_load <= g->utilization);
+	pwtest_bool_true(double_gt_eps(raw_load, g->utilization));
+	pwtest_bool_true(double_leq_eps(exact_load, g->utilization));
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -456,7 +474,7 @@ PWTEST(diamond_cpu_load_captures_parallelism)
 
 PWTEST(chain_topology_aware_admission_regression)
 {
-	dag_t *g = create_test_dag_with_util(9, 0.4f, 1);
+	dag_t *g = create_test_dag_with_util(9, 0.4, 1);
 	double exact_load, raw_load;
 
 	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
@@ -469,8 +487,67 @@ PWTEST(chain_topology_aware_admission_regression)
 	assert_all_on_cpu(g, 0);
 	exact_load = cpu_exact_unrelated_load(g, 0);
 	raw_load = cpu_raw_density_sum(g, 0);
-	pwtest_bool_true(raw_load > g->utilization);
-	pwtest_bool_true(exact_load <= g->utilization);
+	pwtest_bool_true(double_gt_eps(raw_load, g->utilization));
+	pwtest_bool_true(double_leq_eps(exact_load, g->utilization));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(near_bound_utilization_accepts_small_roundoff)
+{
+	dag_t *g = create_test_dag_with_util(9, nextafter(1.0 / 3.0, 0.0), 1);
+	double exact_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	pwtest_bool_true(double_eq_eps(exact_load, 1.0 / 3.0));
+	pwtest_bool_true(double_leq_eps(exact_load, g->utilization));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(near_bound_utilization_rejects_clear_overload)
+{
+	dag_t *g = create_test_dag_with_util(9, 0.33, 1);
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_errno(dag_recalculate(g), EAGAIN);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(ordinary_feasible_load_case_still_succeeds)
+{
+	dag_t *g = create_test_dag_with_util(10, 0.7, 1);
+	double exact_load, raw_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 2, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 3, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	raw_load = cpu_raw_density_sum(g, 0);
+	pwtest_bool_true(double_eq_eps(exact_load, raw_load));
+	pwtest_bool_true(double_eq_eps(exact_load, 0.6));
+	pwtest_bool_true(double_leq_eps(exact_load, g->utilization));
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -741,6 +818,9 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);
 	pwtest_add(diamond_cpu_load_captures_parallelism, PWTEST_NOARG);
 	pwtest_add(chain_topology_aware_admission_regression, PWTEST_NOARG);
+	pwtest_add(near_bound_utilization_accepts_small_roundoff, PWTEST_NOARG);
+	pwtest_add(near_bound_utilization_rejects_clear_overload, PWTEST_NOARG);
+	pwtest_add(ordinary_feasible_load_case_still_succeeds, PWTEST_NOARG);
 	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
 	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);
 	pwtest_add(multiple_sources_and_sinks_skip_unreachable_pairs, PWTEST_NOARG);

@@ -59,7 +59,7 @@ struct dag_edge {
 struct dag {
 	uint64_t period;    /* global period */
 	uint64_t deadline;  /* global end-to-end deadline */
-	float utilization;  /* max topology-aware per-CPU DAG load */
+	double utilization; /* max topology-aware per-CPU DAG load */
 	uint32_t num_cpus;
 	bool dirty;          /* computed deadlines and CPUs are stale */
 
@@ -77,9 +77,11 @@ struct dag {
 /* Create and destroy a DAG.
  * utilization is the maximum per-CPU load admitted for this DAG after
  * accounting for precedence: only pairwise unrelated tasks contribute
- * concurrently on the same CPU.
+ * concurrently on the same CPU. It is stored as a double, while the timing
+ * parameters remain exact uint64_t integers. Admission compares derived loads
+ * against this cap with a small local epsilon to absorb roundoff noise.
  */
-dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus);
+dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus);
 void dag_destroy(dag_t *g);
 
 /* Set global period and deadline.

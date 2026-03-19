@@ -16,6 +16,7 @@
 #include <string.h>
 #include <errno.h>
 #include <float.h>
+#include <math.h>
 #include <stdbool.h>
 #include <limits.h>
 
@@ -30,6 +31,12 @@ static inline size_t dag_list_len(struct spa_list *list)
 }
 
 #define DAG_MIN_RELATIVE_DEADLINE UINT64_C(1)
+/*
+ * CPU-load and utilization comparisons operate on doubles derived from exact
+ * integer WCET/deadline values. Keep a small tolerance local to those checks
+ * so admission decisions do not flip on last-bit rounding noise.
+ */
+#define DAG_LOAD_EPSILON (64.0 * DBL_EPSILON)
 
 typedef struct {
 	dag_node_t **nodes;
@@ -121,6 +128,35 @@ static int validate_deadline_budget(uint64_t deadline_budget,
 	return 0;
 }
 
+static inline bool double_greater_eps(double value, double limit)
+{
+	return value > limit + DAG_LOAD_EPSILON;
+}
+
+static inline bool double_less_eps(double value, double limit)
+{
+	return value + DAG_LOAD_EPSILON < limit;
+}
+
+static inline bool double_equal_eps(double a, double b)
+{
+	return fabs(a - b) <= DAG_LOAD_EPSILON;
+}
+
+static double subtract_density_bound(double value, double decrement)
+{
+	double result = value - decrement;
+
+	/* The remaining-density bound is a sum of non-negative densities.
+	 * Clamp only tiny negative roundoff back to zero; larger negatives still
+	 * signal an internal accounting bug instead of being hidden.
+	 */
+	if (result < 0.0 && fabs(result) <= DAG_LOAD_EPSILON)
+		return 0.0;
+
+	return result;
+}
+
 static void clear_assignments(dag_t *g)
 {
 	dag_node_t *n;
@@ -138,9 +174,10 @@ static void mark_dag_dirty(dag_t *g)
 	clear_assignments(g);
 }
 
-dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus)
+dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
 {
-	if (period == 0 || deadline == 0 || utilization <= 0.0f || utilization > 1.0f || num_cpus == 0) {
+	if (period == 0 || deadline == 0 || !isfinite(utilization) ||
+			utilization <= 0.0 || utilization > 1.0 || num_cpus == 0) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -1038,6 +1075,9 @@ static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
 			goto out;
 		}
 
+		/* Deadline/period remain exact uint64_t values; density is the
+		 * derived floating-point load used only for CPU admission.
+		 */
 		density[i] = (double) topo.nodes[i]->wcet / (double) denom;
 	}
 
@@ -1101,16 +1141,18 @@ static void search_max_unrelated_density(const bool *related, int node_count,
 	struct density_order_entry next_candidates[
 		candidate_count > 1 ? candidate_count - 1 : 1];
 
-	if (current_density > *best_density)
+	if (double_greater_eps(current_density, *best_density))
 		*best_density = current_density;
 
 	if (candidate_count == 0 ||
-			current_density + remaining_density <= *best_density)
+			!double_greater_eps(current_density + remaining_density,
+				*best_density))
 		return;
 
 	current = &candidates[0];
 	v = current->index;
-	remaining_without_v = remaining_density - current->density;
+	remaining_without_v = subtract_density_bound(remaining_density,
+			current->density);
 
 	for (int i = 1; i < candidate_count; i++) {
 		const struct density_order_entry *candidate = &candidates[i];
@@ -1127,7 +1169,8 @@ static void search_max_unrelated_density(const bool *related, int node_count,
 			current_density + current->density, include_remaining,
 			best_density);
 
-	if (current_density + remaining_without_v <= *best_density)
+	if (!double_greater_eps(current_density + remaining_without_v,
+			*best_density))
 		return;
 
 	search_max_unrelated_density(related, node_count,
@@ -1175,13 +1218,13 @@ static bool prefer_cpu_choice(double load, uint32_t cpu,
 {
 	if (best_cpu < 0)
 		return true;
-	if (load < best_load)
+	if (double_less_eps(load, best_load))
 		return true;
 
 	/* When two CPUs yield the same resulting load, keep placement
 	 * deterministic by taking the lowest CPU index.
 	 */
-	return load == best_load && (int) cpu < best_cpu;
+	return double_equal_eps(load, best_load) && (int) cpu < best_cpu;
 }
 
 static int assign_cpus(dag_t *g)
@@ -1234,7 +1277,8 @@ static int assign_cpus(dag_t *g)
 			}
 		}
 
-		if (chosen_cpu < 0 || chosen_load > (double) g->utilization) {
+		if (chosen_cpu < 0 ||
+				double_greater_eps(chosen_load, g->utilization)) {
 			errno = EAGAIN;
 			goto out;
 		}
