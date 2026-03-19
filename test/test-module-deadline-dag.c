@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "config.h"
 
@@ -161,15 +162,34 @@ static void force_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 	spa_list_append(&dst->incoming, &edge->dst_link);
 }
 
-static void assert_deadlines_cleared(dag_t *g)
+static void assert_assignments_cleared(dag_t *g)
 {
 	dag_node_t *node;
 
 	spa_list_for_each(node, &g->nodes, link) {
 		pwtest_bool_false(node->deadline_assigned);
 		pwtest_int_eq((int)node->deadline, 0);
-		pwtest_int_eq((int)node->cpu, 0);
+		pwtest_int_eq((int) node->cpu, (int) DAG_CPU_INVALID);
 	}
+}
+
+struct foreach_stats {
+	uint32_t count;
+	uint64_t deadline_sum;
+};
+
+static void collect_foreach_stats(void *data, pid_t tid, uint64_t wcet,
+		uint64_t deadline, uint64_t period, uint32_t cpu)
+{
+	struct foreach_stats *stats = data;
+
+	(void) tid;
+	(void) wcet;
+	(void) period;
+	(void) cpu;
+
+	stats->count++;
+	stats->deadline_sum += deadline;
 }
 
 PWTEST(single_node_deadline)
@@ -476,7 +496,116 @@ PWTEST(topo_sort_rejects_forced_cycle)
 
 	force_add_edge(g, 3, 1);
 	pwtest_errno(dag_recalculate(g), ELOOP);
-	assert_deadlines_cleared(g);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(wcet_update_invalidates_schedule)
+{
+	dag_t *g = create_test_dag(18, 3);
+	dag_node_t *a, *b, *c;
+	struct foreach_stats stats = { 0, };
+
+	pwtest_int_eq(dag_add_node(g, 1, 2, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 3, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 4, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	c = find_node(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int) a->deadline, 4);
+	pwtest_int_eq((int) b->deadline, 6);
+	pwtest_int_eq((int) c->deadline, 8);
+
+	pwtest_int_eq(dag_set_node_wcet(g, 2, 6), 0);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	pwtest_int_eq(dag_foreach_node(g, collect_foreach_stats, &stats), 0);
+	pwtest_bool_false(g->dirty);
+	pwtest_int_eq((int) stats.count, 3);
+	pwtest_int_eq((int) a->deadline, 3);
+	pwtest_int_eq((int) b->deadline, 9);
+	pwtest_int_eq((int) c->deadline, 6);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(edge_update_invalidates_schedule)
+{
+	dag_t *g = create_test_dag(9, 1);
+	dag_node_t *a, *b;
+	struct foreach_stats stats = { 0, };
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_int_eq((int) a->deadline, 9);
+	pwtest_int_eq((int) b->deadline, 9);
+
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	pwtest_int_eq(dag_foreach_node(g, collect_foreach_stats, &stats), 0);
+	pwtest_bool_false(g->dirty);
+	pwtest_int_eq((int) stats.count, 2);
+	pwtest_int_eq((int) a->deadline, 4);
+	pwtest_int_eq((int) b->deadline, 4);
+
+	memset(&stats, 0, sizeof(stats));
+	pwtest_int_eq(dag_remove_edge(g, 1, 2), 0);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	pwtest_int_eq(dag_foreach_node(g, collect_foreach_stats, &stats), 0);
+	pwtest_bool_false(g->dirty);
+	pwtest_int_eq((int) stats.count, 2);
+	pwtest_int_eq((int) a->deadline, 9);
+	pwtest_int_eq((int) b->deadline, 9);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(recalculate_failure_keeps_dag_dirty)
+{
+	dag_t *g = create_test_dag(15, 3);
+	struct foreach_stats stats = { 0, };
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	force_add_edge(g, 3, 1);
+	pwtest_int_eq(dag_set_node_wcet(g, 1, 2), 0);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+	pwtest_errno(dag_foreach_node(g, collect_foreach_stats, &stats), ELOOP);
+	pwtest_bool_true(g->dirty);
+	pwtest_int_eq((int) stats.count, 0);
+	assert_assignments_cleared(g);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -496,6 +625,9 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(multiple_sources_and_sinks_skip_unreachable_pairs, PWTEST_NOARG);
 	pwtest_add(preassigned_tightening_residual_budget, PWTEST_NOARG);
 	pwtest_add(topo_sort_rejects_forced_cycle, PWTEST_NOARG);
+	pwtest_add(wcet_update_invalidates_schedule, PWTEST_NOARG);
+	pwtest_add(edge_update_invalidates_schedule, PWTEST_NOARG);
+	pwtest_add(recalculate_failure_keeps_dag_dirty, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

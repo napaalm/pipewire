@@ -83,8 +83,14 @@ static void clear_assignments(dag_t *g)
 	spa_list_for_each(n, &g->nodes, link) {
 		n->deadline_assigned = false;
 		n->deadline = 0;
-		n->cpu = 0;
+		n->cpu = DAG_CPU_INVALID;
 	}
+}
+
+static void mark_dag_dirty(dag_t *g)
+{
+	g->dirty = true;
+	clear_assignments(g);
 }
 
 dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus)
@@ -101,6 +107,7 @@ dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_
 	g->deadline = deadline;
 	g->utilization = utilization;
 	g->num_cpus = num_cpus;
+	g->dirty = false;
 	spa_list_init(&g->nodes);
 	spa_list_init(&g->edges);
 
@@ -135,6 +142,8 @@ int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 	if (!g) { errno = EINVAL; return -1; }
 	if (period == 0 || deadline == 0) { errno = EINVAL; return -1; }
 
+	if (g->period != period || g->deadline != deadline)
+		mark_dag_dirty(g);
 	g->period = period;
 	g->deadline = deadline;
 	return 0;
@@ -228,10 +237,12 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
 	n->wcet = wcet;
 	n->tid = tid;
 	n->deadline = 0;
+	n->cpu = DAG_CPU_INVALID;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);
 	spa_list_init(&n->incoming);
 	spa_list_append(&g->nodes, &n->link);
+	mark_dag_dirty(g);
 	return 0;
 }
 
@@ -261,6 +272,7 @@ int dag_remove_node(dag_t *g, uint32_t id)
 
 	spa_list_remove(&n->link);
 	free(n);
+	mark_dag_dirty(g);
 	return 0;
 }
 
@@ -298,6 +310,7 @@ int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 	spa_list_append(&g->edges, &e->link);
 	spa_list_append(&src->outgoing, &e->src_link);
 	spa_list_append(&dst->incoming, &e->dst_link);
+	mark_dag_dirty(g);
 	return 0;
 }
 
@@ -315,6 +328,7 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 			spa_list_remove(&e->src_link);
 			spa_list_remove(&e->dst_link);
 			free(e);
+			mark_dag_dirty(g);
 			return 0;
 		}
 	}
@@ -327,6 +341,8 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet)
 	if (!g) { errno = EINVAL; return -1; }
 	dag_node_t *n = find_node(g, id);
 	if (!n) { errno = ENOENT; return -1; }
+	if (n->wcet != wcet)
+		mark_dag_dirty(g);
 	n->wcet = wcet;
 	return 0;
 }
@@ -1000,8 +1016,12 @@ int dag_recalculate(dag_t *g)
 
 	if (!g) { errno = EINVAL; return -1; }
 
-	if (spa_list_is_empty(&g->nodes))
+	g->dirty = true;
+
+	if (spa_list_is_empty(&g->nodes)) {
+		g->dirty = false;
 		return 0;
+	}
 
 	clear_assignments(g);
 
@@ -1050,27 +1070,26 @@ int dag_recalculate(dag_t *g)
 		goto out;
 
 	res = 0;
+	g->dirty = false;
 
 out:
 	free(topo);
 	free(sources);
 	free(sinks);
-	if (res < 0)
+	if (res < 0) {
 		clear_assignments(g);
+		g->dirty = true;
+	}
 	return res;
 }
 
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 {
 	if (!g || !cb) { errno = EINVAL; return -1; }
-	dag_node_t *n;
-	spa_list_for_each(n, &g->nodes, link) {
-		if (!n->deadline_assigned) {
-			if (dag_recalculate(g) < 0) return -1;
-			break;
-		}
-	}
+	if (g->dirty && dag_recalculate(g) < 0)
+		return -1;
 
+	dag_node_t *n;
 	spa_list_for_each(n, &g->nodes, link) {
 		cb(data, n->tid, n->wcet, n->deadline, g->period, n->cpu);
 	}

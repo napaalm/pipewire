@@ -32,6 +32,8 @@ typedef struct dag_node dag_node_t;
 typedef struct dag_edge dag_edge_t;
 typedef struct dag dag_t;
 
+#define DAG_CPU_INVALID UINT32_MAX
+
 struct dag_node {
 	struct spa_list link;        /* link in dag->nodes */
 	struct spa_list outgoing;    /* list of outgoing edges (dag_edge_t) */
@@ -40,7 +42,7 @@ struct dag_node {
 	uint32_t id;
 	uint64_t wcet;       /* worst case execution time */
 	uint64_t deadline;   /* assigned relative deadline */
-	uint32_t cpu;        /* assigned CPU */
+	uint32_t cpu;        /* assigned CPU, or DAG_CPU_INVALID while stale */
 	pid_t tid;           /* associated thread id */
 
 	bool deadline_assigned;
@@ -59,6 +61,7 @@ struct dag {
 	uint64_t deadline;  /* global end-to-end deadline */
 	float utilization;  /* max topology-aware per-CPU DAG load */
 	uint32_t num_cpus;
+	bool dirty;          /* computed deadlines and CPUs are stale */
 
 	struct spa_list nodes; /* list of dag_node_t */
 	struct spa_list edges; /* list of dag_edge_t */
@@ -79,7 +82,10 @@ struct dag {
 dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus);
 void dag_destroy(dag_t *g);
 
-/* Set global period and deadline */
+/* Set global period and deadline.
+ * Successful timing or topology mutations mark the DAG dirty and clear any
+ * previously computed deadlines and CPU assignments.
+ */
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline);
 
 /* Add and remove nodes */
@@ -96,11 +102,14 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
 
 /* Recalculate scheduling parameters after changes.
- * On failure, any previously assigned deadlines/CPUs are cleared.
+ * On success, the DAG becomes clean. On failure, assigned deadlines/CPUs are
+ * cleared and the DAG remains dirty.
  */
 int dag_recalculate(dag_t *g);
 
-/* Apply a function to all tids with current scheduling parameters */
+/* Apply a function to all tids with current scheduling parameters.
+ * If the DAG is dirty, this recalculates scheduling parameters first.
+ */
 typedef void (*dag_node_callback_t)(void *data, pid_t tid, uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);
 
