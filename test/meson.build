@@ -83,6 +83,15 @@ test('test-loop',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-dag',
+    executable('test-module-deadline-dag',
+               'test-module-deadline-dag.c',
+               '../src/modules/module-deadline/dag.c',
+               include_directories: [pwtest_inc, include_directories('../src/modules')],
+               dependencies: [ spa_dep, pipewire_dep, mathlib, dl_lib ],
+               link_with: pwtest_lib)
+)
+
 if get_option('spa-plugins').allowed()
 test('test-context',
     executable('test-context',
