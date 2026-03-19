@@ -43,6 +43,46 @@ typedef struct {
 	int count;
 } node_array_t;
 
+struct node_index_entry {
+	dag_node_t *node;
+	int index;
+};
+
+struct density_order_entry {
+	int index;
+	double density;
+};
+
+struct cpu_assignment_info {
+	dag_node_t *node;
+	int index;
+	double density;
+};
+
+struct dag_recompute_workspace {
+	node_array_t topo;
+	struct node_index_entry *node_index;
+	int *indegree;
+	int *queue;
+	uint64_t *wcet_dist;
+	uint64_t *deadline_dist;
+	uint64_t *path_dist;
+	int *path_parent;
+	bool *path_reachable;
+	dag_node_t **path_nodes;
+	bool *path_excluded;
+	bool *reachable;
+	bool *related;
+	double *density;
+	struct cpu_assignment_info *cpu_info;
+	uint32_t *placement;
+	struct density_order_entry *cpu_candidates;
+	dag_node_t **sources;
+	dag_node_t **sinks;
+	int source_count;
+	int sink_count;
+};
+
 static node_array_t dag_nodes_to_array(dag_t *g)
 {
 	node_array_t arr = {
@@ -74,14 +114,46 @@ static node_array_t dag_nodes_to_array(dag_t *g)
 	return arr;
 }
 
-static int find_node_index(const node_array_t *arr, dag_node_t *node)
+static int compare_node_index_entry(const void *a, const void *b)
 {
-	for (int i = 0; i < arr->count; i++) {
-		if (arr->nodes[i] == node)
-			return i;
+	const struct node_index_entry *entry_a = a;
+	const struct node_index_entry *entry_b = b;
+	uintptr_t ptr_a = (uintptr_t) entry_a->node;
+	uintptr_t ptr_b = (uintptr_t) entry_b->node;
+
+	if (ptr_a < ptr_b)
+		return -1;
+	if (ptr_a > ptr_b)
+		return 1;
+	return 0;
+}
+
+static void build_node_index_map(struct node_index_entry *entries,
+		dag_node_t **nodes, int count)
+{
+	for (int i = 0; i < count; i++) {
+		entries[i].node = nodes[i];
+		entries[i].index = i;
 	}
 
-	return -1;
+	qsort(entries, (size_t) count, sizeof(*entries), compare_node_index_entry);
+}
+
+static int lookup_node_index(const struct node_index_entry *entries, int count,
+		dag_node_t *node)
+{
+	struct node_index_entry key = {
+		.node = node,
+		.index = 0,
+	};
+	const struct node_index_entry *entry;
+
+	entry = bsearch(&key, entries, (size_t) count, sizeof(*entries),
+			compare_node_index_entry);
+	if (!entry)
+		return -1;
+
+	return entry->index;
 }
 
 static int validate_global_timing_contract(uint64_t period, uint64_t deadline)
@@ -308,6 +380,7 @@ static dag_node_t *find_node(dag_t *g, uint32_t id)
 static int node_reaches(dag_t *g, dag_node_t *src, dag_node_t *dst)
 {
 	node_array_t arr;
+	struct node_index_entry *node_index = NULL;
 	bool *visited = NULL;
 	int *stack = NULL;
 	int src_idx, dst_idx;
@@ -323,8 +396,13 @@ static int node_reaches(dag_t *g, dag_node_t *src, dag_node_t *dst)
 	if (arr.count == 0)
 		return 0;
 
-	src_idx = find_node_index(&arr, src);
-	dst_idx = find_node_index(&arr, dst);
+	node_index = calloc((size_t) arr.count, sizeof(*node_index));
+	if (!node_index)
+		goto out;
+	build_node_index_map(node_index, arr.nodes, arr.count);
+
+	src_idx = lookup_node_index(node_index, arr.count, src);
+	dst_idx = lookup_node_index(node_index, arr.count, dst);
 	if (src_idx < 0 || dst_idx < 0) {
 		errno = EFAULT;
 		result = -1;
@@ -346,7 +424,7 @@ static int node_reaches(dag_t *g, dag_node_t *src, dag_node_t *dst)
 		dag_edge_t *e;
 
 		spa_list_for_each(e, &arr.nodes[u]->outgoing, src_link) {
-			int v = find_node_index(&arr, e->dst);
+			int v = lookup_node_index(node_index, arr.count, e->dst);
 
 			if (v < 0) {
 				errno = EFAULT;
@@ -367,6 +445,7 @@ static int node_reaches(dag_t *g, dag_node_t *src, dag_node_t *dst)
 out:
 	free(stack);
 	free(visited);
+	free(node_index);
 	free(arr.nodes);
 	return result;
 }
@@ -507,291 +586,371 @@ enum path_search_result {
 	PATH_UNREACHABLE = 1,
 };
 
-static int topological_sort(dag_t *g, dag_node_t **out, int *out_count)
+static void clear_recompute_workspace(struct dag_recompute_workspace *ws)
 {
-	node_array_t arr = dag_nodes_to_array(g);
-	int *indegree = NULL;
-	int *queue = NULL;
+	free(ws->sinks);
+	free(ws->sources);
+	free(ws->cpu_candidates);
+	free(ws->placement);
+	free(ws->cpu_info);
+	free(ws->density);
+	free(ws->related);
+	free(ws->reachable);
+	free(ws->path_excluded);
+	free(ws->path_nodes);
+	free(ws->path_reachable);
+	free(ws->path_parent);
+	free(ws->path_dist);
+	free(ws->deadline_dist);
+	free(ws->wcet_dist);
+	free(ws->queue);
+	free(ws->indegree);
+	free(ws->node_index);
+	free(ws->topo.nodes);
+	memset(ws, 0, sizeof(*ws));
+}
+
+static int build_topological_order(dag_t *g, struct dag_recompute_workspace *ws)
+{
+	node_array_t arr;
 	int front = 0, back = 0;
 	int idx = 0;
-	int result = -1;
 
-	*out_count = 0;
-
+	arr = dag_nodes_to_array(g);
 	if (arr.count < 0)
 		return -1;
+	if (arr.count != ws->topo.count) {
+		free(arr.nodes);
+		errno = EFAULT;
+		return -1;
+	}
 	if (arr.count == 0) {
 		free(arr.nodes);
 		return 0;
 	}
 
-	indegree = calloc((size_t)arr.count, sizeof(*indegree));
-	queue = calloc((size_t)arr.count, sizeof(*queue));
-	if (!indegree || !queue)
-		goto out;
+	build_node_index_map(ws->node_index, arr.nodes, arr.count);
+	memset(ws->indegree, 0, (size_t) arr.count * sizeof(*ws->indegree));
 
 	for (int i = 0; i < arr.count; i++) {
-		dag_edge_t *e;
+		dag_edge_t *edge;
 
-		spa_list_for_each(e, &arr.nodes[i]->incoming, dst_link)
-			indegree[i]++;
+		spa_list_for_each(edge, &arr.nodes[i]->incoming, dst_link)
+			ws->indegree[i]++;
 	}
 
 	for (int i = 0; i < arr.count; i++) {
-		if (indegree[i] == 0)
-			queue[back++] = i;
+		if (ws->indegree[i] == 0)
+			ws->queue[back++] = i;
 	}
 
 	while (front < back) {
-		int u = queue[front++];
+		int u = ws->queue[front++];
 		dag_edge_t *edge;
 
-		out[idx++] = arr.nodes[u];
+		ws->topo.nodes[idx++] = arr.nodes[u];
 		spa_list_for_each(edge, &arr.nodes[u]->outgoing, src_link) {
-			int v = find_node_index(&arr, edge->dst);
+			int v = lookup_node_index(ws->node_index, arr.count, edge->dst);
 
 			if (v < 0) {
+				free(arr.nodes);
 				errno = EFAULT;
-				goto out;
+				return -1;
 			}
 
-			indegree[v]--;
-			if (indegree[v] == 0)
-				queue[back++] = v;
+			ws->indegree[v]--;
+			if (ws->indegree[v] == 0)
+				ws->queue[back++] = v;
 		}
 	}
 
-	if (idx != arr.count) {
+	free(arr.nodes);
+
+	if (idx != ws->topo.count) {
 		/* A partial order here means the graph contains a cycle. */
 		errno = ELOOP;
-		goto out;
+		return -1;
 	}
 
-	*out_count = idx;
-	result = 0;
-
-out:
-	free(queue);
-	free(indegree);
-	free(arr.nodes);
-	return result;
-}
-
-static int find_sources_and_sinks(dag_t *g, dag_node_t ***sources, int *nsources,
-		dag_node_t ***sinks, int *nsinks)
-{
-	size_t count = dag_list_len(&g->nodes);
-	dag_node_t **sarr = NULL;
-	dag_node_t **tarr = NULL;
-	int si = 0, ti = 0;
-
-	if (count > 0) {
-		sarr = calloc(count, sizeof(*sarr));
-		tarr = calloc(count, sizeof(*tarr));
-		if (!sarr || !tarr) {
-			free(sarr);
-			free(tarr);
-			return -1;
-		}
-	}
-
-	dag_node_t *n;
-	spa_list_for_each(n, &g->nodes, link) {
-		bool has_in = !spa_list_is_empty(&n->incoming);
-		bool has_out = !spa_list_is_empty(&n->outgoing);
-
-		if (!has_in)
-			sarr[si++] = n;
-		if (!has_out)
-			tarr[ti++] = n;
-	}
-
-	*sources = sarr;
-	*nsources = si;
-	*sinks = tarr;
-	*nsinks = ti;
+	build_node_index_map(ws->node_index, ws->topo.nodes, ws->topo.count);
 	return 0;
 }
 
-static int compute_graph_critical_bounds(const node_array_t *topo,
+static int build_reachability_matrix(struct dag_recompute_workspace *ws)
+{
+	size_t row_len = (size_t) ws->topo.count;
+
+	memset(ws->reachable, 0, row_len * row_len * sizeof(*ws->reachable));
+	memset(ws->related, 0, row_len * row_len * sizeof(*ws->related));
+
+	for (int i = ws->topo.count - 1; i >= 0; i--) {
+		dag_edge_t *edge;
+		bool *row = &ws->reachable[(size_t) i * row_len];
+
+		spa_list_for_each(edge, &ws->topo.nodes[i]->outgoing, src_link) {
+			int dst_idx = lookup_node_index(ws->node_index, ws->topo.count,
+					edge->dst);
+
+			if (dst_idx < 0) {
+				errno = EFAULT;
+				return -1;
+			}
+
+			row[dst_idx] = true;
+			for (int k = 0; k < ws->topo.count; k++) {
+				if (ws->reachable[(size_t) dst_idx * row_len + (size_t) k])
+					row[k] = true;
+			}
+		}
+	}
+
+	for (int i = 0; i < ws->topo.count; i++) {
+		ws->related[(size_t) i * row_len + (size_t) i] = true;
+		for (int j = i + 1; j < ws->topo.count; j++) {
+			bool pair_related =
+				ws->reachable[(size_t) i * row_len + (size_t) j] ||
+				ws->reachable[(size_t) j * row_len + (size_t) i];
+
+			ws->related[(size_t) i * row_len + (size_t) j] = pair_related;
+			ws->related[(size_t) j * row_len + (size_t) i] = pair_related;
+		}
+	}
+
+	return 0;
+}
+
+static int init_recompute_workspace(dag_t *g, struct dag_recompute_workspace *ws)
+{
+	size_t node_count = dag_list_len(&g->nodes);
+	size_t matrix_elems = 0;
+
+	memset(ws, 0, sizeof(*ws));
+
+	if (node_count > INT_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+
+	ws->topo.count = (int) node_count;
+	if (ws->topo.count == 0)
+		return 0;
+
+	if ((size_t) ws->topo.count > SIZE_MAX / (size_t) ws->topo.count) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	matrix_elems = (size_t) ws->topo.count * (size_t) ws->topo.count;
+
+	/* Cache the topological view and reusable scratch buffers for the whole
+	 * recomputation so longest-path queries and CPU-load preparation do not
+	 * rebuild the same topology data or churn temporary allocations.
+	 */
+	ws->topo.nodes = calloc(node_count, sizeof(*ws->topo.nodes));
+	ws->node_index = calloc(node_count, sizeof(*ws->node_index));
+	ws->indegree = calloc(node_count, sizeof(*ws->indegree));
+	ws->queue = calloc(node_count, sizeof(*ws->queue));
+	ws->wcet_dist = calloc(node_count, sizeof(*ws->wcet_dist));
+	ws->deadline_dist = calloc(node_count, sizeof(*ws->deadline_dist));
+	ws->path_dist = calloc(node_count, sizeof(*ws->path_dist));
+	ws->path_parent = malloc(node_count * sizeof(*ws->path_parent));
+	ws->path_reachable = calloc(node_count, sizeof(*ws->path_reachable));
+	ws->path_nodes = calloc(node_count, sizeof(*ws->path_nodes));
+	ws->path_excluded = calloc(node_count, sizeof(*ws->path_excluded));
+	ws->reachable = calloc(matrix_elems, sizeof(*ws->reachable));
+	ws->related = calloc(matrix_elems, sizeof(*ws->related));
+	ws->density = calloc(node_count, sizeof(*ws->density));
+	ws->cpu_info = calloc(node_count, sizeof(*ws->cpu_info));
+	ws->placement = malloc(node_count * sizeof(*ws->placement));
+	ws->cpu_candidates = calloc(node_count, sizeof(*ws->cpu_candidates));
+	ws->sources = calloc(node_count, sizeof(*ws->sources));
+	ws->sinks = calloc(node_count, sizeof(*ws->sinks));
+	if (!ws->topo.nodes || !ws->node_index || !ws->indegree || !ws->queue ||
+			!ws->wcet_dist || !ws->deadline_dist || !ws->path_dist ||
+			!ws->path_parent || !ws->path_reachable || !ws->path_nodes ||
+			!ws->path_excluded || !ws->reachable || !ws->related ||
+			!ws->density || !ws->cpu_info || !ws->placement ||
+			!ws->cpu_candidates || !ws->sources || !ws->sinks)
+		goto fail;
+
+	if (build_topological_order(g, ws) < 0 || build_reachability_matrix(ws) < 0)
+		goto fail;
+
+	return 0;
+
+fail:
+	clear_recompute_workspace(ws);
+	return -1;
+}
+
+static int find_sources_and_sinks(dag_t *g, struct dag_recompute_workspace *ws)
+{
+	dag_node_t *node;
+
+	ws->source_count = 0;
+	ws->sink_count = 0;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		bool has_in = !spa_list_is_empty(&node->incoming);
+		bool has_out = !spa_list_is_empty(&node->outgoing);
+
+		if (!has_in)
+			ws->sources[ws->source_count++] = node;
+		if (!has_out)
+			ws->sinks[ws->sink_count++] = node;
+	}
+
+	return 0;
+}
+
+static int node_reaches_in_workspace(const struct dag_recompute_workspace *ws,
+		dag_node_t *src, dag_node_t *dst)
+{
+	int src_idx, dst_idx;
+
+	if (src == dst)
+		return 1;
+
+	src_idx = lookup_node_index(ws->node_index, ws->topo.count, src);
+	dst_idx = lookup_node_index(ws->node_index, ws->topo.count, dst);
+	if (src_idx < 0 || dst_idx < 0) {
+		errno = EFAULT;
+		return -1;
+	}
+
+	return ws->reachable[(size_t) src_idx * (size_t) ws->topo.count +
+			(size_t) dst_idx] ? 1 : 0;
+}
+
+static int compute_graph_critical_bounds(struct dag_recompute_workspace *ws,
 		uint64_t *critical_wcet_out,
 		uint64_t *critical_deadline_weight_out)
 {
-	uint64_t *wcet_dist = NULL;
-	uint64_t *deadline_dist = NULL;
 	uint64_t critical_wcet = 0;
 	uint64_t critical_deadline_weight = 0;
-	int result = -1;
 
 	*critical_wcet_out = 0;
 	*critical_deadline_weight_out = 0;
 
-	if (topo->count == 0)
+	if (ws->topo.count == 0)
 		return 0;
 
-	wcet_dist = calloc((size_t) topo->count, sizeof(*wcet_dist));
-	deadline_dist = calloc((size_t) topo->count, sizeof(*deadline_dist));
-	if (!wcet_dist || !deadline_dist)
-		goto out;
+	memset(ws->wcet_dist, 0, (size_t) ws->topo.count * sizeof(*ws->wcet_dist));
+	memset(ws->deadline_dist, 0,
+			(size_t) ws->topo.count * sizeof(*ws->deadline_dist));
 
-	for (int i = 0; i < topo->count; i++) {
+	for (int i = 0; i < ws->topo.count; i++) {
 		uint64_t best_pred_wcet = 0;
 		uint64_t best_pred_deadline = 0;
 		dag_edge_t *edge;
 
-		spa_list_for_each(edge, &topo->nodes[i]->incoming, dst_link) {
-			int pred_idx = find_node_index(topo, edge->src);
+		spa_list_for_each(edge, &ws->topo.nodes[i]->incoming, dst_link) {
+			int pred_idx = lookup_node_index(ws->node_index, ws->topo.count,
+					edge->src);
 
 			if (pred_idx < 0) {
 				errno = EFAULT;
-				goto out;
+				return -1;
 			}
 
-			if (wcet_dist[pred_idx] > best_pred_wcet)
-				best_pred_wcet = wcet_dist[pred_idx];
-			if (deadline_dist[pred_idx] > best_pred_deadline)
-				best_pred_deadline = deadline_dist[pred_idx];
+			if (ws->wcet_dist[pred_idx] > best_pred_wcet)
+				best_pred_wcet = ws->wcet_dist[pred_idx];
+			if (ws->deadline_dist[pred_idx] > best_pred_deadline)
+				best_pred_deadline = ws->deadline_dist[pred_idx];
 		}
 
-		if (add_u64_checked(best_pred_wcet, topo->nodes[i]->wcet,
-					&wcet_dist[i]) < 0)
-			goto out;
+		if (add_u64_checked(best_pred_wcet, ws->topo.nodes[i]->wcet,
+					&ws->wcet_dist[i]) < 0)
+			return -1;
 		if (add_u64_checked(best_pred_deadline,
-					node_deadline_weight(topo->nodes[i]),
-					&deadline_dist[i]) < 0)
-			goto out;
+					node_deadline_weight(ws->topo.nodes[i]),
+					&ws->deadline_dist[i]) < 0)
+			return -1;
 
-		if (wcet_dist[i] > critical_wcet)
-			critical_wcet = wcet_dist[i];
-		if (deadline_dist[i] > critical_deadline_weight)
-			critical_deadline_weight = deadline_dist[i];
+		if (ws->wcet_dist[i] > critical_wcet)
+			critical_wcet = ws->wcet_dist[i];
+		if (ws->deadline_dist[i] > critical_deadline_weight)
+			critical_deadline_weight = ws->deadline_dist[i];
 	}
 
 	*critical_wcet_out = critical_wcet;
 	*critical_deadline_weight_out = critical_deadline_weight;
-	result = 0;
-
-out:
-	free(deadline_dist);
-	free(wcet_dist);
-	return result;
+	return 0;
 }
 
-static int compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
-		dag_node_t ***path_out, int *path_len_out, uint64_t *path_wcet_out)
+static int compute_longest_path(struct dag_recompute_workspace *ws,
+		dag_node_t *src, dag_node_t *dst, int *path_len_out,
+		uint64_t *path_wcet_out)
 {
-	dag_node_t **topo = NULL;
-	uint64_t *dist = NULL;
-	int *parent = NULL;
-	bool *reachable = NULL;
-	int topo_len = 0;
 	int src_idx = -1, dst_idx = -1;
-	int result = -1;
-
-	*path_out = NULL;
 	*path_len_out = 0;
 	*path_wcet_out = 0;
 
 	if (src == dst) {
-		dag_node_t **p = malloc(sizeof(*p));
-
-		if (!p)
-			return -1;
-
-		p[0] = src;
-		*path_out = p;
+		ws->path_nodes[0] = src;
 		*path_len_out = 1;
 		*path_wcet_out = src->wcet;
 		return PATH_FOUND;
 	}
 
-	topo = calloc(dag_list_len(&g->nodes), sizeof(*topo));
-	if (!topo)
-		return -1;
+	src_idx = lookup_node_index(ws->node_index, ws->topo.count, src);
+	dst_idx = lookup_node_index(ws->node_index, ws->topo.count, dst);
+	if (src_idx < 0 || dst_idx < 0 || src_idx > dst_idx)
+		return PATH_UNREACHABLE;
+	if (!ws->reachable[(size_t) src_idx * (size_t) ws->topo.count +
+			(size_t) dst_idx])
+		return PATH_UNREACHABLE;
 
-	if (topological_sort(g, topo, &topo_len) < 0)
-		goto out;
-	if (topo_len == 0) {
-		result = PATH_UNREACHABLE;
-		goto out;
-	}
+	memset(ws->path_dist, 0,
+			(size_t) ws->topo.count * sizeof(*ws->path_dist));
+	memset(ws->path_reachable, 0,
+			(size_t) ws->topo.count * sizeof(*ws->path_reachable));
+	for (int i = 0; i < ws->topo.count; i++)
+		ws->path_parent[i] = -1;
 
-	for (int i = 0; i < topo_len; i++) {
-		if (topo[i] == src)
-			src_idx = i;
-		if (topo[i] == dst)
-			dst_idx = i;
-	}
-
-	if (src_idx < 0 || dst_idx < 0 || src_idx > dst_idx) {
-		result = PATH_UNREACHABLE;
-		goto out;
-	}
-
-	dist = calloc((size_t)topo_len, sizeof(*dist));
-	parent = malloc((size_t)topo_len * sizeof(*parent));
-	reachable = calloc((size_t)topo_len, sizeof(*reachable));
-	if (!dist || !parent || !reachable)
-		goto out;
-
-	for (int i = 0; i < topo_len; i++)
-		parent[i] = -1;
-
-	reachable[src_idx] = true;
-	dist[src_idx] = topo[src_idx]->wcet;
+	ws->path_reachable[src_idx] = true;
+	ws->path_dist[src_idx] = ws->topo.nodes[src_idx]->wcet;
 
 	for (int i = src_idx; i <= dst_idx; i++) {
-		dag_node_t *u = topo[i];
+		dag_node_t *u = ws->topo.nodes[i];
 		dag_edge_t *e;
 
-		if (!reachable[i])
+		if (!ws->path_reachable[i])
 			continue;
 
 		spa_list_for_each(e, &u->outgoing, src_link) {
-			int v = -1;
+			int v = lookup_node_index(ws->node_index, ws->topo.count,
+					e->dst);
 
-			for (int k = i + 1; k <= dst_idx; k++) {
-				if (topo[k] == e->dst) {
-					v = k;
-					break;
-				}
+			if (v < 0) {
+				errno = EFAULT;
+				return -1;
 			}
-			if (v >= 0 && (!reachable[v] ||
-					dist[i] + e->dst->wcet > dist[v])) {
-				reachable[v] = true;
-				dist[v] = dist[i] + e->dst->wcet;
-				parent[v] = i;
+			if (v > dst_idx)
+				continue;
+
+			if (!ws->path_reachable[v] ||
+					ws->path_dist[i] + e->dst->wcet >
+					ws->path_dist[v]) {
+				ws->path_reachable[v] = true;
+				ws->path_dist[v] = ws->path_dist[i] + e->dst->wcet;
+				ws->path_parent[v] = i;
 			}
 		}
 	}
 
-	if (!reachable[dst_idx]) {
-		result = PATH_UNREACHABLE;
-		goto out;
-	}
+	if (!ws->path_reachable[dst_idx])
+		return PATH_UNREACHABLE;
 
 	int path_len = 0;
-	for (int cur = dst_idx; cur != -1; cur = parent[cur])
+	for (int cur = dst_idx; cur != -1; cur = ws->path_parent[cur])
 		path_len++;
 
-	dag_node_t **path = malloc((size_t)path_len * sizeof(*path));
-	if (!path)
-		goto out;
-
-	for (int cur = dst_idx, pos = path_len - 1; cur != -1; cur = parent[cur])
-		path[pos--] = topo[cur];
-
-	*path_out = path;
+	for (int cur = dst_idx, pos = path_len - 1; cur != -1;
+			cur = ws->path_parent[cur])
+		ws->path_nodes[pos--] = ws->topo.nodes[cur];
 	*path_len_out = path_len;
-	*path_wcet_out = dist[dst_idx];
-	result = PATH_FOUND;
-
-out:
-	free(reachable);
-	free(parent);
-	free(dist);
-	free(topo);
-	return result;
+	*path_wcet_out = ws->path_dist[dst_idx];
+	return PATH_FOUND;
 }
 
 static int compute_path_deadline_weight(dag_node_t **path, int path_len,
@@ -838,7 +997,9 @@ static int assign_or_tighten_deadline(dag_node_t *node, uint64_t deadline)
 	return 0;
 }
 
-static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst, uint64_t D)
+static int assign_deadlines_recursive(dag_t *g,
+		struct dag_recompute_workspace *ws, dag_node_t *src,
+		dag_node_t *dst, uint64_t D)
 {
 	if (src == dst) {
 		if (D == 0 && src->deadline_assigned)
@@ -852,30 +1013,26 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	}
 
 	/* Phase A: compute the critical path for this subproblem. */
-	dag_node_t **P = NULL;
+	dag_node_t **P = ws->path_nodes;
 	int path_len = 0;
 	uint64_t L = 0;
 	uint64_t path_deadline_weight = 0;
-	int path_result = compute_longest_path(g, src, dst, &P, &path_len, &L);
+	int path_result = compute_longest_path(ws, src, dst, &path_len, &L);
 	if (path_result < 0)
 		return -1;
 	if (path_result == PATH_UNREACHABLE)
 		return 0;
-	if (compute_path_deadline_weight(P, path_len, &path_deadline_weight) < 0) {
-		free(P);
+	if (compute_path_deadline_weight(P, path_len, &path_deadline_weight) < 0)
 		return -1;
-	}
 
 	if (D == 0) {
 		for (int i = 0; i < path_len; i++) {
 			if (!P[i]->deadline_assigned) {
-				free(P);
 				errno = EAGAIN;
 				return -1;
 			}
 		}
 
-		free(P);
 		return 0;
 	}
 
@@ -888,11 +1045,9 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	uint64_t residual_deadline_weight = path_deadline_weight;
 	bool src_discounted = false;
 	uint64_t discounted_src_deadline = 0;
-	bool *excluded = calloc((size_t)path_len, sizeof(*excluded));
-	if (!excluded) {
-		free(P);
-		return -1;
-	}
+	bool *excluded = ws->path_excluded;
+
+	memset(excluded, 0, (size_t) path_len * sizeof(*excluded));
 
 	bool changed = true;
 	while (changed) {
@@ -900,7 +1055,7 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 		if (residual_deadline_weight == 0)
 			break;
 
-		for (int i=0; i<path_len; i++) {
+		for (int i = 0; i < path_len; i++) {
 			if (excluded[i])
 				continue;
 
@@ -917,8 +1072,6 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 						sub_u64_checked(residual_deadline_weight,
 							node_weight,
 							&residual_deadline_weight) < 0) {
-					free(excluded);
-					free(P);
 					return -1;
 				}
 				if (ni == src) {
@@ -928,28 +1081,19 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 				excluded[i] = true;
 				if (validate_deadline_budget(residual_deadline, residual_wcet,
 							residual_deadline_weight) < 0 &&
-						residual_deadline_weight != 0) {
-					free(excluded);
-					free(P);
+						residual_deadline_weight != 0)
 					return -1;
-				}
 				changed = true;
 				break;
 			}
 		}
 	}
 
-	if (residual_deadline_weight == 0) {
-		free(excluded);
-		free(P);
+	if (residual_deadline_weight == 0)
 		return 0;
-	}
 	if (validate_deadline_budget(residual_deadline, residual_wcet,
-				residual_deadline_weight) < 0) {
-		free(excluded);
-		free(P);
+				residual_deadline_weight) < 0)
 		return -1;
-	}
 
 	/* Phase C: assign/tighten the endpoints with the updated residual budget
 	 * and recurse with the budget left after the current source.
@@ -964,21 +1108,15 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	uint64_t src_weight = node_deadline_weight(n_src);
 	uint64_t d_prime_src = proportional_deadline(residual_deadline,
 			src_weight, residual_deadline_weight);
-	if (assign_or_tighten_deadline(n_src, d_prime_src) < 0) {
-		free(excluded);
-		free(P);
+	if (assign_or_tighten_deadline(n_src, d_prime_src) < 0)
 		return -1;
-	}
-	
+
 	dag_node_t *n_dst = P[path_len - 1];
 	uint64_t dst_weight = node_deadline_weight(n_dst);
 	uint64_t d_prime_dst = proportional_deadline(residual_deadline,
 			dst_weight, residual_deadline_weight);
-	if (assign_or_tighten_deadline(n_dst, d_prime_dst) < 0) {
-		free(excluded);
-		free(P);
+	if (assign_or_tighten_deadline(n_dst, d_prime_dst) < 0)
 		return -1;
-	}
 
 	uint64_t D_residual = 0;
 	if (src_discounted) {
@@ -992,61 +1130,40 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 				sub_u64_checked(discounted_src_deadline,
 					n_src->deadline, &refund) < 0 ||
 				add_u64_checked(residual_deadline, refund,
-					&D_residual) < 0) {
-			free(excluded);
-			free(P);
+					&D_residual) < 0)
 			return -1;
-		}
 	} else {
 		if (sub_u64_checked(residual_deadline, n_src->deadline,
-					&D_residual) < 0) {
-			free(excluded);
-			free(P);
+					&D_residual) < 0)
 			return -1;
-		}
 	}
 
+	/* The workspace path buffers are scratch-only. Finish the current level
+	 * before recursing because child subproblems overwrite the same buffers.
+	 */
 	dag_edge_t *e;
 	spa_list_for_each(e, &src->outgoing, src_link) {
 		if (e->dst != dst) {
-			int reaches = node_reaches(g, e->dst, dst);
+			int reaches = node_reaches_in_workspace(ws, e->dst, dst);
 
 			/* For generic DAGs, a source can fan out toward different sinks.
 			 * Recurse only into successors that still belong to this source ->
 			 * sink subproblem.
 			 */
-			if (reaches < 0) {
-				free(excluded);
-				free(P);
+			if (reaches < 0)
 				return -1;
-			}
 			if (!reaches)
 				continue;
 
-			int r = assign_deadlines_recursive(g, e->dst, dst, D_residual);
-			if (r < 0) {
-				free(excluded);
-				free(P);
+			int r = assign_deadlines_recursive(g, ws, e->dst, dst,
+					D_residual);
+			if (r < 0)
 				return r;
-			}
 		}
 	}
 
-	free(excluded);
-	free(P);
 	return 0;
 }
-
-struct density_order_entry {
-	int index;
-	double density;
-};
-
-struct cpu_assignment_info {
-	dag_node_t *node;
-	int index;
-	double density;
-};
 
 static int compare_density_desc(double a_density, int a_key,
 		double b_density, int b_key)
@@ -1082,116 +1199,6 @@ static int compare_cpu_assignment_info_desc(const void *a, const void *b)
 	/* Place denser tasks first. Equal-density nodes keep topological order. */
 	return compare_density_desc(info_a->density, info_a->index,
 			info_b->density, info_b->index);
-}
-
-static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
-		bool **related_out, double **density_out, int *count_out)
-{
-	size_t node_count;
-	node_array_t topo = {
-		.nodes = NULL,
-		.count = 0,
-	};
-	bool *reachable = NULL;
-	bool *related = NULL;
-	double *density = NULL;
-	size_t matrix_elems;
-	int result = -1;
-
-	*nodes_out = NULL;
-	*related_out = NULL;
-	*density_out = NULL;
-	*count_out = 0;
-
-	node_count = dag_list_len(&g->nodes);
-	if (node_count > INT_MAX) {
-		errno = EOVERFLOW;
-		return -1;
-	}
-	topo.count = (int) node_count;
-	if (topo.count == 0)
-		return 0;
-
-	topo.nodes = calloc((size_t) topo.count, sizeof(*topo.nodes));
-	if (!topo.nodes)
-		return -1;
-
-	if (topological_sort(g, topo.nodes, &topo.count) < 0)
-		goto out;
-
-	if ((size_t) topo.count > SIZE_MAX / (size_t) topo.count) {
-		errno = EOVERFLOW;
-		goto out;
-	}
-
-	matrix_elems = (size_t) topo.count * (size_t) topo.count;
-	reachable = calloc(matrix_elems, sizeof(*reachable));
-	related = calloc(matrix_elems, sizeof(*related));
-	density = calloc((size_t) topo.count, sizeof(*density));
-	if (!reachable || !related || !density)
-		goto out;
-
-	for (int i = 0; i < topo.count; i++) {
-		uint64_t denom;
-
-		if (validate_assigned_node_parameters(g, topo.nodes[i]) < 0)
-			goto out;
-
-		denom = topo.nodes[i]->deadline < g->period ?
-				topo.nodes[i]->deadline : g->period;
-
-		/* Deadline/period remain exact uint64_t values; density is the
-		 * derived floating-point load used only for CPU admission.
-		 */
-		density[i] = (double) topo.nodes[i]->wcet / (double) denom;
-	}
-
-	for (int i = topo.count - 1; i >= 0; i--) {
-		dag_edge_t *e;
-
-		spa_list_for_each(e, &topo.nodes[i]->outgoing, src_link) {
-			int dst_idx = find_node_index(&topo, e->dst);
-
-			if (dst_idx < 0) {
-				errno = EFAULT;
-				goto out;
-			}
-
-			reachable[(size_t) i * (size_t) topo.count + (size_t) dst_idx] = true;
-			for (int k = 0; k < topo.count; k++) {
-				if (reachable[(size_t) dst_idx * (size_t) topo.count + (size_t) k]) {
-					reachable[(size_t) i * (size_t) topo.count + (size_t) k] = true;
-				}
-			}
-		}
-	}
-
-	for (int i = 0; i < topo.count; i++) {
-		related[(size_t) i * (size_t) topo.count + (size_t) i] = true;
-		for (int j = i + 1; j < topo.count; j++) {
-			bool pair_related =
-				reachable[(size_t) i * (size_t) topo.count + (size_t) j] ||
-				reachable[(size_t) j * (size_t) topo.count + (size_t) i];
-
-			related[(size_t) i * (size_t) topo.count + (size_t) j] = pair_related;
-			related[(size_t) j * (size_t) topo.count + (size_t) i] = pair_related;
-		}
-	}
-
-	*nodes_out = topo.nodes;
-	*related_out = related;
-	*density_out = density;
-	*count_out = topo.count;
-	result = 0;
-
-out:
-	free(reachable);
-	if (result < 0) {
-		free(density);
-		free(related);
-		free(topo.nodes);
-	}
-	return result;
 }
 
 static void search_max_unrelated_density(const bool *related, int node_count,
@@ -1245,12 +1252,12 @@ static void search_max_unrelated_density(const bool *related, int node_count,
 
 static double compute_cpu_load_exact(const bool *related, const double *density,
 		const uint32_t *placement, int node_count, uint32_t cpu,
-		int tentative_idx, uint32_t tentative_cpu)
+		int tentative_idx, uint32_t tentative_cpu,
+		struct density_order_entry *candidates)
 {
 	double remaining_density = 0.0;
 	double best_density = 0.0;
 	int candidate_count = 0;
-	struct density_order_entry candidates[node_count > 0 ? node_count : 1];
 
 	for (int i = 0; i < node_count; i++) {
 		uint32_t assigned_cpu = placement[i];
@@ -1292,39 +1299,39 @@ static bool prefer_cpu_choice(double load, uint32_t cpu,
 	return double_equal_eps(load, best_load) && (int) cpu < best_cpu;
 }
 
-static int assign_cpus(dag_t *g)
+static int assign_cpus(dag_t *g, struct dag_recompute_workspace *ws)
 {
-	dag_node_t **nodes = NULL;
-	bool *related = NULL;
-	double *density = NULL;
-	uint32_t *placement = NULL;
-	int node_count = 0;
-	int result = -1;
-	struct cpu_assignment_info *info = NULL;
+	int node_count = ws->topo.count;
 
 	/* For a single DAG, the load of one CPU is the maximum total density of
 	 * any pairwise unrelated set assigned there, not the raw sum of all node
-	 * densities. We build the exact reachability closure once, then solve the
-	 * maximum-weight unrelated set problem exactly for each tentative CPU.
+	 * densities. Reuse the topological view and relatedness matrix prepared
+	 * once for this recomputation, then solve the maximum-weight unrelated set
+	 * problem exactly for each tentative CPU.
 	 */
-	if (build_relatedness_matrix(g, &nodes, &related, &density, &node_count) < 0)
-		return -1;
 	if (node_count == 0)
 		return 0;
 
-	info = calloc((size_t) node_count, sizeof(*info));
-	placement = malloc((size_t) node_count * sizeof(*placement));
-	if (!info || !placement)
-		goto out;
-
 	for (int i = 0; i < node_count; i++) {
-		info[i].node = nodes[i];
-		info[i].index = i;
-		info[i].density = density[i];
-		placement[i] = UINT32_MAX;
+		uint64_t denom;
+
+		if (validate_assigned_node_parameters(g, ws->topo.nodes[i]) < 0)
+			return -1;
+
+		denom = ws->topo.nodes[i]->deadline < g->period ?
+				ws->topo.nodes[i]->deadline : g->period;
+
+		/* Deadline/period remain exact uint64_t values; density is the
+		 * derived floating-point load used only for CPU admission.
+		 */
+		ws->density[i] = (double) ws->topo.nodes[i]->wcet / (double) denom;
+		ws->cpu_info[i].node = ws->topo.nodes[i];
+		ws->cpu_info[i].index = i;
+		ws->cpu_info[i].density = ws->density[i];
+		ws->placement[i] = UINT32_MAX;
 	}
 
-	qsort(info, (size_t) node_count, sizeof(*info),
+	qsort(ws->cpu_info, (size_t) node_count, sizeof(*ws->cpu_info),
 			compare_cpu_assignment_info_desc);
 
 	for (int i = 0; i < node_count; i++) {
@@ -1332,9 +1339,10 @@ static int assign_cpus(dag_t *g)
 		double chosen_load = DBL_MAX;
 
 		for (uint32_t cpu = 0; cpu < g->num_cpus; cpu++) {
-			double load = compute_cpu_load_exact(related, density,
-					placement, node_count, cpu,
-					info[i].index, cpu);
+			double load = compute_cpu_load_exact(ws->related, ws->density,
+					ws->placement, node_count, cpu,
+					ws->cpu_info[i].index, cpu,
+					ws->cpu_candidates);
 
 			if (prefer_cpu_choice(load, cpu, chosen_load, chosen_cpu)) {
 				chosen_load = load;
@@ -1345,34 +1353,19 @@ static int assign_cpus(dag_t *g)
 		if (chosen_cpu < 0 ||
 				double_greater_eps(chosen_load, g->utilization)) {
 			errno = EAGAIN;
-			goto out;
+			return -1;
 		}
 
-		placement[info[i].index] = (uint32_t) chosen_cpu;
-		info[i].node->cpu = (uint32_t) chosen_cpu;
+		ws->placement[ws->cpu_info[i].index] = (uint32_t) chosen_cpu;
+		ws->cpu_info[i].node->cpu = (uint32_t) chosen_cpu;
 	}
 
-	result = 0;
-
-out:
-	free(placement);
-	free(info);
-	free(density);
-	free(related);
-	free(nodes);
-	return result;
+	return 0;
 }
 
 int dag_recalculate(dag_t *g)
 {
-	dag_node_t **sources = NULL, **sinks = NULL, **topo = NULL;
-	node_array_t topo_arr = {
-		.nodes = NULL,
-		.count = 0,
-	};
-	size_t node_count;
-	int nsources = 0, nsinks = 0;
-	int topo_len = 0;
+	struct dag_recompute_workspace ws = { 0 };
 	int res = -1;
 	uint64_t critical_wcet = 0;
 	uint64_t critical_deadline_weight = 0;
@@ -1391,42 +1384,30 @@ int dag_recalculate(dag_t *g)
 
 	clear_assignments(g);
 
-	node_count = dag_list_len(&g->nodes);
-	topo = calloc(node_count, sizeof(*topo));
-	if (!topo)
+	if (init_recompute_workspace(g, &ws) < 0)
 		goto out;
 
-	if (topological_sort(g, topo, &topo_len) < 0)
-		goto out;
-	if ((size_t)topo_len != node_count) {
-		errno = EFAULT;
-		goto out;
-	}
-	topo_arr.nodes = topo;
-	topo_arr.count = topo_len;
 	/* Fail before deadline splitting or CPU placement if the DAG-wide
 	 * critical path already exceeds the end-to-end budget.
 	 */
-	if (compute_graph_critical_bounds(&topo_arr, &critical_wcet,
+	if (compute_graph_critical_bounds(&ws, &critical_wcet,
 				&critical_deadline_weight) < 0)
 		goto out;
 	if (validate_deadline_budget(g->deadline, critical_wcet,
 				critical_deadline_weight) < 0)
 		goto out;
 
-	free(topo);
-	topo = NULL;
-
-	if (find_sources_and_sinks(g, &sources, &nsources, &sinks, &nsinks) < 0)
+	if (find_sources_and_sinks(g, &ws) < 0)
 		goto out;
-	if (nsources == 0 || nsinks == 0) {
+	if (ws.source_count == 0 || ws.sink_count == 0) {
 		errno = EINVAL;
 		goto out;
 	}
 
-	for (int i = 0; i < nsources; i++) {
-		for (int j = 0; j < nsinks; j++) {
-			int reaches = node_reaches(g, sources[i], sinks[j]);
+	for (int i = 0; i < ws.source_count; i++) {
+		for (int j = 0; j < ws.sink_count; j++) {
+			int reaches = node_reaches_in_workspace(&ws, ws.sources[i],
+					ws.sinks[j]);
 
 			/* Generic DAGs can have multiple sources/sinks or disconnected
 			 * components. Only reachable source/sink pairs participate in
@@ -1437,7 +1418,8 @@ int dag_recalculate(dag_t *g)
 			if (!reaches)
 				continue;
 
-			if (assign_deadlines_recursive(g, sources[i], sinks[j],
+			if (assign_deadlines_recursive(g, &ws, ws.sources[i],
+					ws.sinks[j],
 					g->deadline) < 0)
 				goto out;
 		}
@@ -1446,16 +1428,14 @@ int dag_recalculate(dag_t *g)
 	if (validate_assigned_schedule(g) < 0)
 		goto out;
 
-	if (assign_cpus(g) < 0)
+	if (assign_cpus(g, &ws) < 0)
 		goto out;
 
 	res = 0;
 	g->dirty = false;
 
 out:
-	free(topo);
-	free(sources);
-	free(sinks);
+	clear_recompute_workspace(&ws);
 	if (res < 0) {
 		clear_assignments(g);
 		g->dirty = true;
