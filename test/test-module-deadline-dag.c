@@ -476,6 +476,47 @@ PWTEST(chain_topology_aware_admission_regression)
 	return PWTEST_PASS;
 }
 
+PWTEST(independent_tasks_are_placed_by_descending_density)
+{
+	dag_t *g = create_test_dag(10, 2);
+	dag_node_t *a, *b, *c;
+
+	pwtest_int_eq(dag_add_node(g, 1, 5, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 4, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 3, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	c = find_node(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int) a->cpu, 0);
+	pwtest_int_eq((int) b->cpu, 1);
+	pwtest_int_eq((int) c->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(equal_load_ties_choose_lowest_cpu)
+{
+	dag_t *g = create_test_dag(9, 2);
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(multiple_sources_and_sinks_skip_unreachable_pairs)
 {
 	static const uint32_t left_path[] = { 1, 3, 5 };
@@ -700,6 +741,8 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);
 	pwtest_add(diamond_cpu_load_captures_parallelism, PWTEST_NOARG);
 	pwtest_add(chain_topology_aware_admission_regression, PWTEST_NOARG);
+	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
+	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);
 	pwtest_add(multiple_sources_and_sinks_skip_unreachable_pairs, PWTEST_NOARG);
 	pwtest_add(preassigned_tightening_residual_budget, PWTEST_NOARG);
 	pwtest_add(topo_sort_rejects_forced_cycle, PWTEST_NOARG);

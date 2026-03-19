@@ -931,18 +931,51 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	return 0;
 }
 
-static void sort_indices_by_density_desc(int *indices, int count, const double *density)
-{
-	for (int i = 1; i < count; i++) {
-		int cur = indices[i];
-		int j = i - 1;
+struct density_order_entry {
+	int index;
+	double density;
+};
 
-		while (j >= 0 && density[indices[j]] < density[cur]) {
-			indices[j + 1] = indices[j];
-			j--;
-		}
-		indices[j + 1] = cur;
-	}
+struct cpu_assignment_info {
+	dag_node_t *node;
+	int index;
+	double density;
+};
+
+static int compare_density_desc(double a_density, int a_key,
+		double b_density, int b_key)
+{
+	if (a_density < b_density)
+		return 1;
+	if (a_density > b_density)
+		return -1;
+	if (a_key > b_key)
+		return 1;
+	if (a_key < b_key)
+		return -1;
+	return 0;
+}
+
+static int compare_density_order_entry_desc(const void *a, const void *b)
+{
+	const struct density_order_entry *entry_a = a;
+	const struct density_order_entry *entry_b = b;
+
+	/* Visit denser candidates first for the branch-and-bound search.
+	 * Break ties by the topological index to keep traversal deterministic.
+	 */
+	return compare_density_desc(entry_a->density, entry_a->index,
+			entry_b->density, entry_b->index);
+}
+
+static int compare_cpu_assignment_info_desc(const void *a, const void *b)
+{
+	const struct cpu_assignment_info *info_a = a;
+	const struct cpu_assignment_info *info_b = b;
+
+	/* Place denser tasks first. Equal-density nodes keep topological order. */
+	return compare_density_desc(info_a->density, info_a->index,
+			info_b->density, info_b->index);
 }
 
 static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
@@ -1056,15 +1089,17 @@ out:
 	return result;
 }
 
-static void search_max_unrelated_density(const bool *related, const double *density,
-		int node_count, const int *candidates, int candidate_count,
+static void search_max_unrelated_density(const bool *related, int node_count,
+		const struct density_order_entry *candidates, int candidate_count,
 		double current_density, double remaining_density, double *best_density)
 {
+	const struct density_order_entry *current;
 	int v;
 	double remaining_without_v;
 	int include_count = 0;
 	double include_remaining = 0.0;
-	int next_candidates[candidate_count > 1 ? candidate_count - 1 : 1];
+	struct density_order_entry next_candidates[
+		candidate_count > 1 ? candidate_count - 1 : 1];
 
 	if (current_density > *best_density)
 		*best_density = current_density;
@@ -1073,27 +1108,29 @@ static void search_max_unrelated_density(const bool *related, const double *dens
 			current_density + remaining_density <= *best_density)
 		return;
 
-	v = candidates[0];
-	remaining_without_v = remaining_density - density[v];
+	current = &candidates[0];
+	v = current->index;
+	remaining_without_v = remaining_density - current->density;
 
 	for (int i = 1; i < candidate_count; i++) {
-		int candidate = candidates[i];
+		const struct density_order_entry *candidate = &candidates[i];
 
-		if (!related[(size_t) v * (size_t) node_count + (size_t) candidate]) {
-			next_candidates[include_count++] = candidate;
-			include_remaining += density[candidate];
+		if (!related[(size_t) v * (size_t) node_count +
+				(size_t) candidate->index]) {
+			next_candidates[include_count++] = *candidate;
+			include_remaining += candidate->density;
 		}
 	}
 
-	search_max_unrelated_density(related, density, node_count,
+	search_max_unrelated_density(related, node_count,
 			next_candidates, include_count,
-			current_density + density[v], include_remaining,
+			current_density + current->density, include_remaining,
 			best_density);
 
 	if (current_density + remaining_without_v <= *best_density)
 		return;
 
-	search_max_unrelated_density(related, density, node_count,
+	search_max_unrelated_density(related, node_count,
 			&candidates[1], candidate_count - 1,
 			current_density, remaining_without_v, best_density);
 }
@@ -1105,7 +1142,7 @@ static double compute_cpu_load_exact(const bool *related, const double *density,
 	double remaining_density = 0.0;
 	double best_density = 0.0;
 	int candidate_count = 0;
-	int candidates[node_count > 0 ? node_count : 1];
+	struct density_order_entry candidates[node_count > 0 ? node_count : 1];
 
 	for (int i = 0; i < node_count; i++) {
 		uint32_t assigned_cpu = placement[i];
@@ -1116,18 +1153,35 @@ static double compute_cpu_load_exact(const bool *related, const double *density,
 		if (assigned_cpu != cpu)
 			continue;
 
-		candidates[candidate_count++] = i;
+		candidates[candidate_count].index = i;
+		candidates[candidate_count].density = density[i];
+		candidate_count++;
 		remaining_density += density[i];
 	}
 
 	if (candidate_count == 0)
 		return 0.0;
 
-	sort_indices_by_density_desc(candidates, candidate_count, density);
-	search_max_unrelated_density(related, density, node_count,
+	qsort(candidates, (size_t) candidate_count, sizeof(*candidates),
+			compare_density_order_entry_desc);
+	search_max_unrelated_density(related, node_count,
 			candidates, candidate_count, 0.0,
 			remaining_density, &best_density);
 	return best_density;
+}
+
+static bool prefer_cpu_choice(double load, uint32_t cpu,
+		double best_load, int best_cpu)
+{
+	if (best_cpu < 0)
+		return true;
+	if (load < best_load)
+		return true;
+
+	/* When two CPUs yield the same resulting load, keep placement
+	 * deterministic by taking the lowest CPU index.
+	 */
+	return load == best_load && (int) cpu < best_cpu;
 }
 
 static int assign_cpus(dag_t *g)
@@ -1138,12 +1192,7 @@ static int assign_cpus(dag_t *g)
 	uint32_t *placement = NULL;
 	int node_count = 0;
 	int result = -1;
-
-	struct cpu_assignment_info {
-		dag_node_t *node;
-		int index;
-		double density;
-	} *info = NULL;
+	struct cpu_assignment_info *info = NULL;
 
 	/* For a single DAG, the load of one CPU is the maximum total density of
 	 * any pairwise unrelated set assigned there, not the raw sum of all node
@@ -1167,16 +1216,8 @@ static int assign_cpus(dag_t *g)
 		placement[i] = UINT32_MAX;
 	}
 
-	for (int x = 0; x < node_count - 1; x++) {
-		for (int y = x + 1; y < node_count; y++) {
-			if (info[x].density < info[y].density) {
-				struct cpu_assignment_info tmp = info[x];
-
-				info[x] = info[y];
-				info[y] = tmp;
-			}
-		}
-	}
+	qsort(info, (size_t) node_count, sizeof(*info),
+			compare_cpu_assignment_info_desc);
 
 	for (int i = 0; i < node_count; i++) {
 		int chosen_cpu = -1;
@@ -1187,7 +1228,7 @@ static int assign_cpus(dag_t *g)
 					placement, node_count, cpu,
 					info[i].index, cpu);
 
-			if (load < chosen_load) {
+			if (prefer_cpu_choice(load, cpu, chosen_load, chosen_cpu)) {
 				chosen_load = load;
 				chosen_cpu = (int) cpu;
 			}
