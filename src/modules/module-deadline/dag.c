@@ -16,7 +16,6 @@
 #include <string.h>
 #include <errno.h>
 #include <float.h>
-#include <math.h>
 #include <stdbool.h>
 #include <limits.h>
 
@@ -29,6 +28,8 @@ static inline size_t dag_list_len(struct spa_list *list)
 	spa_list_for_each(pos, list, link) len++;
 	return len;
 }
+
+#define DAG_MIN_RELATIVE_DEADLINE UINT64_C(1)
 
 typedef struct {
 	dag_node_t **nodes;
@@ -74,6 +75,50 @@ static int find_node_index(const node_array_t *arr, dag_node_t *node)
 	}
 
 	return -1;
+}
+
+static inline uint64_t node_deadline_weight(const dag_node_t *node)
+{
+	/* The integer scheduler parameters exported by this library must stay
+	 * strictly positive, so every node consumes at least one deadline unit.
+	 */
+	return node->wcet > 0 ? node->wcet : DAG_MIN_RELATIVE_DEADLINE;
+}
+
+static int add_u64_checked(uint64_t a, uint64_t b, uint64_t *out)
+{
+	if (UINT64_MAX - a < b) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+
+	*out = a + b;
+	return 0;
+}
+
+static int sub_u64_checked(uint64_t value, uint64_t decrement, uint64_t *out)
+{
+	if (decrement > value) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	*out = value - decrement;
+	return 0;
+}
+
+static int validate_deadline_budget(uint64_t deadline_budget,
+		uint64_t path_wcet, uint64_t path_deadline_weight)
+{
+	/* A path is infeasible if the remaining deadline cannot cover either the
+	 * critical-path WCET itself or the minimum positive per-node deadlines.
+	 */
+	if (deadline_budget < path_wcet || deadline_budget < path_deadline_weight) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	return 0;
 }
 
 static void clear_assignments(dag_t *g)
@@ -462,6 +507,70 @@ static int find_sources_and_sinks(dag_t *g, dag_node_t ***sources, int *nsources
 	return 0;
 }
 
+static int compute_graph_critical_bounds(const node_array_t *topo,
+		uint64_t *critical_wcet_out,
+		uint64_t *critical_deadline_weight_out)
+{
+	uint64_t *wcet_dist = NULL;
+	uint64_t *deadline_dist = NULL;
+	uint64_t critical_wcet = 0;
+	uint64_t critical_deadline_weight = 0;
+	int result = -1;
+
+	*critical_wcet_out = 0;
+	*critical_deadline_weight_out = 0;
+
+	if (topo->count == 0)
+		return 0;
+
+	wcet_dist = calloc((size_t) topo->count, sizeof(*wcet_dist));
+	deadline_dist = calloc((size_t) topo->count, sizeof(*deadline_dist));
+	if (!wcet_dist || !deadline_dist)
+		goto out;
+
+	for (int i = 0; i < topo->count; i++) {
+		uint64_t best_pred_wcet = 0;
+		uint64_t best_pred_deadline = 0;
+		dag_edge_t *edge;
+
+		spa_list_for_each(edge, &topo->nodes[i]->incoming, dst_link) {
+			int pred_idx = find_node_index(topo, edge->src);
+
+			if (pred_idx < 0) {
+				errno = EFAULT;
+				goto out;
+			}
+
+			if (wcet_dist[pred_idx] > best_pred_wcet)
+				best_pred_wcet = wcet_dist[pred_idx];
+			if (deadline_dist[pred_idx] > best_pred_deadline)
+				best_pred_deadline = deadline_dist[pred_idx];
+		}
+
+		if (add_u64_checked(best_pred_wcet, topo->nodes[i]->wcet,
+					&wcet_dist[i]) < 0)
+			goto out;
+		if (add_u64_checked(best_pred_deadline,
+					node_deadline_weight(topo->nodes[i]),
+					&deadline_dist[i]) < 0)
+			goto out;
+
+		if (wcet_dist[i] > critical_wcet)
+			critical_wcet = wcet_dist[i];
+		if (deadline_dist[i] > critical_deadline_weight)
+			critical_deadline_weight = deadline_dist[i];
+	}
+
+	*critical_wcet_out = critical_wcet;
+	*critical_deadline_weight_out = critical_deadline_weight;
+	result = 0;
+
+out:
+	free(deadline_dist);
+	free(wcet_dist);
+	return result;
+}
+
 static int compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 		dag_node_t ***path_out, int *path_len_out, uint64_t *path_wcet_out)
 {
@@ -579,52 +688,98 @@ out:
 	return result;
 }
 
-static inline uint64_t saturating_sub_u64(uint64_t value, uint64_t decrement)
+static int compute_path_deadline_weight(dag_node_t **path, int path_len,
+		uint64_t *path_deadline_weight_out)
 {
-	/* A discounted node can consume the whole residual budget/path length. */
-	return decrement >= value ? 0 : value - decrement;
+	uint64_t total = 0;
+
+	*path_deadline_weight_out = 0;
+
+	for (int i = 0; i < path_len; i++) {
+		if (add_u64_checked(total, node_deadline_weight(path[i]), &total) < 0)
+			return -1;
+	}
+
+	*path_deadline_weight_out = total;
+	return 0;
 }
 
-static inline uint64_t proportional_deadline(uint64_t deadline_budget, uint64_t wcet, uint64_t path_wcet)
+static inline uint64_t proportional_deadline(uint64_t deadline_budget,
+		uint64_t node_weight, uint64_t path_deadline_weight)
 {
-	if (deadline_budget == 0 || wcet == 0 || path_wcet == 0)
+	if (deadline_budget == 0 || node_weight == 0 || path_deadline_weight == 0)
 		return 0;
 
-	return (uint64_t)floor((double)deadline_budget * ((double)wcet / (double)path_wcet));
+	return (uint64_t) (((unsigned __int128) deadline_budget *
+			(unsigned __int128) node_weight) /
+			(unsigned __int128) path_deadline_weight);
 }
 
-static inline void assign_or_tighten_deadline(dag_node_t *node, uint64_t deadline)
+static int assign_or_tighten_deadline(dag_node_t *node, uint64_t deadline)
 {
+	if (deadline < DAG_MIN_RELATIVE_DEADLINE) {
+		errno = EAGAIN;
+		return -1;
+	}
+
 	if (!node->deadline_assigned) {
 		node->deadline = deadline;
 		node->deadline_assigned = true;
 	} else if (node->deadline > deadline) {
 		node->deadline = deadline;
 	}
+
+	return 0;
 }
 
 static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst, uint64_t D)
 {
 	if (src == dst) {
-		assign_or_tighten_deadline(src, D);
-		return 0;
+		if (D == 0 && src->deadline_assigned)
+			return 0;
+
+		if (validate_deadline_budget(D, src->wcet,
+					node_deadline_weight(src)) < 0)
+			return -1;
+
+		return assign_or_tighten_deadline(src, D);
 	}
 
 	/* Phase A: compute the critical path for this subproblem. */
 	dag_node_t **P = NULL;
 	int path_len = 0;
 	uint64_t L = 0;
+	uint64_t path_deadline_weight = 0;
 	int path_result = compute_longest_path(g, src, dst, &P, &path_len, &L);
 	if (path_result < 0)
 		return -1;
 	if (path_result == PATH_UNREACHABLE)
 		return 0;
+	if (compute_path_deadline_weight(P, path_len, &path_deadline_weight) < 0) {
+		free(P);
+		return -1;
+	}
+
+	if (D == 0) {
+		for (int i = 0; i < path_len; i++) {
+			if (!P[i]->deadline_assigned) {
+				free(P);
+				errno = EAGAIN;
+				return -1;
+			}
+		}
+
+		free(P);
+		return 0;
+	}
 
 	/* Phase B: discount already-assigned tighter deadlines from the
-	 * residual budget and residual path WCET before assigning this level.
+	 * residual budget, residual path WCET and minimum positive-deadline
+	 * budget before assigning this level.
 	 */
 	uint64_t residual_deadline = D;
 	uint64_t residual_wcet = L;
+	uint64_t residual_deadline_weight = path_deadline_weight;
 	bool src_discounted = false;
 	uint64_t discounted_src_deadline = 0;
 	bool *excluded = calloc((size_t)path_len, sizeof(*excluded));
@@ -636,7 +791,7 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		if (residual_deadline == 0 || residual_wcet == 0)
+		if (residual_deadline_weight == 0)
 			break;
 
 		for (int i=0; i<path_len; i++) {
@@ -644,29 +799,50 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 				continue;
 
 			dag_node_t *ni = P[i];
+			uint64_t node_weight = node_deadline_weight(ni);
 			uint64_t d_prime = proportional_deadline(residual_deadline,
-					ni->wcet, residual_wcet);
+					node_weight, residual_deadline_weight);
 
 			if (ni->deadline_assigned && ni->deadline < d_prime) {
-				residual_deadline = saturating_sub_u64(residual_deadline,
-						ni->deadline);
-				residual_wcet = saturating_sub_u64(residual_wcet,
-						ni->wcet);
+				if (sub_u64_checked(residual_deadline, ni->deadline,
+							&residual_deadline) < 0 ||
+						sub_u64_checked(residual_wcet, ni->wcet,
+							&residual_wcet) < 0 ||
+						sub_u64_checked(residual_deadline_weight,
+							node_weight,
+							&residual_deadline_weight) < 0) {
+					free(excluded);
+					free(P);
+					return -1;
+				}
 				if (ni == src) {
 					src_discounted = true;
 					discounted_src_deadline = ni->deadline;
 				}
 				excluded[i] = true;
+				if (validate_deadline_budget(residual_deadline, residual_wcet,
+							residual_deadline_weight) < 0 &&
+						residual_deadline_weight != 0) {
+					free(excluded);
+					free(P);
+					return -1;
+				}
 				changed = true;
 				break;
 			}
 		}
 	}
 
-	if (residual_deadline == 0 || residual_wcet == 0) {
+	if (residual_deadline_weight == 0) {
 		free(excluded);
 		free(P);
 		return 0;
+	}
+	if (validate_deadline_budget(residual_deadline, residual_wcet,
+				residual_deadline_weight) < 0) {
+		free(excluded);
+		free(P);
+		return -1;
 	}
 
 	/* Phase C: assign/tighten the endpoints with the updated residual budget
@@ -674,27 +850,54 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	 *
 	 * The recursive budget must be derived from residual_deadline, not from
 	 * the original D input. Using the stale input would re-introduce deadline
-	 * budget already discounted above for tighter pre-assigned nodes.
+	 * budget already discounted above for tighter pre-assigned nodes. The
+	 * same updated residual budget also carries the minimum positive-deadline
+	 * reservation for the nodes still left on this path.
 	 */
 	dag_node_t *n_src = P[0];
+	uint64_t src_weight = node_deadline_weight(n_src);
 	uint64_t d_prime_src = proportional_deadline(residual_deadline,
-			n_src->wcet, residual_wcet);
-	assign_or_tighten_deadline(n_src, d_prime_src);
+			src_weight, residual_deadline_weight);
+	if (assign_or_tighten_deadline(n_src, d_prime_src) < 0) {
+		free(excluded);
+		free(P);
+		return -1;
+	}
 	
 	dag_node_t *n_dst = P[path_len - 1];
+	uint64_t dst_weight = node_deadline_weight(n_dst);
 	uint64_t d_prime_dst = proportional_deadline(residual_deadline,
-			n_dst->wcet, residual_wcet);
-	assign_or_tighten_deadline(n_dst, d_prime_dst);
+			dst_weight, residual_deadline_weight);
+	if (assign_or_tighten_deadline(n_dst, d_prime_dst) < 0) {
+		free(excluded);
+		free(P);
+		return -1;
+	}
 
-	uint64_t D_residual = residual_deadline;
+	uint64_t D_residual = 0;
 	if (src_discounted) {
+		uint64_t refund = 0;
+
 		/* Phase B already removed the source from residual_deadline. If
 		 * phase C tightened it again, refund the delta so descendants see
 		 * the true post-source residual budget.
 		 */
-		D_residual += discounted_src_deadline - n_src->deadline;
+		if (discounted_src_deadline < n_src->deadline ||
+				sub_u64_checked(discounted_src_deadline,
+					n_src->deadline, &refund) < 0 ||
+				add_u64_checked(residual_deadline, refund,
+					&D_residual) < 0) {
+			free(excluded);
+			free(P);
+			return -1;
+		}
 	} else {
-		D_residual = saturating_sub_u64(D_residual, n_src->deadline);
+		if (sub_u64_checked(residual_deadline, n_src->deadline,
+					&D_residual) < 0) {
+			free(excluded);
+			free(P);
+			return -1;
+		}
 	}
 
 	dag_edge_t *e;
@@ -793,6 +996,10 @@ static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
 		uint64_t denom = topo.nodes[i]->deadline < g->period ?
 				topo.nodes[i]->deadline : g->period;
 
+		/* Deadline splitting already validated that every assigned node has
+		 * a strictly positive relative deadline. Reaching denom == 0 here
+		 * means the internal state is inconsistent.
+		 */
 		if (!topo.nodes[i]->deadline_assigned || denom == 0) {
 			errno = EFAULT;
 			goto out;
@@ -1009,10 +1216,16 @@ out:
 int dag_recalculate(dag_t *g)
 {
 	dag_node_t **sources = NULL, **sinks = NULL, **topo = NULL;
+	node_array_t topo_arr = {
+		.nodes = NULL,
+		.count = 0,
+	};
 	size_t node_count;
 	int nsources = 0, nsinks = 0;
 	int topo_len = 0;
 	int res = -1;
+	uint64_t critical_wcet = 0;
+	uint64_t critical_deadline_weight = 0;
 
 	if (!g) { errno = EINVAL; return -1; }
 
@@ -1036,6 +1249,17 @@ int dag_recalculate(dag_t *g)
 		errno = EFAULT;
 		goto out;
 	}
+	topo_arr.nodes = topo;
+	topo_arr.count = topo_len;
+	/* Fail before deadline splitting or CPU placement if the DAG-wide
+	 * critical path already exceeds the end-to-end budget.
+	 */
+	if (compute_graph_critical_bounds(&topo_arr, &critical_wcet,
+				&critical_deadline_weight) < 0)
+		goto out;
+	if (validate_deadline_budget(g->deadline, critical_wcet,
+				critical_deadline_weight) < 0)
+		goto out;
 
 	free(topo);
 	topo = NULL;

@@ -274,6 +274,81 @@ PWTEST(chain_deadlines)
 	return PWTEST_PASS;
 }
 
+PWTEST(infeasible_chain_fails_early)
+{
+	dag_t *g = create_test_dag(5, 1);
+
+	pwtest_int_eq(dag_add_node(g, 1, 2, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 2, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 2, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_errno(dag_recalculate(g), EAGAIN);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(minimum_deadline_quantum_repairs_zero_wcet_path)
+{
+	static const uint32_t path[] = { 1, 2 };
+	dag_t *g = create_test_dag(2, 1);
+	dag_node_t *a, *b;
+
+	pwtest_int_eq(dag_add_node(g, 1, 0, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_bool_true(a->deadline_assigned);
+	pwtest_bool_true(b->deadline_assigned);
+	pwtest_int_eq((int) a->deadline, 1);
+	pwtest_int_eq((int) b->deadline, 1);
+	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(tight_feasible_chain_assigns_positive_deadlines)
+{
+	static const uint32_t path[] = { 1, 2, 3 };
+	dag_t *g = create_test_dag(9, 1);
+	dag_node_t *a, *b, *c;
+
+	pwtest_int_eq(dag_add_node(g, 1, 2, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 3, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 4, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	c = find_node(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_bool_false(g->dirty);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(c->deadline > 0);
+	pwtest_int_eq((int) a->deadline, 2);
+	pwtest_int_eq((int) b->deadline, 3);
+	pwtest_int_eq((int) c->deadline, 4);
+	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(diamond_deadlines)
 {
 	static const uint32_t left_path[] = { 1, 2, 4 };
@@ -617,6 +692,9 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(self_loop_rejected, PWTEST_NOARG);
 	pwtest_add(cycle_edge_rejected, PWTEST_NOARG);
 	pwtest_add(chain_deadlines, PWTEST_NOARG);
+	pwtest_add(infeasible_chain_fails_early, PWTEST_NOARG);
+	pwtest_add(minimum_deadline_quantum_repairs_zero_wcet_path, PWTEST_NOARG);
+	pwtest_add(tight_feasible_chain_assigns_positive_deadlines, PWTEST_NOARG);
 	pwtest_add(chain_cpu_load_uses_unrelated_sets, PWTEST_NOARG);
 	pwtest_add(independent_tasks_load_sums_densities, PWTEST_NOARG);
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);

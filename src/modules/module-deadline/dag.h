@@ -41,7 +41,7 @@ struct dag_node {
 
 	uint32_t id;
 	uint64_t wcet;       /* worst case execution time */
-	uint64_t deadline;   /* assigned relative deadline */
+	uint64_t deadline;   /* assigned strictly positive relative deadline */
 	uint32_t cpu;        /* assigned CPU, or DAG_CPU_INVALID while stale */
 	pid_t tid;           /* associated thread id */
 
@@ -102,6 +102,11 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
 
 /* Recalculate scheduling parameters after changes.
+ * Successful recomputation assigns strictly positive relative deadlines. The
+ * integer splitter reserves at least one deadline unit per node and fails if
+ * the end-to-end budget cannot cover either the critical-path WCET or that
+ * minimum positive-deadline budget.
+ *
  * On success, the DAG becomes clean. On failure, assigned deadlines/CPUs are
  * cleared and the DAG remains dirty.
  */
