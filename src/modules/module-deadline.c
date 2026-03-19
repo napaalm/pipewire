@@ -162,6 +162,28 @@ struct node {
 	uint64_t period;
 };
 
+struct graph_snapshot_node {
+	struct node *state;
+	uint32_t id;
+	uint64_t wcet;
+	pid_t tid;
+};
+
+struct graph_snapshot_edge {
+	uint32_t src_id;
+	uint32_t dst_id;
+};
+
+struct graph_snapshot {
+	uint64_t period;
+	struct graph_snapshot_node *nodes;
+	size_t node_count;
+	size_t node_capacity;
+	struct graph_snapshot_edge *edges;
+	size_t edge_count;
+	size_t edge_capacity;
+};
+
 struct impl {
 	struct pw_context *context;
 	struct pw_properties *props;
@@ -174,6 +196,10 @@ struct impl {
 	int n_cpus;
 	int cpus[MAX_CPUS];
 	double cpu_utilization;
+
+	/* Persistent scheduling DAG for the last synchronized driver graph. */
+	dag_t *dag;
+	struct pw_impl_node *dag_driver;
 
 	struct spa_list node_list;
 };
@@ -247,6 +273,13 @@ static void prune_stale_cached_nodes(struct impl *impl)
 	}
 }
 
+static void reset_persistent_dag(struct impl *impl)
+{
+	dag_destroy(impl->dag);
+	impl->dag = NULL;
+	impl->dag_driver = NULL;
+}
+
 static void module_destroy(void *data)
 {
 	struct impl *impl = data;
@@ -254,6 +287,7 @@ static void module_destroy(void *data)
 
 	spa_hook_remove(&impl->context_listener);
 	spa_hook_remove(&impl->module_listener);
+	reset_persistent_dag(impl);
 
 	spa_list_for_each_safe(n, tmp, &impl->node_list, link)
 		destroy_cached_node(n);
@@ -403,16 +437,384 @@ static int get_dynamic_loop_tid(struct pw_impl_node *node, pid_t *tid)
 	return 0;
 }
 
+static void clear_graph_snapshot(struct graph_snapshot *snapshot)
+{
+	free(snapshot->edges);
+	free(snapshot->nodes);
+	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int ensure_snapshot_capacity(void **items, size_t item_size,
+		size_t *capacity, size_t count)
+{
+	size_t new_capacity;
+	void *tmp;
+
+	if (count < *capacity)
+		return 0;
+
+	new_capacity = *capacity > 0 ? *capacity * 2 : 8;
+	while (count >= new_capacity) {
+		if (new_capacity > SIZE_MAX / 2) {
+			errno = ENOMEM;
+			return -1;
+		}
+		new_capacity *= 2;
+	}
+
+	if (item_size != 0 && new_capacity > SIZE_MAX / item_size) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	tmp = realloc(*items, new_capacity * item_size);
+	if (tmp == NULL)
+		return -1;
+
+	*items = tmp;
+	*capacity = new_capacity;
+	return 0;
+}
+
+static int snapshot_add_node(struct graph_snapshot *snapshot, struct node *state,
+		uint32_t id, uint64_t wcet, pid_t tid)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->node_count; i++) {
+		if (snapshot->nodes[i].id != id)
+			continue;
+
+		snapshot->nodes[i].state = state;
+		snapshot->nodes[i].wcet = wcet;
+		snapshot->nodes[i].tid = tid;
+		return 0;
+	}
+
+	if (ensure_snapshot_capacity((void **) &snapshot->nodes,
+			sizeof(*snapshot->nodes), &snapshot->node_capacity,
+			snapshot->node_count) < 0)
+		return -1;
+
+	snapshot->nodes[snapshot->node_count++] = (struct graph_snapshot_node) {
+		.state = state,
+		.id = id,
+		.wcet = wcet,
+		.tid = tid,
+	};
+
+	return 0;
+}
+
+static bool snapshot_has_node(const struct graph_snapshot *snapshot, uint32_t id)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->node_count; i++) {
+		if (snapshot->nodes[i].id == id)
+			return true;
+	}
+	return false;
+}
+
+static int snapshot_add_edge(struct graph_snapshot *snapshot, uint32_t src_id,
+		uint32_t dst_id)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->edge_count; i++) {
+		if (snapshot->edges[i].src_id == src_id &&
+				snapshot->edges[i].dst_id == dst_id)
+			return 0;
+	}
+
+	if (ensure_snapshot_capacity((void **) &snapshot->edges,
+			sizeof(*snapshot->edges), &snapshot->edge_capacity,
+			snapshot->edge_count) < 0)
+		return -1;
+
+	snapshot->edges[snapshot->edge_count++] = (struct graph_snapshot_edge) {
+		.src_id = src_id,
+		.dst_id = dst_id,
+	};
+
+	return 0;
+}
+
+static bool snapshot_has_edge(const struct graph_snapshot *snapshot,
+		uint32_t src_id, uint32_t dst_id)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->edge_count; i++) {
+		if (snapshot->edges[i].src_id == src_id &&
+				snapshot->edges[i].dst_id == dst_id)
+			return true;
+	}
+	return false;
+}
+
+static void mark_snapshot_nodes_seen(struct impl *impl,
+		const struct graph_snapshot *snapshot)
+{
+	struct node *state;
+	size_t i;
+
+	spa_list_for_each(state, &impl->node_list, link)
+		state->seen_in_graph = false;
+
+	for (i = 0; i < snapshot->node_count; i++)
+		snapshot->nodes[i].state->seen_in_graph = true;
+}
+
+static dag_node_t *find_dag_node(dag_t *dag, uint32_t id)
+{
+	dag_node_t *node;
+
+	if (dag == NULL)
+		return NULL;
+
+	spa_list_for_each(node, &dag->nodes, link) {
+		if (node->id == id)
+			return node;
+	}
+	return NULL;
+}
+
+static int ensure_persistent_dag(struct impl *impl, uint64_t period)
+{
+	if (impl->dag == NULL) {
+		impl->dag = dag_create(period, period, impl->cpu_utilization,
+				impl->n_cpus);
+		if (impl->dag == NULL)
+			return -1;
+
+		pw_log_debug("created persistent deadline DAG");
+		return 0;
+	}
+
+	return dag_set_global_period_deadline(impl->dag, period, period);
+}
+
+static int sync_snapshot_nodes_to_dag(struct impl *impl,
+		const struct graph_snapshot *snapshot)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->node_count; i++) {
+		const struct graph_snapshot_node *entry = &snapshot->nodes[i];
+		dag_node_t *dag_node = find_dag_node(impl->dag, entry->id);
+
+		if (dag_node == NULL) {
+			if (dag_add_node(impl->dag, entry->id, entry->wcet,
+					entry->tid) < 0)
+				return -1;
+			continue;
+		}
+
+		dag_node->tid = entry->tid;
+		if (dag_set_node_wcet(impl->dag, entry->id, entry->wcet) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int remove_stale_dag_edges(struct impl *impl,
+		const struct graph_snapshot *snapshot)
+{
+	dag_edge_t *edge, *tmp;
+
+	spa_list_for_each_safe(edge, tmp, &impl->dag->edges, link) {
+		if (snapshot_has_edge(snapshot, edge->src->id, edge->dst->id))
+			continue;
+		if (dag_remove_edge(impl->dag, edge->src->id, edge->dst->id) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int add_snapshot_edges_to_dag(struct impl *impl,
+		const struct graph_snapshot *snapshot)
+{
+	size_t i;
+
+	for (i = 0; i < snapshot->edge_count; i++) {
+		const struct graph_snapshot_edge *entry = &snapshot->edges[i];
+
+		if (dag_add_edge(impl->dag, entry->src_id, entry->dst_id) == 0)
+			continue;
+		if (errno == EEXIST)
+			continue;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int remove_stale_dag_nodes(struct impl *impl,
+		const struct graph_snapshot *snapshot)
+{
+	dag_node_t *node, *tmp;
+
+	spa_list_for_each_safe(node, tmp, &impl->dag->nodes, link) {
+		if (snapshot_has_node(snapshot, node->id))
+			continue;
+		if (dag_remove_node(impl->dag, node->id) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Synchronize the module-owned DAG with the latest PipeWire driver snapshot.
+ * The steady-state path updates nodes and edges incrementally so the DAG
+ * library can reuse its dirty-state across recalculations.
+ */
+static int sync_dag_from_snapshot(struct impl *impl, struct pw_impl_node *driver,
+		const struct graph_snapshot *snapshot)
+{
+	if (ensure_persistent_dag(impl, snapshot->period) < 0)
+		return -1;
+	if (sync_snapshot_nodes_to_dag(impl, snapshot) < 0)
+		return -1;
+	if (remove_stale_dag_edges(impl, snapshot) < 0)
+		return -1;
+	if (add_snapshot_edges_to_dag(impl, snapshot) < 0)
+		return -1;
+	if (remove_stale_dag_nodes(impl, snapshot) < 0)
+		return -1;
+
+	impl->dag_driver = driver;
+	return 0;
+}
+
+/*
+ * Rebuild the persistent DAG only as recovery if incremental synchronization
+ * failed after mutating it. This avoids leaving a partially synchronized DAG
+ * behind while keeping the normal path incremental.
+ */
+static int rebuild_dag_from_snapshot(struct impl *impl, struct pw_impl_node *driver,
+		const struct graph_snapshot *snapshot)
+{
+	dag_t *dag;
+	size_t i;
+
+	dag = dag_create(snapshot->period, snapshot->period,
+			impl->cpu_utilization, impl->n_cpus);
+	if (dag == NULL)
+		return -1;
+
+	for (i = 0; i < snapshot->node_count; i++) {
+		const struct graph_snapshot_node *entry = &snapshot->nodes[i];
+
+		if (dag_add_node(dag, entry->id, entry->wcet, entry->tid) < 0)
+			goto error;
+	}
+
+	for (i = 0; i < snapshot->edge_count; i++) {
+		const struct graph_snapshot_edge *entry = &snapshot->edges[i];
+
+		if (dag_add_edge(dag, entry->src_id, entry->dst_id) < 0)
+			goto error;
+	}
+
+	dag_destroy(impl->dag);
+	impl->dag = dag;
+	impl->dag_driver = driver;
+	return 0;
+
+error:
+	dag_destroy(dag);
+	return -1;
+}
+
+/* Build a complete view of the current driver graph before mutating impl->dag. */
+static int collect_driver_graph(struct impl *impl, struct pw_impl_node *driver,
+		uint64_t period, struct graph_snapshot *snapshot)
+{
+	struct pw_node_target *t;
+
+	snapshot->period = period;
+
+	spa_list_for_each(t, &driver->rt.target_list, link) {
+		struct pw_impl_node *node = t->node;
+		struct pw_node_activation *activation = t->activation;
+		struct node *state;
+		pid_t tid = -1;
+		uint64_t runtime;
+
+		if (activation == NULL) {
+			pw_log_warn("node %u has no activation data, skipping deadline update",
+					node->info.id);
+			errno = EINVAL;
+			return -1;
+		}
+
+		state = ensure_cached_node(impl, node);
+		if (state == NULL) {
+			pw_log_error("can't allocate deadline state for node %u: %m",
+					node->info.id);
+			return -1;
+		}
+
+		if (measure_node_runtime(node, activation, period, &runtime) < 0)
+			return -1;
+
+		if (state->period == period)
+			state->wcet = SPA_MAX(state->wcet, runtime);
+		else
+			state->wcet = runtime;
+		state->period = period;
+
+		if (state->wcet == 0) {
+			pw_log_debug("node %u has no non-zero runtime sample yet, skipping deadline update",
+					node->info.id);
+			errno = EAGAIN;
+			return -1;
+		}
+
+		if (get_dynamic_loop_tid(node, &tid) < 0)
+			return -1;
+
+		if (snapshot_add_node(snapshot, state, node->info.id,
+				inflate_wcet(state->wcet), tid) < 0)
+			return -1;
+	}
+
+	spa_list_for_each(t, &driver->rt.target_list, link) {
+		struct pw_impl_node *node = t->node;
+		struct pw_impl_port *port;
+		struct pw_impl_link *link;
+
+		spa_list_for_each(port, &node->output_ports, link) {
+			spa_list_for_each(link, &port->links, output_link) {
+				struct pw_impl_node *dst = link->input->node;
+
+				if (!snapshot_has_node(snapshot, node->info.id) ||
+						!snapshot_has_node(snapshot, dst->info.id))
+					continue;
+
+				if (snapshot_add_edge(snapshot, node->info.id,
+						dst->info.id) < 0)
+					return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static void recalc_params(void *data)
 {
 	struct node *n = data;
 	struct pw_impl_node *driver = n->node;
 	struct impl *impl = n->impl;
-	struct pw_node_target *t;
-	struct node *state;
-	struct node *dst_state;
-	dag_t *dag = NULL;
+	struct graph_snapshot snapshot = { 0 };
 	uint64_t period;
+	bool snapshot_ready = false;
 
 	if (impl->n_cpus <= 0) {
 		pw_log_error("no CPUs available for deadline scheduling");
@@ -428,104 +830,44 @@ static void recalc_params(void *data)
 		return;
 	}
 
-	spa_list_for_each(state, &impl->node_list, link)
-		state->seen_in_graph = false;
-
-	dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
-	if (dag == NULL) {
-		pw_log_error("failed to create DAG for node %u: %m", driver->info.id);
+	if (collect_driver_graph(impl, driver, period, &snapshot) < 0)
 		goto out;
-	}
 
-	spa_list_for_each(t, &driver->rt.target_list, link) {
-		struct pw_impl_node *node = t->node;
-		struct pw_node_activation *na;
-		pid_t tid = -1;
-		uint64_t runtime;
+	mark_snapshot_nodes_seen(impl, &snapshot);
+	snapshot_ready = true;
 
-		na = t->activation;
-		if (na == NULL) {
-			pw_log_warn("node %u has no activation data, skipping deadline update",
-					node->info.id);
-			goto out;
-		}
+	if (sync_dag_from_snapshot(impl, driver, &snapshot) < 0) {
+		int saved_errno = errno;
 
-		state = ensure_cached_node(impl, node);
-		if (state == NULL) {
-			pw_log_error("can't allocate deadline state for node %u: %m",
-					node->info.id);
-			goto out;
-		}
-		state->seen_in_graph = true;
+		errno = saved_errno;
+		pw_log_warn("failed to synchronize DAG for node %u incrementally: %m",
+				driver->info.id);
 
-		if (measure_node_runtime(node, na, period, &runtime) < 0)
-			goto out;
-
-		if (state->period == period)
-			state->wcet = SPA_MAX(state->wcet, runtime);
-		else
-			state->wcet = runtime;
-		state->period = period;
-
-		if (state->wcet == 0) {
-			pw_log_debug("node %u has no non-zero runtime sample yet, skipping deadline update",
-					node->info.id);
-			goto out;
-		}
-
-		if (get_dynamic_loop_tid(node, &tid) < 0)
-			goto out;
-
-		if (dag_add_node(dag, node->info.id, inflate_wcet(state->wcet), tid) < 0) {
-			if (errno == EEXIST)
-				continue;
-			pw_log_warn("failed to add DAG node %u: %m", node->info.id);
+		if (rebuild_dag_from_snapshot(impl, driver, &snapshot) < 0) {
+			saved_errno = errno;
+			errno = saved_errno;
+			pw_log_warn("failed to recover DAG state for node %u: %m",
+					driver->info.id);
+			reset_persistent_dag(impl);
 			goto out;
 		}
 	}
 
-	spa_list_for_each(t, &driver->rt.target_list, link) {
-		struct pw_impl_node *node = t->node;
-		struct pw_impl_port *p;
-		struct pw_impl_link *l;
-
-		state = find_cached_node(impl, node);
-		if (state == NULL || !state->seen_in_graph)
-			continue;
-
-		spa_list_for_each(p, &node->output_ports, link) {
-			spa_list_for_each(l, &p->links, output_link) {
-				struct pw_impl_node *node2 = l->input->node;
-
-				dst_state = find_cached_node(impl, node2);
-				if (dst_state == NULL || !dst_state->seen_in_graph)
-					continue;
-
-				if (dag_add_edge(dag, node->info.id, node2->info.id) < 0) {
-					if (errno == EEXIST)
-						continue;
-					pw_log_warn("failed to add DAG edge %u -> %u: %m",
-							node->info.id, node2->info.id);
-					goto out;
-				}
-			}
-		}
-	}
-
-	if (dag_recalculate(dag) < 0) {
+	if (impl->dag->dirty && dag_recalculate(impl->dag) < 0) {
 		pw_log_warn("failed to compute deadline parameters for node %u: %m",
 				driver->info.id);
 		goto out;
 	}
-	if (dag_foreach_node(dag, sched_cb, impl) < 0) {
+	if (dag_foreach_node(impl->dag, sched_cb, impl) < 0) {
 		pw_log_warn("failed to apply deadline parameters for node %u: %m",
 				driver->info.id);
 		goto out;
 	}
 
 out:
-	dag_destroy(dag);
-	prune_stale_cached_nodes(impl);
+	clear_graph_snapshot(&snapshot);
+	if (snapshot_ready)
+		prune_stale_cached_nodes(impl);
 }
 
 static const struct pw_impl_node_rt_events node_rt_events = {
@@ -554,6 +896,9 @@ static void context_driver_removed(void *data, struct pw_impl_node *node)
 	n = find_cached_node(impl, node);
 	if (n == NULL)
 		return;
+
+	if (impl->dag_driver == node)
+		reset_persistent_dag(impl);
 
 	destroy_cached_node(n);
 }
