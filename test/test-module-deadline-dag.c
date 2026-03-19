@@ -227,6 +227,43 @@ PWTEST(single_node_deadline)
 	return PWTEST_PASS;
 }
 
+PWTEST(invalid_period_deadline_pair_rejected)
+{
+	dag_t *g;
+
+	errno = 0;
+	g = dag_create(9, 10, 1.0, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	g = dag_create(10, 10, 1.0, 1);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(dag_add_node(g, 1, 2, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+	pwtest_errno(dag_set_global_period_deadline(g, 9, 10), EINVAL);
+	pwtest_int_eq((int) g->period, 10);
+	pwtest_int_eq((int) g->deadline, 10);
+	pwtest_bool_false(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(zero_wcet_rejected)
+{
+	dag_t *g = create_test_dag(10, 1);
+
+	pwtest_errno(dag_add_node(g, 1, 0, 1), EINVAL);
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_errno(dag_set_node_wcet(g, 1, 0), EINVAL);
+	pwtest_bool_true(g->dirty);
+	assert_assignments_cleared(g);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(self_loop_rejected)
 {
 	dag_t *g = create_test_dag(10, 1);
@@ -310,13 +347,13 @@ PWTEST(infeasible_chain_fails_early)
 	return PWTEST_PASS;
 }
 
-PWTEST(minimum_deadline_quantum_repairs_zero_wcet_path)
+PWTEST(minimum_deadline_quantum_tight_budget_assigns_positive_deadlines)
 {
 	static const uint32_t path[] = { 1, 2 };
 	dag_t *g = create_test_dag(2, 1);
 	dag_node_t *a, *b;
 
-	pwtest_int_eq(dag_add_node(g, 1, 0, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
 	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
@@ -329,6 +366,33 @@ PWTEST(minimum_deadline_quantum_repairs_zero_wcet_path)
 	pwtest_bool_true(b->deadline_assigned);
 	pwtest_int_eq((int) a->deadline, 1);
 	pwtest_int_eq((int) b->deadline, 1);
+	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(valid_deadline_equals_period_boundary)
+{
+	static const uint32_t path[] = { 1, 2 };
+	dag_t *g = dag_create(10, 10, 1.0, 1);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(dag_add_node(g, 1, 4, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 6, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_set_global_period_deadline(g, 12, 12), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node(g, 1);
+	b = find_node(g, 2);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(a->deadline <= g->period);
+	pwtest_bool_true(b->deadline <= g->period);
 	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
 
 	dag_destroy(g);
@@ -807,11 +871,14 @@ PWTEST(recalculate_failure_keeps_dag_dirty)
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(single_node_deadline, PWTEST_NOARG);
+	pwtest_add(invalid_period_deadline_pair_rejected, PWTEST_NOARG);
+	pwtest_add(zero_wcet_rejected, PWTEST_NOARG);
 	pwtest_add(self_loop_rejected, PWTEST_NOARG);
 	pwtest_add(cycle_edge_rejected, PWTEST_NOARG);
 	pwtest_add(chain_deadlines, PWTEST_NOARG);
 	pwtest_add(infeasible_chain_fails_early, PWTEST_NOARG);
-	pwtest_add(minimum_deadline_quantum_repairs_zero_wcet_path, PWTEST_NOARG);
+	pwtest_add(minimum_deadline_quantum_tight_budget_assigns_positive_deadlines, PWTEST_NOARG);
+	pwtest_add(valid_deadline_equals_period_boundary, PWTEST_NOARG);
 	pwtest_add(tight_feasible_chain_assigns_positive_deadlines, PWTEST_NOARG);
 	pwtest_add(chain_cpu_load_uses_unrelated_sets, PWTEST_NOARG);
 	pwtest_add(independent_tasks_load_sums_densities, PWTEST_NOARG);

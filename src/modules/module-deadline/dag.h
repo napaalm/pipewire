@@ -75,6 +75,7 @@ struct dag {
  */
 
 /* Create and destroy a DAG.
+ * period and deadline must be strictly positive and satisfy deadline <= period.
  * utilization is the maximum per-CPU load admitted for this DAG after
  * accounting for precedence: only pairwise unrelated tasks contribute
  * concurrently on the same CPU. It is stored as a double, while the timing
@@ -86,11 +87,14 @@ void dag_destroy(dag_t *g);
 
 /* Set global period and deadline.
  * Successful timing or topology mutations mark the DAG dirty and clear any
- * previously computed deadlines and CPU assignments.
+ * previously computed deadlines and CPU assignments. The global timing
+ * contract remains period > 0, deadline > 0 and deadline <= period.
  */
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline);
 
-/* Add and remove nodes */
+/* Add and remove nodes.
+ * Node WCET values must be strictly positive.
+ */
 int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid);
 int dag_remove_node(dag_t *g, uint32_t id);
 
@@ -100,7 +104,9 @@ int dag_remove_node(dag_t *g, uint32_t id);
 int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 
-/* Update the WCET of a node */
+/* Update the WCET of a node.
+ * WCET must remain strictly positive.
+ */
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
 
 /* Recalculate scheduling parameters after changes.
@@ -109,8 +115,9 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
  * the end-to-end budget cannot cover either the critical-path WCET or that
  * minimum positive-deadline budget.
  *
- * On success, the DAG becomes clean. On failure, assigned deadlines/CPUs are
- * cleared and the DAG remains dirty.
+ * On success, the DAG becomes clean. Each exported task then satisfies
+ * 0 < runtime <= relative deadline <= global deadline <= period. On failure,
+ * assigned deadlines/CPUs are cleared and the DAG remains dirty.
  */
 int dag_recalculate(dag_t *g);
 

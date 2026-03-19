@@ -84,12 +84,32 @@ static int find_node_index(const node_array_t *arr, dag_node_t *node)
 	return -1;
 }
 
+static int validate_global_timing_contract(uint64_t period, uint64_t deadline)
+{
+	if (period == 0 || deadline == 0 || deadline > period) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int validate_node_wcet(uint64_t wcet)
+{
+	if (wcet < DAG_MIN_RELATIVE_DEADLINE) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	return 0;
+}
+
 static inline uint64_t node_deadline_weight(const dag_node_t *node)
 {
-	/* The integer scheduler parameters exported by this library must stay
-	 * strictly positive, so every node consumes at least one deadline unit.
+	/* Public mutators reject zero-WCET nodes, so the proportional split
+	 * remains based on WCET while still keeping deadlines strictly positive.
 	 */
-	return node->wcet > 0 ? node->wcet : DAG_MIN_RELATIVE_DEADLINE;
+	return node->wcet;
 }
 
 static int add_u64_checked(uint64_t a, uint64_t b, uint64_t *out)
@@ -123,6 +143,48 @@ static int validate_deadline_budget(uint64_t deadline_budget,
 	if (deadline_budget < path_wcet || deadline_budget < path_deadline_weight) {
 		errno = EAGAIN;
 		return -1;
+	}
+
+	return 0;
+}
+
+static int validate_graph_input_contract(const dag_t *g)
+{
+	const dag_node_t *node;
+
+	if (validate_global_timing_contract(g->period, g->deadline) < 0)
+		return -1;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		if (validate_node_wcet(node->wcet) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int validate_assigned_node_parameters(const dag_t *g,
+		const dag_node_t *node)
+{
+	if (!node->deadline_assigned ||
+			node->deadline < DAG_MIN_RELATIVE_DEADLINE ||
+			node->deadline > g->deadline ||
+			node->deadline > g->period ||
+			node->wcet < DAG_MIN_RELATIVE_DEADLINE) {
+		errno = EFAULT;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int validate_assigned_schedule(const dag_t *g)
+{
+	const dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		if (validate_assigned_node_parameters(g, node) < 0)
+			return -1;
 	}
 
 	return 0;
@@ -176,8 +238,10 @@ static void mark_dag_dirty(dag_t *g)
 
 dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
 {
-	if (period == 0 || deadline == 0 || !isfinite(utilization) ||
-			utilization <= 0.0 || utilization > 1.0 || num_cpus == 0) {
+	if (validate_global_timing_contract(period, deadline) < 0)
+		return NULL;
+	if (!isfinite(utilization) || utilization <= 0.0 ||
+			utilization > 1.0 || num_cpus == 0) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -222,7 +286,8 @@ void dag_destroy(dag_t *g)
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 {
 	if (!g) { errno = EINVAL; return -1; }
-	if (period == 0 || deadline == 0) { errno = EINVAL; return -1; }
+	if (validate_global_timing_contract(period, deadline) < 0)
+		return -1;
 
 	if (g->period != period || g->deadline != deadline)
 		mark_dag_dirty(g);
@@ -313,6 +378,8 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
 		errno = EEXIST;
 		return -1;
 	}
+	if (validate_node_wcet(wcet) < 0)
+		return -1;
 	dag_node_t *n = calloc(1, sizeof(*n));
 	if (!n) return -1;
 	n->id = id;
@@ -423,6 +490,8 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet)
 	if (!g) { errno = EINVAL; return -1; }
 	dag_node_t *n = find_node(g, id);
 	if (!n) { errno = ENOENT; return -1; }
+	if (validate_node_wcet(wcet) < 0)
+		return -1;
 	if (n->wcet != wcet)
 		mark_dag_dirty(g);
 	n->wcet = wcet;
@@ -1063,17 +1132,13 @@ static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
 		goto out;
 
 	for (int i = 0; i < topo.count; i++) {
-		uint64_t denom = topo.nodes[i]->deadline < g->period ?
-				topo.nodes[i]->deadline : g->period;
+		uint64_t denom;
 
-		/* Deadline splitting already validated that every assigned node has
-		 * a strictly positive relative deadline. Reaching denom == 0 here
-		 * means the internal state is inconsistent.
-		 */
-		if (!topo.nodes[i]->deadline_assigned || denom == 0) {
-			errno = EFAULT;
+		if (validate_assigned_node_parameters(g, topo.nodes[i]) < 0)
 			goto out;
-		}
+
+		denom = topo.nodes[i]->deadline < g->period ?
+				topo.nodes[i]->deadline : g->period;
 
 		/* Deadline/period remain exact uint64_t values; density is the
 		 * derived floating-point load used only for CPU admission.
@@ -1316,6 +1381,9 @@ int dag_recalculate(dag_t *g)
 
 	g->dirty = true;
 
+	if (validate_graph_input_contract(g) < 0)
+		goto out;
+
 	if (spa_list_is_empty(&g->nodes)) {
 		g->dirty = false;
 		return 0;
@@ -1374,6 +1442,9 @@ int dag_recalculate(dag_t *g)
 				goto out;
 		}
 	}
+
+	if (validate_assigned_schedule(g) < 0)
+		goto out;
 
 	if (assign_cpus(g) < 0)
 		goto out;
