@@ -168,10 +168,14 @@ static dag_node_t *find_node(dag_t *g, uint32_t id)
 	return NULL;
 }
 
-int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid,
-		bool is_audio_source, bool is_audio_sink)
+int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
 {
 	if (!g) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (wcet == 0) {
+		pw_log_error("Cannot add node %u with wcet=0", id);
 		errno = EINVAL;
 		return -1;
 	}
@@ -188,8 +192,6 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid,
 	n->index = DAG_NODE_INDEX_INVALID;
 	n->wcet = wcet;
 	n->tid = tid;
-	n->is_audio_source = is_audio_source;
-	n->is_audio_sink = is_audio_sink;
 	n->deadline = 0;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);
@@ -449,9 +451,9 @@ static void find_sources_and_sinks(dag_t *g, dag_node_t ***sources, uint32_t *ns
 		bool has_in = !spa_list_is_empty(&n->incoming);
 		bool has_out = !spa_list_is_empty(&n->outgoing);
 
-		if (!has_in && n->is_audio_source)
+		if (!has_in)
 			sarr[si++] = n;
-		if (!has_out && n->is_audio_sink)
+		if (!has_out)
 			tarr[ti++] = n;
 	}
 
@@ -523,6 +525,9 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	for (int i = src_idx; i <= dst_idx; i++) {
 		dag_node_t *u = topo[i];
 		dag_edge_t *e;
+
+		if (!g->relatives[src->index][u->index])
+			continue;
 
 		spa_list_for_each(e, &u->outgoing, src_link) {
 			int v = -1;
@@ -617,35 +622,6 @@ static int dag_build_successors(dag_t *g)
 	}
 
 	return 0;
-}
-
-/* Removes all nodes that are not on a path from any source to any sink */
-static int dag_remove_spurious_nodes(dag_t *g, dag_node_t **sources, uint32_t nsources, dag_node_t **sinks, uint32_t nsinks)
-{
-	int removed = 0;
-	dag_node_t *n, *ntmp;
-	spa_list_for_each_safe(n, ntmp, &g->nodes, link) {
-		bool reachable_from_source = false;
-		bool can_reach_sink = false;
-		for (uint32_t i = 0; i < nsources; i++) {
-			if (g->relatives[sources[i]->index][n->index]) {
-				reachable_from_source = true;
-				break;
-			}
-		}
-		for (uint32_t i = 0; i < nsinks; i++) {
-			if (g->relatives[n->index][sinks[i]->index]) {
-				can_reach_sink = true;
-				break;
-			}
-		}
-		if (!reachable_from_source || !can_reach_sink) {
-			if (dag_remove_node_ptr(g, n) < 0)
-				return -1;
-			removed++;
-		}
-	}
-	return removed;
 }
 
 static int dag_ensure_unrelated_capacity(dag_t *g, uint32_t needed)
@@ -813,7 +789,6 @@ static int dag_comp_unrelated(dag_t *g)
 
 static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources, dag_node_t **sinks, uint32_t nsinks)
 {
-	int ret;
 	dag_invalidate_analysis(g);
 
 	if (dag_build_indexed_nodes(g) < 0)
@@ -821,14 +796,6 @@ static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources,
 
 	if (dag_comp_relatives(g) < 0)
 		goto error;
-
-	ret = dag_remove_spurious_nodes(g, sources, nsources, sinks, nsinks);
-	if (ret < 0)
-		goto error;
-	if (ret > 0) {
-		dag_invalidate_analysis(g);
-		return ret;
-	}
 
 	if (dag_comp_unrelated(g, sources, nsources) < 0)
 		goto error;
@@ -969,6 +936,7 @@ static int assign_cpus(dag_t *g)
 
 	for (uint32_t i = 0; i < count; i++) {
 		if (!g->indexed_nodes[i]->deadline_assigned) {
+			pw_log_error("Node %u has no assigned deadline", g->indexed_nodes[i]->id);
 			errno = EFAULT;
 			return -1;
 		}
