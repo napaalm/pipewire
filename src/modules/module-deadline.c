@@ -102,6 +102,42 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define MODULE_USAGE	"( cpu.available=<list of CPUs> ) "	\
 			"( cpu.utilization=<percentage> ) "
 
+/* PipeWire does not assume glibc. Detect the scheduler ABI pieces at
+ * configure time and provide only the missing Linux fallbacks here.
+ *
+ * Before libc headers exposed struct sched_attr, the layout came from the
+ * Linux sched_setattr(2) kernel ABI.
+ */
+#if !HAVE_STRUCT_SCHED_ATTR
+struct sched_attr {
+	uint32_t size;
+	uint32_t sched_policy;
+	uint64_t sched_flags;
+	int32_t sched_nice;
+	uint32_t sched_priority;
+	uint64_t sched_runtime;
+	uint64_t sched_deadline;
+	uint64_t sched_period;
+	uint32_t sched_util_min;
+	uint32_t sched_util_max;
+};
+#endif
+
+#if !HAVE_SCHED_SETATTR
+static int sched_setattr(pid_t tid, struct sched_attr *attr, unsigned int flags)
+{
+	return syscall(SYS_sched_setattr, tid, attr, flags);
+}
+#endif
+
+#if !HAVE_SCHED_GETATTR
+static SPA_UNUSED int sched_getattr(pid_t tid, struct sched_attr *attr,
+		unsigned int size, unsigned int flags)
+{
+	return syscall(SYS_sched_getattr, tid, attr, size, flags);
+}
+#endif
+
 static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Antonio Napolitano <antonio.napolitano@santannapisa.it> and Francesco Barcherini <francesco.barcherini@santannapisa.it>" },
 	{ PW_KEY_MODULE_DESCRIPTION, "Use SCHED_DEADLINE for processing threads" },
@@ -150,27 +186,6 @@ static const struct pw_impl_module_events module_events = {
 	PW_VERSION_IMPL_MODULE_EVENTS,
 	.destroy = module_destroy,
 };
-
-struct sched_attr {
-	uint32_t size;
-	uint32_t sched_policy;
-	uint64_t sched_flags;
-	int32_t sched_nice;
-	uint32_t sched_priority;
-	uint64_t sched_runtime;
-	uint64_t sched_deadline;
-	uint64_t sched_period;
-	uint32_t sched_util_min;
-	uint32_t sched_util_max;
-};
-
-int sched_setattr(pid_t pid, const struct sched_attr *attr, unsigned int flags) {
-	return syscall(SYS_sched_setattr, pid, attr, flags);
-}
-
-int sched_getattr(pid_t pid, struct sched_attr *attr, unsigned int size, unsigned int flags) {
-	return syscall(SYS_sched_getattr, pid, attr, size, flags);
-}
 
 static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, uint64_t period)
 {

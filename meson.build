@@ -495,6 +495,36 @@ foreach f : check_functions
                             dependencies: f.get(3)))
 endforeach
 
+cdata.set10('HAVE_STRUCT_SCHED_ATTR',
+            cc.compiles('''
+            #define _GNU_SOURCE
+            #include <sched.h>
+            int main(void) {
+              struct sched_attr attr = { 0 };
+              return (int) attr.size;
+            }
+          ''', name: 'struct sched_attr in <sched.h>'))
+
+cdata.set10('HAVE_SCHED_SETATTR',
+            cc.compiles('''
+            #define _GNU_SOURCE
+            #include <sched.h>
+            int main(void) {
+              struct sched_attr attr = { 0 };
+              return sched_setattr(0, &attr, 0);
+            }
+          ''', name: 'sched_setattr in <sched.h>'))
+
+cdata.set10('HAVE_SCHED_GETATTR',
+            cc.compiles('''
+            #define _GNU_SOURCE
+            #include <sched.h>
+            int main(void) {
+              struct sched_attr attr = { 0 };
+              return sched_getattr(0, &attr, sizeof(attr), 0);
+            }
+          ''', name: 'sched_getattr in <sched.h>'))
+
 installed_tests_metadir = pipewire_datadir / 'installed-tests' / pipewire_name
 installed_tests_execdir = pipewire_libexecdir / 'installed-tests' / pipewire_name
 installed_tests_enabled = get_option('installed_tests').allowed()
