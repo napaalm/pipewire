@@ -393,21 +393,38 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	return L;
 }
 
+static inline uint64_t saturating_sub_u64(uint64_t value, uint64_t decrement)
+{
+	/* A discounted node can consume the whole residual budget/path length. */
+	return decrement >= value ? 0 : value - decrement;
+}
+
+static inline uint64_t proportional_deadline(uint64_t deadline_budget, uint64_t wcet, uint64_t path_wcet)
+{
+	if (deadline_budget == 0 || wcet == 0 || path_wcet == 0)
+		return 0;
+
+	return (uint64_t)floor((double)deadline_budget * ((double)wcet / (double)path_wcet));
+}
+
+static inline void assign_or_tighten_deadline(dag_node_t *node, uint64_t deadline)
+{
+	if (!node->deadline_assigned) {
+		node->deadline = deadline;
+		node->deadline_assigned = true;
+	} else if (node->deadline > deadline) {
+		node->deadline = deadline;
+	}
+}
+
 static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst, uint64_t D)
 {
 	if (src == dst) {
-		uint64_t d_i = D;
-		if (src->deadline_assigned) {
-			if (src->deadline > d_i) {
-				src->deadline = d_i;
-			}
-		} else {
-			src->deadline = d_i;
-			src->deadline_assigned = true;
-		}
+		assign_or_tighten_deadline(src, D);
 		return 0;
 	}
 
+	/* Phase A: compute the critical path for this subproblem. */
 	dag_node_t **P;
 	int path_len;
 	uint64_t L = compute_longest_path(g, src, dst, &P, &path_len);
@@ -417,7 +434,13 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 		return -1;
 	}
 
-	uint64_t D_orig = D;
+	/* Phase B: discount already-assigned tighter deadlines from the
+	 * residual budget and residual path WCET before assigning this level.
+	 */
+	uint64_t residual_deadline = D;
+	uint64_t residual_wcet = L;
+	bool src_discounted = false;
+	uint64_t discounted_src_deadline = 0;
 	bool *excluded = calloc((size_t)path_len, sizeof(*excluded));
 	if (!excluded) {
 		free(P);
@@ -427,9 +450,7 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		double D_d = (double)D;
-		double L_d = (double)L;
-		if (D_d <= 0.0 || L_d <= 0.0)
+		if (residual_deadline == 0 || residual_wcet == 0)
 			break;
 
 		for (int i=0; i<path_len; i++) {
@@ -437,12 +458,18 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 				continue;
 
 			dag_node_t *ni = P[i];
-			uint64_t C_i = ni->wcet;
-			uint64_t d_prime = (uint64_t)floor(D_d * ((double)C_i / L_d));
+			uint64_t d_prime = proportional_deadline(residual_deadline,
+					ni->wcet, residual_wcet);
 
 			if (ni->deadline_assigned && ni->deadline < d_prime) {
-				D = (D > ni->deadline) ? (D - ni->deadline) : 0;
-				L = (L > C_i) ? (L - C_i) : 0;
+				residual_deadline = saturating_sub_u64(residual_deadline,
+						ni->deadline);
+				residual_wcet = saturating_sub_u64(residual_wcet,
+						ni->wcet);
+				if (ni == src) {
+					src_discounted = true;
+					discounted_src_deadline = ni->deadline;
+				}
 				excluded[i] = true;
 				changed = true;
 				break;
@@ -450,42 +477,43 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 		}
 	}
 
-	double D_d = (double)D;
-	double L_d = (double)L;
-
-	if (D_d <= 0.0 || L_d <= 0.0) {
+	if (residual_deadline == 0 || residual_wcet == 0) {
 		free(excluded);
 		free(P);
 		return 0;
 	}
 
-	uint64_t assigned_src = 0;
+	/* Phase C: assign/tighten the endpoints with the updated residual budget
+	 * and recurse with the budget left after the current source.
+	 *
+	 * The recursive budget must be derived from residual_deadline, not from
+	 * the original D input. Using the stale input would re-introduce deadline
+	 * budget already discounted above for tighter pre-assigned nodes.
+	 */
 	dag_node_t *n_src = P[0];
-	uint64_t C_src = n_src->wcet;
-	uint64_t d_prime_src = (uint64_t)floor(D_d * ((double)C_src / L_d));
-	if (!n_src->deadline_assigned) {
-		n_src->deadline = d_prime_src;
-		n_src->deadline_assigned = true;
-	} else {
-		if (n_src->deadline > d_prime_src) n_src->deadline = d_prime_src;
-	}
-	assigned_src = n_src->deadline;
+	uint64_t d_prime_src = proportional_deadline(residual_deadline,
+			n_src->wcet, residual_wcet);
+	assign_or_tighten_deadline(n_src, d_prime_src);
 	
 	dag_node_t *n_dst = P[path_len - 1];
-	uint64_t C_dst = n_dst->wcet;
-	uint64_t d_prime_dst = (uint64_t)floor(D_d * ((double)C_dst / L_d));
-	
-	if (!n_dst->deadline_assigned) {
-		n_dst->deadline = d_prime_dst;
-		n_dst->deadline_assigned = true;
+	uint64_t d_prime_dst = proportional_deadline(residual_deadline,
+			n_dst->wcet, residual_wcet);
+	assign_or_tighten_deadline(n_dst, d_prime_dst);
+
+	uint64_t D_residual = residual_deadline;
+	if (src_discounted) {
+		/* Phase B already removed the source from residual_deadline. If
+		 * phase C tightened it again, refund the delta so descendants see
+		 * the true post-source residual budget.
+		 */
+		D_residual += discounted_src_deadline - n_src->deadline;
 	} else {
-		if (n_dst->deadline > d_prime_dst) n_dst->deadline = d_prime_dst;
+		D_residual = saturating_sub_u64(D_residual, n_src->deadline);
 	}
 
 	dag_edge_t *e;
 	spa_list_for_each(e, &src->outgoing, src_link) {
 		if (e->dst != dst) {
-			uint64_t D_residual = (D_orig > assigned_src) ? (D_orig - assigned_src) : 0;
 			int r = assign_deadlines_recursive(g, e->dst, dst, D_residual);
 			if (r < 0) {
 				free(excluded);
