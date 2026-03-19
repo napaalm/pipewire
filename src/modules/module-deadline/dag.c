@@ -982,11 +982,54 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	return 0;
 }
 
+struct cpu_assignment_info {
+	dag_node_t *node;
+	uint32_t index;
+	double util;
+};
+
+static int compare_density_desc(double a_density, uint32_t a_key,
+		double b_density, uint32_t b_key)
+{
+	if (a_density < b_density)
+		return 1;
+	if (a_density > b_density)
+		return -1;
+	if (a_key > b_key)
+		return 1;
+	if (a_key < b_key)
+		return -1;
+	return 0;
+}
+
+static int compare_cpu_assignment_info_desc(const void *a, const void *b)
+{
+	const struct cpu_assignment_info *info_a = a;
+	const struct cpu_assignment_info *info_b = b;
+
+	/* Place denser tasks first. Equal-density nodes keep topological order. */
+	return compare_density_desc(info_a->util, info_a->index,
+			info_b->util, info_b->index);
+}
+
+static bool prefer_cpu_choice(double projected, uint32_t cpu,
+		double best_projected, int best_cpu)
+{
+	if (best_cpu < 0)
+		return true;
+	if (projected < best_projected)
+		return true;
+
+	/* When two CPUs yield the same projected load, prefer the lowest index. */
+	return projected == best_projected && (int) cpu < best_cpu;
+}
+
 static int assign_cpus(dag_t *g)
 {
 	uint32_t count = g->indexed_count;
 	uint32_t unrelated_size = g->unrelated_size;
 	uint32_t num_cpus = g->num_cpus;
+	struct cpu_assignment_info *info;
 
 	if (count == 0)
 		return 0;
@@ -998,10 +1041,7 @@ static int assign_cpus(dag_t *g)
 		}
 	}
 
-	struct {
-		dag_node_t *n;
-		double util;
-	} *info = calloc(count, sizeof(*info));
+	info = calloc(count, sizeof(*info));
 	if (!info)
 		return -1;
 
@@ -1014,23 +1054,12 @@ static int assign_cpus(dag_t *g)
 			return -1;
 		}
 
-		info[i].n = g->indexed_nodes[i];
+		info[i].node = g->indexed_nodes[i];
+		info[i].index = g->indexed_nodes[i]->index;
 		info[i].util = ((double)g->indexed_nodes[i]->wcet) / denom;
 	}
 
-	for (uint32_t x = 0; x + 1 < count; x++) {
-		for (uint32_t y = x + 1; y < count; y++) {
-			if (info[x].util < info[y].util) {
-				double tmpu = info[x].util;
-				dag_node_t *tmpn = info[x].n;
-
-				info[x].util = info[y].util;
-				info[x].n = info[y].n;
-				info[y].util = tmpu;
-				info[y].n = tmpn;
-			}
-		}
-	}
+	qsort(info, count, sizeof(*info), compare_cpu_assignment_info_desc);
 
 	double *cpu_peak = calloc(num_cpus, sizeof(*cpu_peak));
 	double *cpu_set_util = calloc((size_t)num_cpus * unrelated_size, sizeof(*cpu_set_util));
@@ -1044,13 +1073,13 @@ static int assign_cpus(dag_t *g)
 	for (uint32_t i = 0; i < count; i++) {
 		double u = info[i].util;
 		int chosen = -1;
-		double max_margin = -DBL_MAX;
+		double chosen_projected = DBL_MAX;
 
 		for (uint32_t c = 0; c < num_cpus; c++) {
 			double projected = cpu_peak[c] > u ? cpu_peak[c] : u;
 
 			for (uint32_t s = 0; s < unrelated_size; s++) {
-				if (!bitset_test(g->unrelated[s], info[i].n->index))
+				if (!bitset_test(g->unrelated[s], info[i].node->index))
 					continue;
 
 				double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u;
@@ -1058,9 +1087,10 @@ static int assign_cpus(dag_t *g)
 					projected = candidate;
 			}
 
-			double margin = g->utilization - projected;
-			if (margin >= 0.0 && margin > max_margin) {
-				max_margin = margin;
+			if (projected <= g->utilization &&
+					prefer_cpu_choice(projected, c,
+						chosen_projected, chosen)) {
+				chosen_projected = projected;
 				chosen = (int)c;
 			}
 		}
@@ -1073,12 +1103,12 @@ static int assign_cpus(dag_t *g)
 			return -1;
 		}
 
-		info[i].n->cpu = (uint32_t)chosen;
+		info[i].node->cpu = (uint32_t)chosen;
 		double projected = cpu_peak[chosen] > u ? cpu_peak[chosen] : u;
 
 		for (uint32_t s = 0; s < unrelated_size; s++) {
 			size_t offset = (size_t)chosen * unrelated_size + s;
-			if (!bitset_test(g->unrelated[s], info[i].n->index))
+			if (!bitset_test(g->unrelated[s], info[i].node->index))
 				continue;
 
 			cpu_set_util[offset] += u;
