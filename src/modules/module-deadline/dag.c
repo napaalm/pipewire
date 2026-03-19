@@ -712,85 +712,282 @@ static int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst
 	return 0;
 }
 
-static int assign_cpus(dag_t *g)
+static void sort_indices_by_density_desc(int *indices, int count, const double *density)
 {
-	size_t count = dag_list_len(&g->nodes);
-	if (count == 0) return 0;
+	for (int i = 1; i < count; i++) {
+		int cur = indices[i];
+		int j = i - 1;
 
-	dag_node_t *node;
-	dag_node_t **arr = malloc(count*sizeof(*arr));
-	int i=0;
-	spa_list_for_each(node, &g->nodes, link) {
-		arr[i++] = node;
-	}
-
-	for (size_t j=0; j<count; j++) {
-		if (!arr[j]->deadline_assigned) {
-			free(arr);
-			errno = EFAULT;
-			return -1;
+		while (j >= 0 && density[indices[j]] < density[cur]) {
+			indices[j + 1] = indices[j];
+			j--;
 		}
+		indices[j + 1] = cur;
 	}
+}
 
-	struct {
-		dag_node_t *n;
-		double util;
-	} *info = malloc(count*sizeof(*info));
+static int build_relatedness_matrix(dag_t *g, dag_node_t ***nodes_out,
+		bool **related_out, double **density_out, int *count_out)
+{
+	size_t node_count;
+	node_array_t topo = {
+		.nodes = NULL,
+		.count = 0,
+	};
+	bool *reachable = NULL;
+	bool *related = NULL;
+	double *density = NULL;
+	size_t matrix_elems;
+	int result = -1;
 
-	for (size_t j=0; j<count; j++) {
-		double denom = (double)((arr[j]->deadline < g->period) ? arr[j]->deadline : g->period);
-		if (denom == 0) {
-			free(info);
-			free(arr);
-			errno = EFAULT;
-			return -1;
-		}
-		info[j].n = arr[j];
-		info[j].util = ((double)arr[j]->wcet) / denom;
-	}
+	*nodes_out = NULL;
+	*related_out = NULL;
+	*density_out = NULL;
+	*count_out = 0;
 
-	for (size_t x=0; x<count-1; x++) {
-		for (size_t y=x+1; y<count; y++) {
-			if (info[x].util < info[y].util) {
-				double tmpu = info[x].util; info[x].util = info[y].util; info[y].util = tmpu;
-				dag_node_t *tmpn = info[x].n; info[x].n = info[y].n; info[y].n = tmpn;
-			}
-		}
-	}
-
-	double *cpu_util = calloc(g->num_cpus, sizeof(double));
-	if (!cpu_util) {
-		free(info);
-		free(arr);
+	node_count = dag_list_len(&g->nodes);
+	if (node_count > INT_MAX) {
+		errno = EOVERFLOW;
 		return -1;
 	}
+	topo.count = (int) node_count;
+	if (topo.count == 0)
+		return 0;
 
-	for (size_t j=0; j<count; j++) {
-		double u = info[j].util;
-		int chosen = -1;
-		double max_margin = -1.0;
-		for (uint32_t c=0; c<g->num_cpus; c++) {
-			double margin = g->utilization - cpu_util[c];
-			if (margin >= u && margin > max_margin) {
-				max_margin = margin;
-				chosen = c;
-			}
-		}
-		if (chosen < 0) {
-			free(cpu_util);
-			free(info);
-			free(arr);
-			errno = EAGAIN;
-			return -1;
-		}
-		cpu_util[chosen] += u;
-		info[j].n->cpu = chosen;
+	topo.nodes = calloc((size_t) topo.count, sizeof(*topo.nodes));
+	if (!topo.nodes)
+		return -1;
+
+	if (topological_sort(g, topo.nodes, &topo.count) < 0)
+		goto out;
+
+	if ((size_t) topo.count > SIZE_MAX / (size_t) topo.count) {
+		errno = EOVERFLOW;
+		goto out;
 	}
 
-	free(cpu_util);
+	matrix_elems = (size_t) topo.count * (size_t) topo.count;
+	reachable = calloc(matrix_elems, sizeof(*reachable));
+	related = calloc(matrix_elems, sizeof(*related));
+	density = calloc((size_t) topo.count, sizeof(*density));
+	if (!reachable || !related || !density)
+		goto out;
+
+	for (int i = 0; i < topo.count; i++) {
+		uint64_t denom = topo.nodes[i]->deadline < g->period ?
+				topo.nodes[i]->deadline : g->period;
+
+		if (!topo.nodes[i]->deadline_assigned || denom == 0) {
+			errno = EFAULT;
+			goto out;
+		}
+
+		density[i] = (double) topo.nodes[i]->wcet / (double) denom;
+	}
+
+	for (int i = topo.count - 1; i >= 0; i--) {
+		dag_edge_t *e;
+
+		spa_list_for_each(e, &topo.nodes[i]->outgoing, src_link) {
+			int dst_idx = find_node_index(&topo, e->dst);
+
+			if (dst_idx < 0) {
+				errno = EFAULT;
+				goto out;
+			}
+
+			reachable[(size_t) i * (size_t) topo.count + (size_t) dst_idx] = true;
+			for (int k = 0; k < topo.count; k++) {
+				if (reachable[(size_t) dst_idx * (size_t) topo.count + (size_t) k]) {
+					reachable[(size_t) i * (size_t) topo.count + (size_t) k] = true;
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < topo.count; i++) {
+		related[(size_t) i * (size_t) topo.count + (size_t) i] = true;
+		for (int j = i + 1; j < topo.count; j++) {
+			bool pair_related =
+				reachable[(size_t) i * (size_t) topo.count + (size_t) j] ||
+				reachable[(size_t) j * (size_t) topo.count + (size_t) i];
+
+			related[(size_t) i * (size_t) topo.count + (size_t) j] = pair_related;
+			related[(size_t) j * (size_t) topo.count + (size_t) i] = pair_related;
+		}
+	}
+
+	*nodes_out = topo.nodes;
+	*related_out = related;
+	*density_out = density;
+	*count_out = topo.count;
+	result = 0;
+
+out:
+	free(reachable);
+	if (result < 0) {
+		free(density);
+		free(related);
+		free(topo.nodes);
+	}
+	return result;
+}
+
+static void search_max_unrelated_density(const bool *related, const double *density,
+		int node_count, const int *candidates, int candidate_count,
+		double current_density, double remaining_density, double *best_density)
+{
+	int v;
+	double remaining_without_v;
+	int include_count = 0;
+	double include_remaining = 0.0;
+	int next_candidates[candidate_count > 1 ? candidate_count - 1 : 1];
+
+	if (current_density > *best_density)
+		*best_density = current_density;
+
+	if (candidate_count == 0 ||
+			current_density + remaining_density <= *best_density)
+		return;
+
+	v = candidates[0];
+	remaining_without_v = remaining_density - density[v];
+
+	for (int i = 1; i < candidate_count; i++) {
+		int candidate = candidates[i];
+
+		if (!related[(size_t) v * (size_t) node_count + (size_t) candidate]) {
+			next_candidates[include_count++] = candidate;
+			include_remaining += density[candidate];
+		}
+	}
+
+	search_max_unrelated_density(related, density, node_count,
+			next_candidates, include_count,
+			current_density + density[v], include_remaining,
+			best_density);
+
+	if (current_density + remaining_without_v <= *best_density)
+		return;
+
+	search_max_unrelated_density(related, density, node_count,
+			&candidates[1], candidate_count - 1,
+			current_density, remaining_without_v, best_density);
+}
+
+static double compute_cpu_load_exact(const bool *related, const double *density,
+		const uint32_t *placement, int node_count, uint32_t cpu,
+		int tentative_idx, uint32_t tentative_cpu)
+{
+	double remaining_density = 0.0;
+	double best_density = 0.0;
+	int candidate_count = 0;
+	int candidates[node_count > 0 ? node_count : 1];
+
+	for (int i = 0; i < node_count; i++) {
+		uint32_t assigned_cpu = placement[i];
+
+		if (i == tentative_idx)
+			assigned_cpu = tentative_cpu;
+
+		if (assigned_cpu != cpu)
+			continue;
+
+		candidates[candidate_count++] = i;
+		remaining_density += density[i];
+	}
+
+	if (candidate_count == 0)
+		return 0.0;
+
+	sort_indices_by_density_desc(candidates, candidate_count, density);
+	search_max_unrelated_density(related, density, node_count,
+			candidates, candidate_count, 0.0,
+			remaining_density, &best_density);
+	return best_density;
+}
+
+static int assign_cpus(dag_t *g)
+{
+	dag_node_t **nodes = NULL;
+	bool *related = NULL;
+	double *density = NULL;
+	uint32_t *placement = NULL;
+	int node_count = 0;
+	int result = -1;
+
+	struct cpu_assignment_info {
+		dag_node_t *node;
+		int index;
+		double density;
+	} *info = NULL;
+
+	/* For a single DAG, the load of one CPU is the maximum total density of
+	 * any pairwise unrelated set assigned there, not the raw sum of all node
+	 * densities. We build the exact reachability closure once, then solve the
+	 * maximum-weight unrelated set problem exactly for each tentative CPU.
+	 */
+	if (build_relatedness_matrix(g, &nodes, &related, &density, &node_count) < 0)
+		return -1;
+	if (node_count == 0)
+		return 0;
+
+	info = calloc((size_t) node_count, sizeof(*info));
+	placement = malloc((size_t) node_count * sizeof(*placement));
+	if (!info || !placement)
+		goto out;
+
+	for (int i = 0; i < node_count; i++) {
+		info[i].node = nodes[i];
+		info[i].index = i;
+		info[i].density = density[i];
+		placement[i] = UINT32_MAX;
+	}
+
+	for (int x = 0; x < node_count - 1; x++) {
+		for (int y = x + 1; y < node_count; y++) {
+			if (info[x].density < info[y].density) {
+				struct cpu_assignment_info tmp = info[x];
+
+				info[x] = info[y];
+				info[y] = tmp;
+			}
+		}
+	}
+
+	for (int i = 0; i < node_count; i++) {
+		int chosen_cpu = -1;
+		double chosen_load = DBL_MAX;
+
+		for (uint32_t cpu = 0; cpu < g->num_cpus; cpu++) {
+			double load = compute_cpu_load_exact(related, density,
+					placement, node_count, cpu,
+					info[i].index, cpu);
+
+			if (load < chosen_load) {
+				chosen_load = load;
+				chosen_cpu = (int) cpu;
+			}
+		}
+
+		if (chosen_cpu < 0 || chosen_load > (double) g->utilization) {
+			errno = EAGAIN;
+			goto out;
+		}
+
+		placement[info[i].index] = (uint32_t) chosen_cpu;
+		info[i].node->cpu = (uint32_t) chosen_cpu;
+	}
+
+	result = 0;
+
+out:
+	free(placement);
 	free(info);
-	free(arr);
-	return 0;
+	free(density);
+	free(related);
+	free(nodes);
+	return result;
 }
 
 int dag_recalculate(dag_t *g)

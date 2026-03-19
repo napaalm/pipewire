@@ -3,6 +3,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include <errno.h>
+#include <math.h>
 #include <stdlib.h>
 
 #include "config.h"
@@ -37,12 +38,108 @@ static uint64_t path_deadline_sum(dag_t *g, const uint32_t *ids, size_t n_ids)
 	return sum;
 }
 
-static dag_t *create_test_dag(uint64_t deadline, uint32_t num_cpus)
+static dag_t *create_test_dag_with_util(uint64_t deadline, float utilization,
+		uint32_t num_cpus)
 {
-	dag_t *g = dag_create(deadline, deadline, 1.0f, num_cpus);
+	dag_t *g = dag_create(deadline, deadline, utilization, num_cpus);
 
 	pwtest_ptr_notnull(g);
 	return g;
+}
+
+static dag_t *create_test_dag(uint64_t deadline, uint32_t num_cpus)
+{
+	return create_test_dag_with_util(deadline, 1.0f, num_cpus);
+}
+
+static double node_density(dag_t *g, dag_node_t *node)
+{
+	uint64_t denom = node->deadline < g->period ? node->deadline : g->period;
+
+	pwtest_bool_true(node->deadline_assigned);
+	pwtest_bool_true(denom > 0);
+	return (double) node->wcet / (double) denom;
+}
+
+static double cpu_raw_density_sum(dag_t *g, uint32_t cpu)
+{
+	double sum = 0.0;
+	dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		if (node->cpu == cpu)
+			sum += node_density(g, node);
+	}
+
+	return sum;
+}
+
+static bool node_reaches_recursive(dag_node_t *src, dag_node_t *dst)
+{
+	dag_edge_t *edge;
+
+	if (src == dst)
+		return true;
+
+	spa_list_for_each(edge, &src->outgoing, src_link) {
+		if (node_reaches_recursive(edge->dst, dst))
+			return true;
+	}
+
+	return false;
+}
+
+static double cpu_exact_unrelated_load(dag_t *g, uint32_t cpu)
+{
+	dag_node_t *selected[64];
+	size_t count = 0;
+	double best = 0.0;
+	uint64_t subsets;
+	dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link) {
+		if (node->cpu == cpu) {
+			pwtest_bool_true(count < SPA_N_ELEMENTS(selected));
+			selected[count++] = node;
+		}
+	}
+
+	subsets = 1ULL << count;
+
+	for (uint64_t mask = 1; mask < subsets; mask++) {
+		bool unrelated = true;
+		double load = 0.0;
+
+		for (size_t i = 0; i < count && unrelated; i++) {
+			if ((mask & (1ULL << i)) == 0)
+				continue;
+
+			load += node_density(g, selected[i]);
+
+			for (size_t j = i + 1; j < count; j++) {
+				if ((mask & (1ULL << j)) == 0)
+					continue;
+				if (node_reaches_recursive(selected[i], selected[j]) ||
+						node_reaches_recursive(selected[j], selected[i])) {
+					unrelated = false;
+					break;
+				}
+			}
+		}
+
+		if (unrelated && load > best)
+			best = load;
+	}
+
+	return best;
+}
+
+static void assert_all_on_cpu(dag_t *g, uint32_t cpu)
+{
+	dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link)
+		pwtest_int_eq((int) node->cpu, (int) cpu);
 }
 
 static void force_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
@@ -194,6 +291,96 @@ PWTEST(diamond_deadlines)
 	return PWTEST_PASS;
 }
 
+PWTEST(chain_cpu_load_uses_unrelated_sets)
+{
+	dag_t *g = create_test_dag(9, 1);
+	double exact_load, raw_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	raw_load = cpu_raw_density_sum(g, 0);
+	pwtest_bool_true(fabs(exact_load - (1.0 / 3.0)) < 1.0e-9);
+	pwtest_bool_true(raw_load > exact_load);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(independent_tasks_load_sums_densities)
+{
+	dag_t *g = create_test_dag(10, 1);
+	double exact_load, raw_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 2, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 3, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	raw_load = cpu_raw_density_sum(g, 0);
+	pwtest_bool_true(fabs(exact_load - raw_load) < 1.0e-9);
+	pwtest_bool_true(fabs(exact_load - 0.6) < 1.0e-9);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(diamond_cpu_load_captures_parallelism)
+{
+	dag_t *g = create_test_dag_with_util(12, 0.6f, 1);
+	double exact_load, raw_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 1, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	raw_load = cpu_raw_density_sum(g, 0);
+	pwtest_bool_true(fabs(exact_load - 0.5) < 1.0e-9);
+	pwtest_bool_true(raw_load > g->utilization);
+	pwtest_bool_true(exact_load <= g->utilization);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(chain_topology_aware_admission_regression)
+{
+	dag_t *g = create_test_dag_with_util(9, 0.4f, 1);
+	double exact_load, raw_load;
+
+	pwtest_int_eq(dag_add_node(g, 1, 1, 1), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 1, 2), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	assert_all_on_cpu(g, 0);
+	exact_load = cpu_exact_unrelated_load(g, 0);
+	raw_load = cpu_raw_density_sum(g, 0);
+	pwtest_bool_true(raw_load > g->utilization);
+	pwtest_bool_true(exact_load <= g->utilization);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(multiple_sources_and_sinks_skip_unreachable_pairs)
 {
 	static const uint32_t left_path[] = { 1, 3, 5 };
@@ -301,7 +488,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(self_loop_rejected, PWTEST_NOARG);
 	pwtest_add(cycle_edge_rejected, PWTEST_NOARG);
 	pwtest_add(chain_deadlines, PWTEST_NOARG);
+	pwtest_add(chain_cpu_load_uses_unrelated_sets, PWTEST_NOARG);
+	pwtest_add(independent_tasks_load_sums_densities, PWTEST_NOARG);
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);
+	pwtest_add(diamond_cpu_load_captures_parallelism, PWTEST_NOARG);
+	pwtest_add(chain_topology_aware_admission_regression, PWTEST_NOARG);
 	pwtest_add(multiple_sources_and_sinks_skip_unreachable_pairs, PWTEST_NOARG);
 	pwtest_add(preassigned_tightening_residual_budget, PWTEST_NOARG);
 	pwtest_add(topo_sort_rejects_forced_cycle, PWTEST_NOARG);

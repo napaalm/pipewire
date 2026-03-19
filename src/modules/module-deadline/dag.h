@@ -57,7 +57,7 @@ struct dag_edge {
 struct dag {
 	uint64_t period;    /* global period */
 	uint64_t deadline;  /* global end-to-end deadline */
-	float utilization;  /* max utilization */
+	float utilization;  /* max topology-aware per-CPU DAG load */
 	uint32_t num_cpus;
 
 	struct spa_list nodes; /* list of dag_node_t */
@@ -71,7 +71,11 @@ struct dag {
  * combinations are skipped.
  */
 
-/* Create and destroy a DAG */
+/* Create and destroy a DAG.
+ * utilization is the maximum per-CPU load admitted for this DAG after
+ * accounting for precedence: only pairwise unrelated tasks contribute
+ * concurrently on the same CPU.
+ */
 dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus);
 void dag_destroy(dag_t *g);
 
