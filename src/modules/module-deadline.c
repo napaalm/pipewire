@@ -240,7 +240,7 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, ui
 		else
 			pw_log_error("failed to set DEADLINE attributes for tid %d: %s", tid, strerror(errno));
 	}
-	else 
+	else
 		pw_log_debug("set DEADLINE scheduling for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
 
 	return ret;
@@ -367,7 +367,7 @@ static void recalc_params(void *data)
 		}
 
 		// media_class = pw_properties_get(node->properties, PW_KEY_MEDIA_CLASS);
-		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid);
+		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid, false);
 	}
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
