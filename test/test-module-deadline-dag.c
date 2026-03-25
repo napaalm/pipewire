@@ -108,6 +108,30 @@ static uint32_t dag_real_indexed_count(dag_t *g)
 	return count;
 }
 
+static bool dag_all_nodes_have_no_successors(dag_t *g)
+{
+	dag_node_t *n;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		if (n->successors != NULL)
+			return false;
+	}
+
+	return true;
+}
+
+static bool dag_unrelated_has_fictitious_nodes(dag_t *g)
+{
+	for (uint32_t i = 0; i < g->unrelated_size; i++) {
+		for (uint32_t j = 0; j < g->indexed_count; j++) {
+			if (bitset_test(g->unrelated[i], j) && g->indexed_nodes[j]->fictitious)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 struct foreach_info {
 	uint32_t count;
 	bool saw_internal_tid;
@@ -149,11 +173,14 @@ PWTEST(chain_uses_peak_not_sum)
 
 	pwtest_int_eq((int)dag_real_indexed_count(g), 3);
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
-	pwtest_int_eq(g->relatives[n1->index][n1->index], 1);
-	pwtest_int_eq(g->relatives[n1->index][n2->index], 1);
-	pwtest_int_eq(g->relatives[n2->index][n1->index], 1);
-	pwtest_int_eq(g->relatives[n1->index][n3->index], 1);
-	pwtest_int_eq(g->relatives[n3->index][n1->index], 1);
+	pwtest_ptr_notnull(n1->successors);
+	pwtest_ptr_notnull(n2->successors);
+	pwtest_ptr_notnull(n3->successors);
+	pwtest_bool_true(bitset_test(n1->successors, n1->index));
+	pwtest_bool_true(bitset_test(n1->successors, n2->index));
+	pwtest_bool_false(bitset_test(n2->successors, n1->index));
+	pwtest_bool_true(bitset_test(n1->successors, n3->index));
+	pwtest_bool_false(bitset_test(n3->successors, n1->index));
 	pwtest_int_eq((int)dag_max_unrelated_size(g), 1);
 	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
 	pwtest_int_eq((int)n1->cpu, 0);
@@ -294,12 +321,18 @@ PWTEST(recalculate_keeps_exactly_two_fictitious_nodes)
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+	pwtest_ptr_notnull(find_node_by_id(g, 1)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 2)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 3)->successors);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
 	pwtest_int_eq((int)dag_real_node_count(g), 3);
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+	pwtest_ptr_notnull(find_node_by_id(g, 1)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 2)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 3)->successors);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
