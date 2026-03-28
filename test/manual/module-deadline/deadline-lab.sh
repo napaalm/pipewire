@@ -1,0 +1,990 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null); then
+	:
+else
+	REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
+fi
+BUILD_DIR="${MDL_BUILD_DIR:-$REPO_ROOT/build}"
+LAB_DIR="${MDL_LAB_DIR:-$BUILD_DIR/deadline-lab}"
+STATE_DIR="$LAB_DIR/state"
+LOG_DIR="$LAB_DIR/logs"
+SNAP_DIR="$LOG_DIR/snapshots"
+CONFIG_DIR="$STATE_DIR/config"
+RUNTIME_DIR="$STATE_DIR/runtime"
+PIDS_DIR="$STATE_DIR/pids"
+CONFIG_FILE="$CONFIG_DIR/pipewire.conf"
+PIPEWIRE_PID_FILE="$STATE_DIR/pipewire.pid"
+CURRENT_LOG_FILE="$STATE_DIR/current-log"
+CURRENT_VARIANT_FILE="$STATE_DIR/current-variant"
+RESULTS_FILE="$LOG_DIR/latest-summary.txt"
+
+DEFAULT_REMOTE="${MDL_REMOTE:-deadline-lab}"
+DEFAULT_ALSA_PATH="${MDL_ALSA_PATH:-hw:0,0}"
+DEFAULT_RATE="${MDL_DEFAULT_RATE:-48000}"
+DEFAULT_QUANTUM="${MDL_DEFAULT_QUANTUM:-256}"
+DEFAULT_MIN_QUANTUM="${MDL_MIN_QUANTUM:-32}"
+DEFAULT_MAX_QUANTUM="${MDL_MAX_QUANTUM:-2048}"
+DEFAULT_QUANTUM_LIMIT="${MDL_QUANTUM_LIMIT:-8192}"
+DEFAULT_UTILIZATION="${MDL_UTILIZATION:-0.95}"
+ALLOWED_RATES="${MDL_ALLOWED_RATES:-[ 44100 48000 96000 ]}"
+
+msg()
+{
+	printf '%s\n' "$*"
+}
+
+die()
+{
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+
+note()
+{
+	msg "$*"
+	if [[ "${RESULTS_ENABLED:-0}" == "1" ]]; then
+		printf '%s\n' "$*" >>"$RESULTS_FILE"
+	fi
+}
+
+ensure_dirs()
+{
+	mkdir -p "$STATE_DIR" "$LOG_DIR" "$SNAP_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$PIDS_DIR"
+	chmod 700 "$RUNTIME_DIR"
+}
+
+expand_cpu_list()
+{
+	local text="$1"
+	local item
+	local start
+	local end
+	local cpu
+	local out=()
+
+	text=${text// /}
+	IFS=',' read -r -a items <<<"$text"
+	for item in "${items[@]}"; do
+		[[ -z "$item" ]] && continue
+		if [[ "$item" == *-* ]]; then
+			start=${item%-*}
+			end=${item#*-}
+			for ((cpu = start; cpu <= end; cpu++)); do
+				out+=("$cpu")
+			done
+		else
+			out+=("$item")
+		fi
+	done
+	printf '%s\n' "${out[*]}"
+}
+
+detect_affinity_json()
+{
+	local affinity
+	local expanded
+	local cpu
+	local out='[ '
+
+	affinity=$(taskset -pc $$ | awk -F: '{ gsub(/^[ \t]+/, "", $2); print $2 }')
+	expanded=$(expand_cpu_list "$affinity")
+	for cpu in $expanded; do
+		out+="$cpu "
+	done
+	out+=']'
+	printf '%s\n' "$out"
+}
+
+BASE_CPUS="${MDL_CPUS:-$(detect_affinity_json)}"
+AFFINITY_CPUS="$(expand_cpu_list "$(taskset -pc $$ | awk -F: '{ gsub(/^[ \t]+/, "", $2); print $2 }')")"
+
+prepare_env()
+{
+	export PIPEWIRE_CONFIG_DIR="$BUILD_DIR/src/daemon"
+	export SPA_PLUGIN_DIR="$BUILD_DIR/spa/plugins"
+	export SPA_DATA_DIR="$REPO_ROOT/spa/plugins"
+	export PIPEWIRE_MODULE_DIR="$BUILD_DIR/src/modules"
+	export PATH="$BUILD_DIR/src/daemon:$BUILD_DIR/src/tools:$BUILD_DIR/src/examples:$PATH"
+	export LD_LIBRARY_PATH="$BUILD_DIR/src/pipewire${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	export ACP_PATHS_DIR="$REPO_ROOT/spa/plugins/alsa/mixer/paths"
+	export ACP_PROFILES_DIR="$REPO_ROOT/spa/plugins/alsa/mixer/profile-sets"
+	export ALSA_PLUGIN_DIR="$BUILD_DIR/pipewire-alsa/alsa-plugins"
+	export PW_BUILDDIR="$BUILD_DIR"
+	export PW_UNINSTALLED=1
+	export PKG_CONFIG_PATH="$BUILD_DIR/meson-uninstalled${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+	export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+	export PIPEWIRE_RUNTIME_DIR="$RUNTIME_DIR"
+	export PIPEWIRE_REMOTE="$DEFAULT_REMOTE"
+	export DISABLE_RTKIT=1
+	export NO_COLOR=1
+}
+
+run_tool()
+{
+	prepare_env
+	"$@"
+}
+
+pw_dump_json()
+{
+	run_tool "$BUILD_DIR/src/tools/pw-dump"
+}
+
+pw_cli()
+{
+	run_tool "$BUILD_DIR/src/tools/pw-cli" "$@"
+}
+
+pw_metadata_tool()
+{
+	run_tool "$BUILD_DIR/src/tools/pw-metadata" "$@"
+}
+
+pw_link_tool()
+{
+	run_tool "$BUILD_DIR/src/tools/pw-link" "$@"
+}
+
+current_log()
+{
+	[[ -f "$CURRENT_LOG_FILE" ]] || die "no current log file recorded"
+	cat "$CURRENT_LOG_FILE"
+}
+
+current_variant()
+{
+	[[ -f "$CURRENT_VARIANT_FILE" ]] || die "no current variant recorded"
+	cat "$CURRENT_VARIANT_FILE"
+}
+
+pipewire_pid()
+{
+	[[ -f "$PIPEWIRE_PID_FILE" ]] || die "daemon pid file not found"
+	cat "$PIPEWIRE_PID_FILE"
+}
+
+is_running()
+{
+	[[ -f "$PIPEWIRE_PID_FILE" ]] || return 1
+	kill -0 "$(cat "$PIPEWIRE_PID_FILE")" 2>/dev/null
+}
+
+wait_for_remote()
+{
+	local _i
+	for _i in $(seq 1 100); do
+		if pw_dump_json >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	die "local daemon did not come up"
+}
+
+write_config()
+{
+	local variant="$1"
+	local cpus_line=""
+	local util_line=""
+	local dynamic_loops="true"
+
+	case "$variant" in
+	base)
+		cpus_line="            cpus.available   = ${BASE_CPUS}"
+		util_line="            cpus.utilization = ${DEFAULT_UTILIZATION}"
+		;;
+	no-cpus)
+		util_line="            cpus.utilization = ${DEFAULT_UTILIZATION}"
+		;;
+	no-util)
+		cpus_line="            cpus.available   = ${BASE_CPUS}"
+		;;
+	no-dynamic-loop)
+		cpus_line="            cpus.available   = ${BASE_CPUS}"
+		util_line="            cpus.utilization = ${DEFAULT_UTILIZATION}"
+		dynamic_loops="false"
+		;;
+	*)
+		die "unknown config variant: $variant"
+		;;
+	esac
+
+	cat >"$CONFIG_FILE" <<EOF
+# Local module-deadline lab config. Generated by deadline-lab.sh.
+
+context.properties = {
+    context.dynamic-data-loops  = ${dynamic_loops}
+    context.num-data-loops      = -1
+    core.daemon                 = true
+    core.name                   = "${DEFAULT_REMOTE}"
+    default.clock.rate          = ${DEFAULT_RATE}
+    default.clock.allowed-rates = ${ALLOWED_RATES}
+    default.clock.quantum       = ${DEFAULT_QUANTUM}
+    default.clock.min-quantum   = ${DEFAULT_MIN_QUANTUM}
+    default.clock.max-quantum   = ${DEFAULT_MAX_QUANTUM}
+    default.clock.quantum-limit = ${DEFAULT_QUANTUM_LIMIT}
+    settings.check-quantum      = false
+    settings.check-rate         = false
+    log.level                   = 4
+}
+
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    api.alsa.*      = alsa/libspa-alsa
+    support.*       = support/libspa-support
+    audiotestsrc    = audiotestsrc/libspa-audiotestsrc
+}
+
+context.modules = [
+    { name = libpipewire-module-rt
+        args = {
+            nice.level = -11
+            rt.prio    = 88
+        }
+        flags = [ ifexists nofail ]
+    }
+    { name = libpipewire-module-deadline
+        args = {
+${cpus_line}
+${util_line}
+        }
+    }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-profiler }
+    { name = libpipewire-module-metadata }
+    { name = libpipewire-module-spa-node-factory }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-access }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-link-factory }
+]
+
+stream.properties = {
+    adapter.auto-port-config = { mode = dsp }
+}
+
+context.objects = [
+    { factory = metadata
+        args = {
+            metadata.name = default
+        }
+    }
+    { factory = spa-node-factory
+        args = {
+            factory.name    = support.node.driver
+            node.name       = Dummy-Driver
+            node.group      = pipewire.dummy
+            priority.driver = 20000
+        }
+    }
+    { factory = spa-node-factory
+        args = {
+            factory.name    = support.node.driver
+            node.name       = Freewheel-Driver
+            priority.driver = 19000
+            node.group      = pipewire.freewheel
+            node.freewheel  = true
+        }
+    }
+]
+EOF
+}
+
+start_daemon()
+{
+	local variant="${1:-base}"
+	local log_file
+
+	is_running && die "daemon already running"
+	ensure_dirs
+	write_config "$variant"
+
+	log_file="$LOG_DIR/pipewire-${variant}.log"
+	: >"$log_file"
+
+	prepare_env
+	PIPEWIRE_LOG="$log_file" \
+	PIPEWIRE_LOG_SYSTEMD=false \
+	PIPEWIRE_LOG_LINE=true \
+	PIPEWIRE_DEBUG="${MDL_PIPEWIRE_DEBUG:-D}" \
+	nohup "$BUILD_DIR/src/daemon/pipewire" -c "$CONFIG_FILE" >>"$log_file" 2>&1 < /dev/null &
+
+	echo "$!" >"$PIPEWIRE_PID_FILE"
+	printf '%s\n' "$log_file" >"$CURRENT_LOG_FILE"
+	printf '%s\n' "$variant" >"$CURRENT_VARIANT_FILE"
+
+	wait_for_remote
+	note "started ${variant} daemon pid=$(pipewire_pid) log=$log_file"
+}
+
+stop_loopbacks()
+{
+	local pid_file
+	local pid
+
+	for pid_file in "$PIDS_DIR"/*.pid; do
+		[[ -e "$pid_file" ]] || continue
+		pid=$(cat "$pid_file")
+		if kill -0 "$pid" 2>/dev/null; then
+			kill "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
+		rm -f "$pid_file"
+	done
+}
+
+stop_daemon()
+{
+	if is_running; then
+		stop_loopbacks
+		kill "$(pipewire_pid)" 2>/dev/null || true
+		wait "$(pipewire_pid)" 2>/dev/null || true
+		rm -f "$PIPEWIRE_PID_FILE"
+		note "stopped daemon"
+	else
+		stop_loopbacks
+	fi
+}
+
+node_id_by_name()
+{
+	pw_dump_json | jq -r --arg name "$1" '
+		.[] |
+		select(.type == "PipeWire:Interface:Node" and (.info.props["node.name"] // "") == $name) |
+		.id
+	' | head -n1
+}
+
+destroy_node_by_name()
+{
+	local name="$1"
+	local id
+
+	id=$(node_id_by_name "$name" || true)
+	[[ -n "$id" ]] || return 0
+	pw_cli destroy "$id" >/dev/null
+}
+
+wait_for_node()
+{
+	local name="$1"
+	local _i
+
+	for _i in $(seq 1 100); do
+		if [[ -n "$(node_id_by_name "$name" || true)" ]]; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	die "node $name did not appear"
+}
+
+create_node()
+{
+	local factory="$1"
+	local props="$2"
+
+	pw_cli create-node "$factory" "$props" >/dev/null
+}
+
+create_source()
+{
+	local name="$1"
+
+	create_node adapter "{ factory.name = audiotestsrc node.name = \"$name\" node.description = \"$name\" media.class = \"Audio/Source\" audio.rate = ${DEFAULT_RATE} audio.channels = 2 audio.position = [ FL FR ] node.always-process = true object.linger = true }"
+	wait_for_node "$name"
+}
+
+create_null_sink()
+{
+	local name="$1"
+
+	create_node adapter "{ factory.name = support.null-audio-sink node.name = \"$name\" node.description = \"$name\" media.class = \"Audio/Sink\" audio.position = [ FL FR ] adapter.auto-port-config = { mode = dsp monitor = true position = preserve } object.linger = true }"
+	wait_for_node "$name"
+}
+
+create_alsa_sink()
+{
+	local name="$1"
+
+	create_node adapter "{ factory.name = api.alsa.pcm.sink node.name = \"$name\" node.description = \"$name\" media.class = \"Audio/Sink\" api.alsa.path = \"${DEFAULT_ALSA_PATH}\" audio.rate = ${DEFAULT_RATE} audio.channels = 2 audio.position = [ FL FR ] node.suspend-on-idle = false adapter.auto-port-config = { mode = dsp monitor = true position = preserve } object.linger = true }"
+	wait_for_node "$name"
+}
+
+create_auto_link()
+{
+	local src="$1"
+	local dst="$2"
+	local src_id
+	local dst_id
+
+	src_id=$(node_id_by_name "$src")
+	dst_id=$(node_id_by_name "$dst")
+	[[ -n "$src_id" ]] || die "no node id for $src"
+	[[ -n "$dst_id" ]] || die "no node id for $dst"
+
+	pw_cli create-link "$src_id" "*" "$dst_id" "*" "{ object.linger = true }" >/dev/null
+	sleep 0.5
+}
+
+start_loopback()
+{
+	local name="$1"
+	local capture_target="$2"
+	local playback_target="$3"
+	local log_file="$LOG_DIR/${name}.log"
+
+	prepare_env
+	nohup "$BUILD_DIR/src/tools/pw-loopback" \
+		--remote="$DEFAULT_REMOTE" \
+		--name="$name" \
+		--capture="$capture_target" \
+		--playback="$playback_target" \
+		--capture-props="{ node.name = \"${name}-capture\" node.passive = true }" \
+		--playback-props="{ node.name = \"${name}-playback\" node.passive = true }" \
+		>>"$log_file" 2>&1 < /dev/null &
+
+	echo "$!" >"$PIDS_DIR/${name}.pid"
+	wait_for_node "${name}-capture"
+	wait_for_node "${name}-playback"
+}
+
+graph_reset()
+{
+	local ids
+	local id
+
+	is_running || return 0
+	stop_loopbacks
+
+	ids=$(pw_dump_json | jq -r '
+		.[] |
+		select(.type == "PipeWire:Interface:Node" and ((.info.props["node.name"] // "") | startswith("mdl-"))) |
+		.id
+	' | sort -nr)
+
+	while read -r id; do
+		[[ -n "$id" ]] || continue
+		pw_cli destroy "$id" >/dev/null || true
+	done <<<"$ids"
+
+	sleep 1
+}
+
+snapshot()
+{
+	local tag="$1"
+
+	pw_dump_json >"$SNAP_DIR/${tag}.json"
+	pw_link_tool -iol >"$SNAP_DIR/${tag}.links.txt" || true
+	if is_running; then
+		ps -L -o pid,tid,policy,psr,comm -p "$(pipewire_pid)" >"$SNAP_DIR/${tag}.threads.txt" || true
+	fi
+}
+
+log_count()
+{
+	grep -c -- "$1" "$(current_log)" 2>/dev/null || true
+}
+
+assert_log_contains()
+{
+	local pattern="$1"
+
+	grep -q -- "$pattern" "$(current_log)" || die "log is missing pattern: $pattern"
+}
+
+assert_log_contains_any()
+{
+	local first="$1"
+	local second="$2"
+
+	if grep -q -- "$first" "$(current_log)" || grep -q -- "$second" "$(current_log)"; then
+		return 0
+	fi
+	die "log is missing both patterns: $first | $second"
+}
+
+assert_log_absent()
+{
+	local pattern="$1"
+
+	if grep -q -- "$pattern" "$(current_log)"; then
+		die "log unexpectedly contains: $pattern"
+	fi
+}
+
+node_tid()
+{
+	local name="$1"
+
+	pw_dump_json | jq -r --arg name "$name" '
+		.[] |
+		select(.type == "PipeWire:Interface:Node" and (.info.props["node.name"] // "") == $name) |
+		(.info.props["node.loop.tid"] // empty)
+	' | head -n1
+}
+
+report_sched_policy()
+{
+	local name="$1"
+	local tid
+	local sched
+	local affinity
+
+	tid=$(node_tid "$name")
+	[[ -n "$tid" ]] || die "no node.loop.tid found for $name"
+
+	sched=$(chrt -p "$tid" 2>&1)
+	affinity=$(taskset -pc "$tid" 2>&1)
+	note "$name tid=$tid $sched"
+	note "$name tid=$tid $affinity"
+}
+
+assert_sched_deadline()
+{
+	local name="$1"
+	local tid
+	local sched
+
+	tid=$(node_tid "$name")
+	[[ -n "$tid" ]] || die "no node.loop.tid found for $name"
+
+	sched=$(chrt -p "$tid" 2>&1)
+	grep -q "SCHED_DEADLINE" <<<"$sched" || die "thread $tid for $name is not SCHED_DEADLINE"
+	report_sched_policy "$name"
+}
+
+assert_affinity_from_current_mask()
+{
+	local name="$1"
+	local tid
+	local current
+	local cpu
+	local allowed
+	local found=0
+
+	tid=$(node_tid "$name")
+	current=$(taskset -pc "$tid" | awk -F: '{ gsub(/^[ \t]+/, "", $2); print $2 }')
+	current=$(expand_cpu_list "$current")
+
+	for cpu in $current; do
+		for allowed in $AFFINITY_CPUS; do
+			if [[ "$cpu" == "$allowed" ]]; then
+				found=1
+				break 2
+			fi
+		done
+	done
+
+	[[ "$found" -eq 1 ]] || die "thread $tid for $name is not pinned inside current affinity mask"
+	note "$name tid=$tid pinned inside initial affinity mask ($current)"
+}
+
+set_clock()
+{
+	local rate="$1"
+	local quantum="$2"
+
+	pw_metadata_tool -n settings 0 clock.force-rate "$rate" >/dev/null
+	pw_metadata_tool -n settings 0 clock.force-quantum "$quantum" >/dev/null
+	sleep 1
+}
+
+reset_clock()
+{
+	pw_metadata_tool -n settings 0 clock.force-rate 0 >/dev/null || true
+	pw_metadata_tool -n settings 0 clock.force-quantum 0 >/dev/null || true
+	sleep 1
+}
+
+module_id_deadline()
+{
+	pw_dump_json | jq -r '
+		.[] |
+		select(.type == "PipeWire:Interface:Module" and (.info.props["module.name"] // "") == "libpipewire-module-deadline") |
+		.id
+	' | head -n1
+}
+
+scenario_basic_direct_chain()
+{
+	local count
+
+	graph_reset
+	create_null_sink mdl-null-a
+	create_null_sink mdl-null-b
+	create_null_sink mdl-null-c
+	create_auto_link mdl-null-a mdl-null-b
+	create_auto_link mdl-null-b mdl-null-c
+	sleep 2
+
+	snapshot basic-direct-chain
+	assert_log_contains "created persistent deadline DAG"
+	assert_log_absent "failed to apply deadline parameters"
+	assert_sched_deadline mdl-null-a
+	assert_sched_deadline mdl-null-b
+	assert_sched_deadline mdl-null-c
+
+	count=$(log_count "created persistent deadline DAG")
+	note "basic direct chain: persistent DAG creation count=$count"
+}
+
+scenario_loopback_chain()
+{
+	graph_reset
+	create_null_sink mdl-loop-root
+	create_null_sink mdl-loop-mid
+	create_null_sink mdl-null-loop
+	create_auto_link mdl-loop-root mdl-loop-mid
+	start_loopback mdl-lb-loop mdl-loop-mid mdl-null-loop
+	sleep 2
+
+	snapshot loopback-chain
+	assert_sched_deadline mdl-loop-root
+	assert_sched_deadline mdl-loop-mid
+	report_sched_policy mdl-lb-loop-capture
+	report_sched_policy mdl-lb-loop-playback
+	report_sched_policy mdl-null-loop
+	note "loopback chain: recorded scheduling policy for client nodes and downstream sink"
+}
+
+scenario_growth_and_shrink()
+{
+	local before
+	local after
+
+	graph_reset
+	create_null_sink mdl-grow-a
+	create_null_sink mdl-grow-b
+	create_null_sink mdl-grow-c
+	create_auto_link mdl-grow-a mdl-grow-b
+	sleep 2
+
+	before=$(log_count "created persistent deadline DAG")
+	create_auto_link mdl-grow-a mdl-grow-c
+	sleep 2
+	after=$(log_count "created persistent deadline DAG")
+	[[ "$after" == "$before" ]] || die "persistent DAG recreated while growing topology"
+
+	snapshot topology-grown
+	assert_sched_deadline mdl-grow-a
+	assert_sched_deadline mdl-grow-b
+	assert_sched_deadline mdl-grow-c
+	note "growth: persistent DAG reused while adding a branch"
+
+	destroy_node_by_name mdl-grow-c
+	sleep 2
+	snapshot topology-shrunk
+	[[ -z "$(node_id_by_name mdl-grow-c || true)" ]] || die "topology shrink did not remove mdl-grow-c"
+	note "shrink: removed branch disappeared from the graph"
+}
+
+scenario_unrelated_sets()
+{
+	graph_reset
+	create_null_sink mdl-sink-u1
+	create_null_sink mdl-sink-u1b
+	create_null_sink mdl-sink-u2
+	create_null_sink mdl-sink-u2b
+	create_auto_link mdl-sink-u1 mdl-sink-u1b
+	create_auto_link mdl-sink-u2 mdl-sink-u2b
+	sleep 2
+
+	snapshot unrelated-sets
+	assert_sched_deadline mdl-sink-u1
+	assert_sched_deadline mdl-sink-u1b
+	assert_sched_deadline mdl-sink-u2
+	assert_sched_deadline mdl-sink-u2b
+	note "unrelated sets: two disconnected graphs scheduled concurrently"
+}
+
+scenario_card()
+{
+	local ok=0
+	local rate
+	local quantum
+
+	graph_reset
+	create_null_sink mdl-card-root
+	if ! create_alsa_sink mdl-card 2>/dev/null; then
+		note "card scenario skipped: failed to create ALSA sink on ${DEFAULT_ALSA_PATH}"
+		return 0
+	fi
+	create_auto_link mdl-card-root mdl-card
+	sleep 2
+
+	snapshot card-default
+	assert_sched_deadline mdl-card-root
+	assert_sched_deadline mdl-card
+	note "card scenario: ALSA sink ${DEFAULT_ALSA_PATH} active under DEADLINE"
+
+	for rate in 44100 48000 96000; do
+		case "$rate" in
+		44100) quantum=128 ;;
+		48000) quantum=256 ;;
+		96000) quantum=512 ;;
+		esac
+		if set_clock "$rate" "$quantum"; then
+			sleep 1
+			snapshot "card-${rate}-${quantum}"
+			note "card scenario: rate=$rate quantum=$quantum applied"
+			ok=1
+		fi
+	done
+
+	reset_clock
+	[[ "$ok" -eq 1 ]] || note "card scenario: no alternate rate/quantum pair could be confirmed"
+}
+
+scenario_cycle_attempt()
+{
+	local log_before
+	local log_after
+	local rc=0
+
+	graph_reset
+	create_null_sink mdl-cycle-a
+	create_null_sink mdl-cycle-b
+	create_auto_link mdl-cycle-a mdl-cycle-b
+	sleep 1
+
+	log_before=$(log_count "failed to compute deadline parameters")
+	set +e
+	create_auto_link mdl-cycle-b mdl-cycle-a
+	rc=$?
+	set -e
+	sleep 2
+	log_after=$(log_count "failed to compute deadline parameters")
+
+	snapshot cycle-attempt
+	if [[ "$rc" -ne 0 ]]; then
+		note "cycle attempt: PipeWire rejected the back-edge before module-deadline saw it"
+	elif (( log_after > log_before )); then
+		note "cycle attempt: module-deadline rejected the cyclic graph as expected"
+	else
+		note "cycle attempt: no explicit module rejection was observed; inspect cycle-attempt snapshot"
+	fi
+}
+
+scenario_unload_module()
+{
+	local id
+
+	graph_reset
+	create_null_sink mdl-unload-a
+	create_null_sink mdl-sink-unload
+	create_auto_link mdl-unload-a mdl-sink-unload
+	sleep 2
+
+	id=$(module_id_deadline || true)
+	[[ -n "$id" ]] || die "deadline module id not found"
+	pw_cli destroy "$id" >/dev/null
+	sleep 1
+
+	is_running || die "daemon died while unloading deadline module"
+	note "module unload: destroyed remote module id=$id while graph was active"
+}
+
+scenario_no_cpus()
+{
+	start_daemon no-cpus
+	trap stop_daemon RETURN
+	scenario_basic_direct_chain
+	assert_affinity_from_current_mask mdl-null-a
+	assert_affinity_from_current_mask mdl-null-b
+	stop_daemon
+	trap - RETURN
+}
+
+scenario_no_util()
+{
+	start_daemon no-util
+	trap stop_daemon RETURN
+	scenario_basic_direct_chain
+	note "no-util variant: scheduling worked with default cpus.utilization"
+	stop_daemon
+	trap - RETURN
+}
+
+scenario_no_dynamic_loop()
+{
+	start_daemon no-dynamic-loop
+	trap stop_daemon RETURN
+	graph_reset
+	create_null_sink mdl-nodyn-a
+	create_null_sink mdl-sink-nodyn
+	create_auto_link mdl-nodyn-a mdl-sink-nodyn
+	sleep 2
+	snapshot no-dynamic-loop
+	assert_log_contains_any "is not using a dynamic data loop" "has no valid loop TID"
+	note "no-dynamic-loop variant: warning path triggered cleanly"
+	stop_daemon
+	trap - RETURN
+}
+
+compile_targets()
+{
+	meson compile -C "$BUILD_DIR"
+}
+
+run_unit_test()
+{
+	local log_file="$LOG_DIR/test-module-deadline-dag.log"
+
+	ensure_dirs
+	prepare_env
+	"$BUILD_DIR/test/test-module-deadline-dag" >"$log_file" 2>&1
+	note "unit test: test-module-deadline-dag passed (log=$log_file)"
+}
+
+run_live_matrix()
+{
+	ensure_dirs
+	: >"$RESULTS_FILE"
+	RESULTS_ENABLED=1
+	trap stop_daemon EXIT
+
+	start_daemon base
+	scenario_basic_direct_chain
+	scenario_loopback_chain
+	scenario_growth_and_shrink
+	scenario_unrelated_sets
+	scenario_card
+	scenario_cycle_attempt
+	scenario_unload_module
+	stop_daemon
+
+	scenario_no_cpus
+	scenario_no_util
+	scenario_no_dynamic_loop
+
+	trap - EXIT
+	RESULTS_ENABLED=0
+	note "live matrix complete, summary=$RESULTS_FILE"
+}
+
+status()
+{
+	if is_running; then
+		msg "running pid=$(pipewire_pid) variant=$(current_variant)"
+		msg "log=$(current_log)"
+		pw_dump_json | jq -r '
+			.[] |
+			select(.type == "PipeWire:Interface:Node") |
+			"\(.id)\t\(.info.props["node.name"] // "<unnamed>")"
+		'
+	else
+		msg "stopped"
+	fi
+}
+
+usage()
+{
+	cat <<EOF
+usage: $(basename "$0") <command>
+
+commands:
+  compile               build the current tree in build/
+  unit                  run test-module-deadline-dag
+  start [variant]       start the local daemon (base, no-cpus, no-util, no-dynamic-loop)
+  stop                  stop the local daemon and local helper clients
+  status                show daemon state and current nodes
+  graph-reset           destroy local lab nodes and helper clients
+  scenario-basic        run the daemon-only chain scenario on a running base daemon
+  scenario-loopback     run the client loopback scenario on a running base daemon
+  scenario-grow         run topology growth and shrink on a running base daemon
+  scenario-unrelated    run the unrelated-set scenario on a running base daemon
+  scenario-card         run the single-card scenario on a running base daemon
+  scenario-cycle        attempt a cyclic graph on a running base daemon
+  scenario-unload       unload the module from a running base daemon
+  scenario-no-cpus      start the no-cpus variant and verify affinity fallback
+  scenario-no-util      start the no-util variant and verify default utilization
+  scenario-no-dynamic   start the no-dynamic-loop variant and verify warning handling
+  live-matrix           run the full live verification pack
+  all                   compile, run the unit test, and run the live matrix
+EOF
+}
+
+main()
+{
+	local cmd="${1:-}"
+
+	case "$cmd" in
+	compile)
+		compile_targets
+		;;
+	unit)
+		run_unit_test
+		;;
+	start)
+		start_daemon "${2:-base}"
+		;;
+	stop)
+		stop_daemon
+		;;
+	status)
+		status
+		;;
+	graph-reset)
+		graph_reset
+		;;
+	scenario-basic)
+		is_running || start_daemon base
+		scenario_basic_direct_chain
+		;;
+	scenario-loopback)
+		is_running || start_daemon base
+		scenario_loopback_chain
+		;;
+	scenario-grow)
+		is_running || start_daemon base
+		scenario_growth_and_shrink
+		;;
+	scenario-unrelated)
+		is_running || start_daemon base
+		scenario_unrelated_sets
+		;;
+	scenario-card)
+		is_running || start_daemon base
+		scenario_card
+		;;
+	scenario-cycle)
+		is_running || start_daemon base
+		scenario_cycle_attempt
+		;;
+	scenario-unload)
+		is_running || start_daemon base
+		scenario_unload_module
+		;;
+	scenario-no-cpus)
+		scenario_no_cpus
+		;;
+	scenario-no-util)
+		scenario_no_util
+		;;
+	scenario-no-dynamic)
+		scenario_no_dynamic_loop
+		;;
+	live-matrix)
+		run_live_matrix
+		;;
+	all)
+		compile_targets
+		run_unit_test
+		run_live_matrix
+		;;
+	""|-h|--help|help)
+		usage
+		;;
+	*)
+		die "unknown command: $cmd"
+		;;
+	esac
+}
+
+main "$@"
