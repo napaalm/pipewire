@@ -95,7 +95,11 @@ pipewire_module_combine_stream = shared_library('pipewire-module-combine-stream'
 
 pipewire_module_deadline = shared_library('pipewire-module-deadline',
   [ 'module-deadline.c',
-    'module-deadline/dag.c' ],
+    'module-deadline/cpu_topology.c',
+    'module-deadline/dag.c',
+    'module-deadline/reconcile.c',
+    'module-deadline/sched_groups.c',
+    'module-deadline/wcet_sketch.c' ],
   include_directories : [configinc],
   install : true,
   install_dir : modules_install_dir,

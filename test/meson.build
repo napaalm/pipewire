@@ -67,6 +67,52 @@ test('test-lib',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-dag',
+    executable('test-module-deadline-dag',
+               'test-module-deadline-dag.c',
+               '../src/modules/module-deadline/dag.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-wcet-sketch',
+    executable('test-module-deadline-wcet-sketch',
+               'test-module-deadline-wcet-sketch.c',
+               '../src/modules/module-deadline/wcet_sketch.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-reconcile',
+    executable('test-module-deadline-reconcile',
+               'test-module-deadline-reconcile.c',
+               '../src/modules/module-deadline/dag.c',
+               '../src/modules/module-deadline/reconcile.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-sched-groups',
+    executable('test-module-deadline-sched-groups',
+               'test-module-deadline-sched-groups.c',
+               '../src/modules/module-deadline/sched_groups.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-cpu-topology',
+    executable('test-cpu-topology',
+               'test-cpu-topology.c',
+               '../src/modules/module-deadline/cpu_topology.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-client',
     executable('test-client',
                'test-client.c',
