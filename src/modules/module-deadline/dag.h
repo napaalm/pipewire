@@ -51,7 +51,6 @@ struct dag_node {
 	uint64_t remaining_deadline;
 	uint64_t longest_len;
 	int longest_next;
-	bitset_t *successors;
 
 	bool deadline_assigned;
 };
@@ -67,8 +66,34 @@ struct dag_edge {
 struct dag {
 	uint64_t period;    /* global period */
 	uint64_t deadline;  /* global end-to-end deadline */
-	float utilization;  /* max utilization */
+	double admission_ceiling; /* max per-CPU DAG load (in relative
+				   * utilisation units), must be finite
+				   * and in (0, 1]; rejected at create
+				   * time otherwise. Compared against the
+				   * worst-case running sum during the
+				   * worst-fit placement pass, with a
+				   * small epsilon so floating-point
+				   * round-off does not exclude exactly
+				   * fitting workloads. */
 	uint32_t num_cpus;
+
+	/* Per-CPU capacity scalar in (0, 1]. relative_capacity[i] = 1.0
+	 * means CPU i is the reference (any CPU with raw_capacity *
+	 * freq equal to the max in the set); slower CPUs come in below
+	 * 1.0. Always non-NULL after dag_create (NULL input is
+	 * promoted to a vector of 1.0s, the homogeneous identity).
+	 * Length is num_cpus; owned by the dag_t, freed in
+	 * dag_destroy. */
+	double  *relative_capacity;
+
+	/* Set whenever a successful timing or topology mutation
+	 * invalidates the previously-computed scheduling parameters.
+	 * dag_recalculate clears it on success and re-sets it (with
+	 * cleared assignments) on failure. dag_foreach_node triggers
+	 * an internal recalculate only when this is true, so a
+	 * caller-side no-op cycle (no mutations between two foreach
+	 * passes) does not re-run the analyser. */
+	bool dirty;
 
 	struct spa_list nodes; /* list of dag_node_t */
 	struct spa_list edges; /* list of dag_edge_t */
@@ -80,15 +105,29 @@ struct dag {
 	uint32_t unrelated_capacity;
 };
 
-/* Create and destroy a DAG */
-dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus);
+/* Create and destroy a DAG.
+ *
+ * `admission_ceiling` is the per-CPU upper bound on total relative
+ * utilisation: every per-CPU running sum produced by the worst-fit
+ * placement is compared against this value. Must be finite and in
+ * (0, 1].
+ *
+ * `relative_capacity` is an optional length-`num_cpus` vector of
+ * per-CPU capacity scalars in (0, 1]; entry i is CPU i's relative
+ * throughput, with the fastest CPU(s) at 1.0. NULL is shorthand for a
+ * uniform 1.0 vector, the homogeneous-host case, which reduces
+ * admission and placement to the original (pre-heterogeneous-CPU)
+ * arithmetic. The vector is copied; the caller keeps ownership of
+ * its input. */
+dag_t *dag_create(uint64_t period, uint64_t deadline, double admission_ceiling,
+		uint32_t num_cpus, const double *relative_capacity);
 void dag_destroy(dag_t *g);
 
 /* Set global period and deadline */
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline);
 
 /* Add and remove nodes */
-int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid);
+int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitious);
 int dag_remove_node(dag_t *g, uint32_t id);
 
 /* Add and remove edges */

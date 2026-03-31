@@ -242,17 +242,11 @@ struct impl {
 	int n_cpus;
 	int cpus[MAX_CPUS];
 	float cpu_utilization;
-	/* Per-CPU relative_capacity vector aligned with cpus[],
-	 * derived from cpu_topology at module init. reconcile_init
-	 * forwards a NULL here as the homogeneous (all-1.0) identity;
-	 * a non-NULL vector is passed through to dag_create. */
+	/* Per-CPU relative_capacity vector aligned with cpus[].
+	 * NULL until D4 wires the cpu_topology probe; reconcile_init
+	 * treats NULL as the homogeneous (all-1.0) identity, which is
+	 * the regression-safe default. */
 	double *relative_capacity;
-	/* The probed (or JSON-overridden) topology. Kept alive for the
-	 * lifetime of the module so the per-CPU diagnostic fields are
-	 * available for logging at any point. */
-	struct cpu_topology topology;
-	enum cpu_smt_policy  smt_policy;
-	enum cpu_dvfs_policy dvfs_policy;
 
 	/* WCET estimator configuration; see module-options doc above. */
 	uint32_t sketch_window_size;
@@ -476,7 +470,31 @@ static void recalc_params(void *data)
 	if (node->target_rate.denom == 0 || node->target_quantum == 0)
 		return;
 
-	uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
+	period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
+
+	if (drv->reconcile == NULL) {
+		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
+				impl->cpu_utilization,
+				impl->relative_capacity,
+				impl->wcet_recalc_threshold,
+				impl->recalc_persistent);
+		if (drv->reconcile == NULL) {
+			pw_log_warn("reconcile_init failed: %m");
+			return;
+		}
+	}
+
+	/* Pre-size the follower/edge arrays generously; realloc on
+	 * overflow. */
+	followers_cap = 32;
+	edges_cap = 64;
+	followers = calloc(followers_cap, sizeof(*followers));
+	edges = calloc(edges_cap, sizeof(*edges));
+	if (!followers || !edges) {
+		free(followers);
+		free(edges);
+		return;
+	}
 
 	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
 	
@@ -518,8 +536,310 @@ static void recalc_params(void *data)
 				pw_log_error("node %d has no TID", node->info.id);
 				return;
 			}
-		} else {
-			pw_log_error("node %d is not a dynamic loop", node->info.id);
+		}
+	}
+
+	/* Compute a cheap topology fingerprint (FNV-1a-ish hash over
+	 * the follower-id list and edge-src/dst pairs) so the
+	 * persistent reconcile path can short-circuit when nothing
+	 * structural changed. The sync path runs every audio cycle;
+	 * bumping the generation every call would defeat the
+	 * persistent-DAG optimisation. */
+	{
+		uint64_t h = 0xcbf29ce484222325ULL;
+		uint32_t i;
+		for (i = 0; i < n_followers; i++) {
+			h ^= followers[i].id;
+			h *= 0x100000001b3ULL;
+			h ^= (uint64_t)followers[i].tid;
+			h *= 0x100000001b3ULL;
+		}
+		for (i = 0; i < n_edges; i++) {
+			h ^= edges[i].src;
+			h *= 0x100000001b3ULL;
+			h ^= edges[i].dst;
+			h *= 0x100000001b3ULL;
+		}
+		if (h != drv->topo.generation) {
+			drv->topo.generation = h;
+		}
+	}
+
+	rtopo.followers = followers;
+	rtopo.n_followers = n_followers;
+	rtopo.edges = edges;
+	rtopo.n_edges = n_edges;
+	rtopo.period = period;
+	rtopo.generation = drv->topo.generation;
+
+	sched_groups_reset(&impl->sched_groups);
+	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
+	apply_sched_groups(impl);
+
+	free(followers);
+	free(edges);
+}
+
+/* ------------------------------------------------------------------
+ * Async path: the RT hook just pushes per-target samples to a per-
+ * driver SPSC ring and signals the worker via an eventfd. All the
+ * heavy work (sketch updates, DAG build, P-EDF analysis, syscalls)
+ * happens on the worker thread, which runs at a low SCHED_FIFO prio
+ * and is CPU-pinned away from the deadline cores so it never shares
+ * a CPU with the threads it configures.
+ * ------------------------------------------------------------------ */
+
+/* RT-context: push samples into drv's ring. Drops if full (worker is
+ * lagging); the WCET sketch tail stats absorb the loss naturally. */
+static void rt_push_samples(struct node *drv, uint64_t period)
+{
+	struct pw_impl_node *node = drv->node;
+	struct pw_node_target *t;
+	uint32_t buf_size_bytes = drv->ring_capacity * sizeof(struct sample);
+
+	spa_list_for_each(t, &node->rt.target_list, link) {
+		struct pw_impl_node *tnode = t->node;
+		uint64_t runtime = get_runtime_ns(tnode, t->activation);
+
+		uint32_t widx;
+		int32_t filled = spa_ringbuffer_get_write_index(&drv->ring, &widx);
+		if (filled < 0 || (uint32_t)filled >= buf_size_bytes) {
+			drv->ring_dropped++;
+			continue;
+		}
+		uint32_t offset = (widx % buf_size_bytes);
+		/* Slot-aligned writes only; capacity is power of two of slot
+		 * size so offset always lands on a slot boundary. */
+		struct sample *s = (struct sample *)((uint8_t *)drv->ring_slots + offset);
+		s->node_id = tnode->info.id;
+		s->_pad = 0;
+		s->runtime_ns = runtime;
+		s->period_ns = period;
+		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
+	}
+}
+
+/* Worker-context: drain everything the producer wrote since last time. */
+static void worker_drain_samples(struct impl *impl, struct node *drv)
+{
+	uint32_t buf_size_bytes = drv->ring_capacity * sizeof(struct sample);
+	uint32_t ridx;
+	int32_t avail = spa_ringbuffer_get_read_index(&drv->ring, &ridx);
+	if (avail <= 0)
+		return;
+
+	/* Process slot-by-slot. */
+	uint32_t processed = 0;
+	while ((uint32_t)avail - processed >= sizeof(struct sample)) {
+		uint32_t offset = ((ridx + processed) % buf_size_bytes);
+		const struct sample *s = (const struct sample *)
+			((uint8_t *)drv->ring_slots + offset);
+
+		struct node *n = find_node_by_id(impl, s->node_id);
+		if (n == NULL) {
+			n = calloc(1, sizeof(*n));
+			if (n) {
+				n->impl = impl;
+				n->node_id = s->node_id;
+				n->enabled = true;
+				/* n->node stays NULL: the worker never
+				 * dereferences pw_impl_node *; the
+				 * topology snapshot carries the id+tid
+				 * we need to apply DEADLINE. */
+				spa_list_insert(&impl->node_list, &n->link);
+				if (node_register(impl, n) < 0) {
+					spa_list_remove(&n->link);
+					free(n);
+					n = NULL;
+				}
+			}
+		}
+		if (n)
+			apply_sample(impl, n, s->runtime_ns, s->period_ns);
+
+		processed += sizeof(struct sample);
+	}
+	spa_ringbuffer_read_update(&drv->ring, ridx + processed);
+	pw_log_trace("worker drained %u samples (drv-node=%d)",
+		     processed / (uint32_t)sizeof(struct sample),
+		     drv->node ? drv->node->info.id : (uint32_t)-1);
+}
+
+/* Main-loop context: walk the driver's follower list and the
+ * follower ports/links to capture a self-contained topology snapshot
+ * that the worker can consume without further main-loop access. */
+struct snapshot_arg {
+	struct node *drv;
+};
+
+static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
+				   bool async SPA_UNUSED, uint32_t seq SPA_UNUSED,
+				   const void *data, size_t size SPA_UNUSED,
+				   void *user_data SPA_UNUSED)
+{
+	const struct snapshot_arg *a = data;
+	struct node *drv = a->drv;
+	struct pw_impl_node *dnode = drv->node;
+	struct topo_snap *t = &drv->topo;
+
+	t->ok = false;
+	t->n_nodes = 0;
+	t->n_edges = 0;
+
+	if (dnode->target_rate.denom == 0 || dnode->target_quantum == 0) {
+		SPA_ATOMIC_STORE(t->pending, 0);
+		return 0;
+	}
+	t->period = SPA_NSEC_PER_SEC * dnode->target_quantum / dnode->target_rate.denom;
+
+	struct pw_impl_node *follower;
+	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
+		if (follower == dnode)
+			continue;
+		if (!pw_properties_get_bool(follower->properties,
+					    PW_KEY_NODE_LOOP_DYNAMIC, false))
+			continue;
+		pid_t tid = pw_properties_get_int32(follower->properties,
+						    PW_KEY_NODE_LOOP_TID, -1);
+		if (tid == -1)
+			continue;
+
+		if (t->n_nodes >= t->nodes_cap) {
+			uint32_t newcap = t->nodes_cap ? t->nodes_cap * 2 : TOPO_INITIAL_NODES;
+			struct topo_node *nn = realloc(t->nodes, newcap * sizeof(*nn));
+			if (!nn)
+				return -ENOMEM;
+			t->nodes = nn;
+			t->nodes_cap = newcap;
+		}
+		t->nodes[t->n_nodes].id = follower->info.id;
+		t->nodes[t->n_nodes].tid = tid;
+		t->n_nodes++;
+	}
+
+	/* Edges: for each follower, walk output ports -> links -> input
+	 * node, skipping links that don't introduce an in-period
+	 * precedence constraint.
+	 *
+	 * A PipeWire link is *feedback* when constructing it would close
+	 * a cycle in the graph (pw_impl_node_can_reach hits on the dst);
+	 * the link records PW_KEY_LINK_FEEDBACK in its properties and
+	 * the data plane uses spa_io_async_buffers instead of
+	 * spa_io_buffers so the consumer in cycle N reads the producer's
+	 * data from cycle N-1. There is no within-period dependency
+	 * between the two endpoints, so the scheduling DAG must omit the
+	 * edge entirely.
+	 *
+	 * An *async* link is one whose endpoints opt in to the same
+	 * one-cycle-delay semantics via pw_impl_node.async (set when
+	 * both endpoints' ports declare PW_IMPL_PORT_FLAG_ASYNC). The
+	 * delay rationale is identical, so we filter both kinds with
+	 * the same one-liner. */
+	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
+		if (follower == dnode)
+			continue;
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &follower->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				if (!l->input || !l->input->node)
+					continue;
+				if (l->feedback)
+					continue;
+				if (l->output->node && l->input->node &&
+						(l->output->node->async ||
+						 l->input->node->async))
+					continue;
+				if (t->n_edges >= t->edges_cap) {
+					uint32_t newcap = t->edges_cap ? t->edges_cap * 2 : TOPO_INITIAL_EDGES;
+					struct topo_edge *ne = realloc(t->edges, newcap * sizeof(*ne));
+					if (!ne)
+						return -ENOMEM;
+					t->edges = ne;
+					t->edges_cap = newcap;
+				}
+				t->edges[t->n_edges].src = follower->info.id;
+				t->edges[t->n_edges].dst = l->input->node->info.id;
+				t->n_edges++;
+			}
+		}
+	}
+
+	t->ok = true;
+
+	/* Compute a fingerprint of the freshly-captured topology. Only
+	 * bump the generation if the fingerprint differs from the
+	 * previous one -- otherwise the worker sees a "topology change"
+	 * every snapshot tick and re-runs dag_build_analysis even when
+	 * nothing structural changed, defeating the persistent-DAG
+	 * optimisation. The fingerprint covers period, follower
+	 * id+tid tuples and edge src/dst pairs (the same shape
+	 * reconcile_apply reads). */
+	{
+		uint64_t h = 0xcbf29ce484222325ULL;
+		uint32_t i;
+		h ^= t->period;
+		h *= 0x100000001b3ULL;
+		for (i = 0; i < t->n_nodes; i++) {
+			h ^= t->nodes[i].id;
+			h *= 0x100000001b3ULL;
+			h ^= (uint64_t)t->nodes[i].tid;
+			h *= 0x100000001b3ULL;
+		}
+		for (i = 0; i < t->n_edges; i++) {
+			h ^= t->edges[i].src;
+			h *= 0x100000001b3ULL;
+			h ^= t->edges[i].dst;
+			h *= 0x100000001b3ULL;
+		}
+		if (h != drv->topo_fingerprint) {
+			drv->topo_fingerprint = h;
+			/* Release-store the generation bump so the worker
+			 * (which acquires t->generation before reading the
+			 * nodes/edges arrays) observes the freshly-written
+			 * topology atomically. */
+			SPA_ATOMIC_STORE(t->generation, t->generation + 1);
+		}
+	}
+	SPA_ATOMIC_STORE(t->pending, 0);
+	return 0;
+}
+
+/* Worker-context: rebuild and reapply the DAG using the freshest
+ * topology snapshot + current per-node sketch budgets.
+ *
+ * Soft-failure: a single follower that never produces a non-zero
+ * runtime (e.g. an idle source: a synth client whose plugin failed
+ * to start, a paused stream, a node currently disconnected from any
+ * input) used to abort the whole driver's recalc, leaving every
+ * other follower on the default SCHED_FIFO scheduling. Instead,
+ * skip the broken node from the DAG and apply SCHED_DEADLINE to
+ * everyone else. Drop any edge that referenced the skipped node;
+ * the DAG library treats the resulting sub-graph as the workload
+ * to schedule. */
+/* Build a reconcile_topo_t snapshot from the driver's per-tick
+ * topology view, then hand off to the reconcile layer. The
+ * follower array carries each follower's current WCET (looked up
+ * via the module-side id-index in O(log N)). */
+static void worker_apply_dag(struct impl *impl, struct node *drv)
+{
+	struct topo_snap *t = &drv->topo;
+	reconcile_follower_t *followers;
+	reconcile_edge_t *edges;
+	reconcile_topo_t rtopo = { 0 };
+	uint32_t i;
+
+	if (!t->ok || t->n_nodes == 0)
+		return;
+
+	if (drv->reconcile == NULL) {
+		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
+				impl->cpu_utilization,
+				impl->relative_capacity,
+				impl->wcet_recalc_threshold,
+				impl->recalc_persistent);
+		if (drv->reconcile == NULL) {
+			pw_log_warn("reconcile_init failed: %m");
 			return;
 		}
 
