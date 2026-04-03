@@ -65,7 +65,27 @@ struct cpu_info {
 	uint64_t raw_capacity;       /* sysfs cpu_capacity, default 1024 */
 	uint64_t min_freq_khz;
 	uint64_t max_freq_khz;
-	double   relative_capacity;  /* in (0, 1] */
+	/* "Target" capacity scalar in (0, 1] -- raw_capacity *
+	 * freq_for_policy, normalised by the maximum nominal capacity
+	 * in the set. This is what the placer compares per-CPU load
+	 * against, and what sched_cb divides the runtime budget by
+	 * when shipping it to the kernel. Under cpus.dvfs-policy =
+	 * conservative this reflects each CPU's min_freq, so the
+	 * resulting kernel budget is guaranteed to be feasible at
+	 * any governor-allowed frequency. */
+	double   relative_capacity;
+	/* "Nominal" capacity scalar in (0, 1] -- raw_capacity *
+	 * max_freq, normalised by the maximum nominal capacity in
+	 * the set. Always 1.0 for the fastest CPU(s). The sample
+	 * normalisation in module-deadline scales every collected
+	 * runtime by this value: since we don't actually know which
+	 * cpufreq state the CPU was in at the moment of measurement
+	 * (sysfs reads are not RT-safe), the conservative choice is
+	 * to assume the sample was collected at max_freq, which is
+	 * the smallest wall-clock time the same work could possibly
+	 * take. That ensures the sketch never under-estimates the
+	 * "reference-CPU" WCET regardless of governor behaviour. */
+	double   relative_capacity_nominal;
 };
 
 struct cpu_topology {

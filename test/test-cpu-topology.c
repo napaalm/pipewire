@@ -252,10 +252,11 @@ PWTEST(cpu_topo_sysfs_missing_fallback)
 
 /* ===================================================================
  * D1.7.a (sysfs path) -- the live dev host is homogeneous, so probing
- * the actual /sys must yield relative_capacity = 1.0 everywhere over
- * any non-empty subset of online CPUs. Probes cpu 0 (always online,
- * never isolated), which is enough to exercise the read paths.
- * =================================================================== */
+ * the actual /sys must yield relative_capacity_nominal = 1.0 across
+ * every CPU. The target relative_capacity is bounded above by the
+ * nominal one and equals it under assume-max policy (and on a host
+ * whose min == max == single OPP). Probes cpu 0 (always online,
+ * never isolated), which is enough to exercise the read paths. */
 PWTEST(cpu_topo_sysfs_homogeneous_cpu0)
 {
 	uint32_t cpus[] = { 0 };
@@ -263,8 +264,42 @@ PWTEST(cpu_topo_sysfs_homogeneous_cpu0)
 
 	pwtest_int_eq(cpu_topology_probe(cpus, 1, CPU_DVFS_CONSERVATIVE, &t), 0);
 	pwtest_int_eq((int)t.num_cpus, 1);
-	pwtest_double_eq(t.cpus[0].relative_capacity, 1.0);
+	pwtest_double_eq(t.cpus[0].relative_capacity_nominal, 1.0);
+	pwtest_bool_true(t.cpus[0].relative_capacity > 0.0 &&
+			t.cpus[0].relative_capacity <= 1.0);
+	pwtest_bool_true(t.cpus[0].relative_capacity <=
+			t.cpus[0].relative_capacity_nominal);
 
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+/* ===================================================================
+ * Conservatism gap: when min_freq < max_freq the nominal vector
+ * stays at 1.0 (we assume samples were collected at max_freq, the
+ * smallest possible wall-clock time) while the target vector drops
+ * to min_freq / max_freq under conservative policy. Under
+ * assume-max the two vectors coincide. The asymmetry is what makes
+ * sched_cb produce an inflated kernel budget large enough to stay
+ * feasible at any governor-selected frequency.
+ * =================================================================== */
+PWTEST(cpu_topo_nominal_vs_target_under_conservative)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 2200000, max_freq_khz = 3800000 }"
+		"] }";
+
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_double_eq(t.cpus[0].relative_capacity_nominal, 1.0);
+	pwtest_double_eq(t.cpus[0].relative_capacity, 2200000.0 / 3800000.0);
+	cpu_topology_destroy(&t);
+
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_ASSUME_MAX, &t), 0);
+	pwtest_double_eq(t.cpus[0].relative_capacity_nominal, 1.0);
+	pwtest_double_eq(t.cpus[0].relative_capacity, 1.0);
 	cpu_topology_destroy(&t);
 	return PWTEST_PASS;
 }
@@ -280,6 +315,7 @@ PWTEST_SUITE(cpu_topology)
 	pwtest_add(cpu_topo_smt_pair_ignore_keeps_set, PWTEST_NOARG);
 	pwtest_add(cpu_topo_sysfs_missing_fallback, PWTEST_NOARG);
 	pwtest_add(cpu_topo_sysfs_homogeneous_cpu0, PWTEST_NOARG);
+	pwtest_add(cpu_topo_nominal_vs_target_under_conservative, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

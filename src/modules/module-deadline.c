@@ -217,6 +217,69 @@ static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
 
+/* A single RT->worker sample. node_id+period_ns are enough for the
+ * worker to look up (or lazily create) the node estimator and to
+ * detect period changes. cpu carries the CPU id the follower thread
+ * ran on when the runtime was measured (its current SCHED_DEADLINE
+ * placement, since followers are pinned); the worker uses it to
+ * normalise the sample into reference-CPU units before feeding the
+ * sketch, so the digest always holds WCETs "as if measured on the
+ * fastest CPU". SAMPLE_CPU_UNKNOWN means the follower has not yet
+ * been placed (e.g. very first cycle after registration) and the
+ * worker treats the sample as already reference-CPU normalised.
+ *
+ * cycles is the perf_event_open(CPU_CYCLES) delta the executor
+ * captured around the node's process() call (impl-node.c writes it
+ * into pw_node_activation::prev_run_cycles). Zero means the kernel
+ * refused perf_event_open (paranoid > 1 typically) so we fall back
+ * on the wall-clock path that conservatively assumes the sample was
+ * collected at max_freq.
+ *
+ * The RT thread writes; the worker reads. */
+#define SAMPLE_CPU_UNKNOWN UINT32_MAX
+
+struct sample {
+	uint32_t node_id;
+	uint32_t cpu;
+	uint64_t runtime_ns;
+	uint64_t cycles;
+	uint64_t period_ns;
+};
+
+/* Topology snapshot for one driver. Populated only on the main loop
+ * (inside snapshot_topology() dispatched via pw_loop_invoke); read
+ * only by the worker, between the moment the main-loop callback
+ * returns and the moment we issue the next snapshot request. No
+ * other reader exists, so no locking. */
+struct topo_node {
+	uint32_t id;
+	pid_t    tid;
+};
+struct topo_edge {
+	uint32_t src;
+	uint32_t dst;
+};
+struct topo_snap {
+	struct topo_node *nodes;
+	struct topo_edge *edges;
+	uint32_t n_nodes, nodes_cap;
+	uint32_t n_edges, edges_cap;
+	uint64_t period;
+	bool     ok;
+	uint32_t pending;  /* atomic, CAS-coalesces async snapshot invokes */
+
+	/* Monotonic generation counter incremented (release store) at
+	 * the end of every successful snapshot_topology_main. Workers
+	 * read it via acquire load and compare against
+	 * drv->topo_gen_applied to decide whether a topology-reconcile
+	 * pass is needed this wake. Wraps at UINT64_MAX which is
+	 * effectively never in any realistic deployment. */
+	uint64_t generation;
+};
+
+/* struct sched_group is defined in module-deadline/sched_groups.h
+ * (extracted so it can be unit-tested in isolation). */
+
 struct node {
 	struct spa_list link;
 	struct impl *impl;
@@ -242,11 +305,36 @@ struct impl {
 	int n_cpus;
 	int cpus[MAX_CPUS];
 	float cpu_utilization;
-	/* Per-CPU relative_capacity vector aligned with cpus[].
-	 * NULL until D4 wires the cpu_topology probe; reconcile_init
-	 * treats NULL as the homogeneous (all-1.0) identity, which is
-	 * the regression-safe default. */
+	/* Per-CPU relative_capacity vector aligned with cpus[],
+	 * derived from cpu_topology at module init. The "target"
+	 * vector reflects the dvfs policy (min_freq under
+	 * conservative, max_freq under assume-max) and is what
+	 * reconcile_init forwards to dag_create -- it is both the
+	 * admission ceiling the placer compares per-CPU load against
+	 * and the divisor sched_cb applies before sched_setattr.
+	 * NULL is the homogeneous (all-1.0) identity. The "nominal"
+	 * vector is always max-freq based; the sketch-insert path
+	 * uses it to normalise samples as if they had been collected
+	 * at max_freq, which is the smallest wall-clock time the
+	 * same work could possibly take and therefore the
+	 * conservative upper bound on the sample's true cycle
+	 * count. The two vectors agree under the assume-max policy
+	 * and diverge under conservative, where target < nominal. */
 	double *relative_capacity;
+	double *relative_capacity_nominal;
+	/* The probed (or JSON-overridden) topology. Kept alive for the
+	 * lifetime of the module so the per-CPU diagnostic fields are
+	 * available for logging at any point. */
+	struct cpu_topology topology;
+	enum cpu_smt_policy  smt_policy;
+	enum cpu_dvfs_policy dvfs_policy;
+	/* When true (the default), set SCHED_FLAG_RECLAIM on every
+	 * sched_setattr so unused bandwidth flows to peers via GRUB.
+	 * Disabled by sched.reclaim=false for the saturation live
+	 * test: a strict-budget mode where deadline misses surface
+	 * instead of being absorbed by reclaim. Fixed for the
+	 * lifetime of the module. */
+	bool sched_reclaim;
 
 	/* WCET estimator configuration; see module-options doc above. */
 	uint32_t sketch_window_size;
@@ -293,6 +381,7 @@ static void module_destroy(void *data)
 
 	free(impl->nodes_by_id);
 	free(impl->relative_capacity);
+	free(impl->relative_capacity_nominal);
 	cpu_topology_destroy(&impl->topology);
 	sched_groups_fini(&impl->sched_groups);
 	free(impl);
@@ -418,8 +507,149 @@ static int set_cpu_affinity(pid_t tid, int cpu)
 static void sched_cb(void *data, pid_t tid, uint64_t runtime, uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
-	set_deadline_sched(tid, runtime, deadline, period);
-	set_cpu_affinity(tid, impl->cpus[cpu]);
+
+	/* Denormalise runtime from reference-CPU units into kernel
+	 * units for the placement CPU. The sketch holds WCETs as if the
+	 * follower ran on the fastest CPU; on a slower placement the
+	 * thread needs proportionally more wall-clock time, so the
+	 * budget shipped to sched_setattr divides by
+	 * relative_capacity[cpu]. Identity when relative_capacity is
+	 * unset (NULL vector) or the placement CPU is the reference. */
+	uint64_t runtime_kernel = runtime;
+	if (impl->relative_capacity != NULL &&
+			cpu < (uint32_t)impl->n_cpus &&
+			impl->relative_capacity[cpu] > 0.0) {
+		double scaled = (double)runtime / impl->relative_capacity[cpu];
+		if (scaled < 0.0)
+			scaled = 0.0;
+		if (scaled > (double)UINT64_MAX)
+			scaled = (double)UINT64_MAX;
+		runtime_kernel = (uint64_t)scaled;
+	}
+
+	int res = sched_groups_add(&impl->sched_groups, id, tid,
+			runtime_kernel, deadline, period, cpu);
+	if (res == -ENOMEM)
+		pw_log_warn("sched: out of memory accumulating tid=%d", (int)tid);
+	/* -EINVAL (tid <= 0) is silently ignored: a follower with no
+	 * published thread can't be scheduled, same as before the
+	 * extraction. */
+}
+
+/* Per-group apply pass.
+ *
+ * Iterates the accumulator and issues at most one sched_setattr +
+ * one sched_setaffinity per distinct TID. Reuses the leader follower
+ * node's last_applied cache so a stable graph re-applies nothing:
+ * the cache lives on the lowest-id member of each group and is
+ * invalidated automatically when the group composition changes
+ * (leader becomes a different follower, sums change, period or CPU
+ * change).
+ *
+ * Singleton TIDs (n_members == 1) take exactly the same code path
+ * as multi-member groups -- the original one-node-one-thread case
+ * is just the degenerate single-member group. */
+static void apply_sched_groups(struct impl *impl)
+{
+	uint32_t i;
+	for (i = 0; i < impl->sched_groups.count; i++) {
+		struct sched_group *g = &impl->sched_groups.entries[i];
+		struct node *anchor;
+		int rc_sched, rc_aff;
+
+		impl->sched_calls_total++;
+
+		anchor = find_node_by_id(impl, g->leader_id);
+		if (anchor != NULL && anchor->last_applied &&
+				anchor->last_runtime == g->sum_runtime &&
+				anchor->last_deadline == g->sum_deadline &&
+				anchor->last_period == g->period &&
+				anchor->last_cpu == g->cpu) {
+			impl->sched_calls_skipped++;
+			continue;
+		}
+
+		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
+				g->sum_deadline, g->period);
+		rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
+
+		if (anchor == NULL)
+			continue;
+
+		if (rc_sched == 0 && rc_aff == 0) {
+			anchor->last_runtime  = g->sum_runtime;
+			anchor->last_deadline = g->sum_deadline;
+			anchor->last_period   = g->period;
+			anchor->last_cpu      = g->cpu;
+			anchor->last_applied  = true;
+		} else {
+			anchor->last_applied = false;
+		}
+	}
+}
+
+/* Bsearch over impl->nodes_by_id for `id`; returns the array slot
+ * where `id` lives or would be inserted to keep order. */
+#define MODULE_NODES_BY_ID_INITIAL_CAP 16u
+
+static uint32_t nodes_by_id_bsearch(struct impl *impl, uint32_t id)
+{
+	uint32_t lo = 0, hi = impl->nodes_by_id_count;
+
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (impl->nodes_by_id[mid]->node_id < id)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static int node_register(struct impl *impl, struct node *n)
+{
+	uint32_t pos;
+
+	if (impl->nodes_by_id_count == impl->nodes_by_id_cap) {
+		uint32_t new_cap = impl->nodes_by_id_cap ?
+				impl->nodes_by_id_cap * 2 :
+				MODULE_NODES_BY_ID_INITIAL_CAP;
+		struct node **resized = realloc(impl->nodes_by_id,
+				(size_t)new_cap * sizeof(*resized));
+
+		if (!resized)
+			return -ENOMEM;
+		impl->nodes_by_id = resized;
+		impl->nodes_by_id_cap = new_cap;
+	}
+
+	pos = nodes_by_id_bsearch(impl, n->node_id);
+	if (pos < impl->nodes_by_id_count) {
+		memmove(&impl->nodes_by_id[pos + 1], &impl->nodes_by_id[pos],
+				(impl->nodes_by_id_count - pos) *
+				sizeof(*impl->nodes_by_id));
+	}
+	impl->nodes_by_id[pos] = n;
+	impl->nodes_by_id_count++;
+	return 0;
+}
+
+static void node_unregister(struct impl *impl, struct node *n)
+{
+	uint32_t pos;
+
+	if (impl->nodes_by_id_count == 0)
+		return;
+	pos = nodes_by_id_bsearch(impl, n->node_id);
+	if (pos >= impl->nodes_by_id_count || impl->nodes_by_id[pos] != n)
+		return;
+	if (pos < impl->nodes_by_id_count - 1) {
+		memmove(&impl->nodes_by_id[pos], &impl->nodes_by_id[pos + 1],
+				(impl->nodes_by_id_count - pos - 1) *
+				sizeof(*impl->nodes_by_id));
+	}
+	impl->nodes_by_id_count--;
 }
 
 static struct node *find_node(struct impl *impl, struct pw_impl_node *node)
@@ -458,11 +688,161 @@ static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_
 	return runtime;
 }
 
-static void recalc_params(void *data)
+/* Convert a CPU-cycle delta collected on `sample_cpu` into a
+ * frequency-invariant reference-CPU runtime in nanoseconds. The work
+ * done by `cycles` cycles on CPU `sample_cpu` is
+ *
+ *     work = cycles * raw_capacity[sample_cpu]
+ *
+ * (raw_capacity captures the CPU's relative IPC per cycle; the same
+ * count of cycles on an E-core does less work than on a P-core). The
+ * reference CPU at its peak nominal throughput would execute that
+ * work in
+ *
+ *     ref_ns = work * 1e9 / (raw_capacity[ref] * max_freq_hz[ref])
+ *
+ * On a uniform host that collapses to cycles / max_freq[ref]. Returns
+ * a positive double on success, 0.0 when cycles is 0 or any required
+ * topology field is missing (the caller then falls back on the
+ * wall-clock path). */
+static inline double wcet_cycles_to_reference_ns(struct impl *impl,
+		uint64_t cycles, uint32_t sample_cpu)
 {
-	struct node *n = data;
-	struct pw_impl_node *node = n->node;
-	struct impl *impl = n->impl;
+	if (cycles == 0 || impl == NULL || impl->topology.num_cpus == 0)
+		return 0.0;
+	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
+			sample_cpu >= impl->topology.num_cpus)
+		return 0.0;
+
+	uint32_t ref_idx = impl->topology.reference_cpu_index;
+	if (ref_idx >= impl->topology.num_cpus)
+		return 0.0;
+
+	const struct cpu_info *src = &impl->topology.cpus[sample_cpu];
+	const struct cpu_info *ref = &impl->topology.cpus[ref_idx];
+	if (ref->raw_capacity == 0 || ref->max_freq_khz == 0)
+		return 0.0;
+
+	double work = (double)cycles * (double)src->raw_capacity;
+	double ref_throughput =
+		(double)ref->raw_capacity * (double)ref->max_freq_khz * 1000.0;
+	if (!(ref_throughput > 0.0))
+		return 0.0;
+	return work * 1.0e9 / ref_throughput;
+}
+
+/* Wall-clock fallback when cycles are unavailable. We do not know the
+ * cpufreq state at the moment of measurement (a per-sample sysfs read
+ * is not RT-safe), so the conservative assumption is that the sample
+ * was collected at the CPU's max_freq -- i.e. the smallest wall-clock
+ * time the same workload could possibly take. The denormalisation in
+ * sched_cb then divides by relative_capacity[placement_cpu], which is
+ * the *target* capacity (min_freq under conservative policy). The
+ * resulting kernel budget is inflated by approximately
+ * max_freq / freq_for_policy: on a host where the governor parks
+ * CPUs anywhere down to min_freq, the budget remains feasible even
+ * without per-cycle frequency information.
+ *
+ * Identity (no scaling) on homogeneous hardware *only* when
+ * max_freq == freq_for_policy, e.g. under cpus.dvfs-policy =
+ * assume-max or on a host where cpuinfo_max_freq == cpuinfo_min_freq.
+ *
+ * Falls back to the raw runtime when relative_capacity_nominal is
+ * absent or sample_cpu is out of range / not yet known. */
+static inline double wcet_sample_to_reference(struct impl *impl,
+		uint64_t runtime, uint32_t sample_cpu)
+{
+	if (impl->relative_capacity_nominal == NULL)
+		return (double)runtime;
+	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
+			sample_cpu >= (uint32_t)impl->n_cpus)
+		return (double)runtime;
+	double rc = impl->relative_capacity_nominal[sample_cpu];
+	if (!(rc > 0.0))
+		return (double)runtime;
+	return (double)runtime * rc;
+}
+
+/* Apply one sample to a follower's estimator. Worker-thread or RT-
+ * thread (in sync mode); never both for a given node. sample_cpu is
+ * the placement CPU the follower ran on; cycles is the
+ * PERF_COUNT_HW_CPU_CYCLES delta the executor (impl-node.c) captured
+ * around the node's process() call. When cycles > 0 the sketch holds
+ * a frequency-invariant "ns at reference CPU peak throughput" value
+ * derived directly from the cycle count, which removes the
+ * assume-max wall-clock conservatism. When cycles == 0 (perf
+ * unavailable: paranoid > 1, kernel too old, non-Linux) the worker
+ * falls back to the wall-clock path that assumes the sample was
+ * collected at max_freq.
+ *
+ * In both paths the sketch is reference-CPU-normalised, so the emit
+ * step in sched_cb divides uniformly by
+ * relative_capacity[placement_cpu] without caring how the sample
+ * got there. */
+static void apply_sample(struct impl *impl, struct node *n,
+		uint64_t runtime, uint64_t cycles,
+		uint32_t sample_cpu, uint64_t period)
+{
+	if (!n->sketch_ready) {
+		if (wcet_sketch_init(&n->sketch,
+				     impl->sketch_window_size,
+				     impl->sketch_compression,
+				     impl->sketch_quantile) == 0) {
+			n->sketch_ready = true;
+		} else {
+			pw_log_warn("node %d: WCET sketch init failed; using peak-hold",
+				    n->node ? n->node->info.id : (uint32_t)-1);
+		}
+	}
+
+	if (n->period != period) {
+		if (n->sketch_ready)
+			wcet_sketch_reset(&n->sketch);
+		n->wcet = 0;
+	}
+
+	/* Prefer cycles when available: they are frequency-invariant
+	 * by construction and yield a precise reference-CPU WCET
+	 * without the assume-max inflation. */
+	double sample_ref = wcet_cycles_to_reference_ns(impl, cycles, sample_cpu);
+	if (sample_ref <= 0.0)
+		sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
+
+	if (runtime > 0 && n->sketch_ready)
+		wcet_sketch_add(&n->sketch, sample_ref);
+
+	if (!n->sketch_ready ||
+	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
+		/* Peak-hold fallback. n->wcet is stored in reference-CPU
+		 * units so it lines up with the sketch's eventual output;
+		 * sched_cb denormalises before sched_setattr. */
+		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
+			(uint64_t)sample_ref : 0;
+		n->wcet = SPA_MAX(n->wcet, sample_ref_u64);
+	} else {
+		double q = wcet_sketch_quantile(&n->sketch);
+		if (q > 0.0 && q < (double)UINT64_MAX)
+			n->wcet = (uint64_t)q;
+		else
+			n->wcet = SPA_MAX(n->wcet, runtime);
+	}
+
+	n->period = period;
+}
+
+/* ------------------------------------------------------------------
+ * Sync path: original behaviour, now running on the same reconcile
+ * orchestrator the async worker uses. Builds the topology view from
+ * the driver's rt.target_list and the live pw_impl_node graph (not
+ * from a topo snapshot, because the sync path runs inside the RT
+ * hook and has direct access), then hands it to reconcile_apply.
+ * Selected via recalc.sync=true; recalc.persistent and
+ * wcet.recalc-threshold apply just like in the async case.
+ * ------------------------------------------------------------------ */
+static void recalc_params_sync(struct node *drv)
+{
+	struct pw_impl_node *node = drv->node;
+	struct impl *impl = drv->impl;
 	struct pw_node_target *t;
 	struct pw_impl_node *node2;
 	bool abort = false;
@@ -518,14 +898,19 @@ static void recalc_params(void *data)
 		if (runtime > period)
 			pw_log_warn("node %d runtime %lu exceeds period %lu", node->info.id, runtime, period);
 
-		if (n->period == period)
-			n->wcet = SPA_MAX(n->wcet, runtime);
-		else
-			n->wcet = runtime;
-		if (n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
-			abort = true;
-			pw_log_warn("Abort trying to add node %d (wcet=0)", node->info.id);
-			continue;
+		apply_sample(impl, n, runtime,
+				SPA_ATOMIC_LOAD(na->prev_run_cycles),
+				n->last_applied ? n->last_cpu : SAMPLE_CPU_UNKNOWN,
+				period);
+
+		if (n_followers >= followers_cap) {
+			uint32_t new_cap = followers_cap * 2;
+			reconcile_follower_t *r = realloc(followers,
+					new_cap * sizeof(*followers));
+			if (!r)
+				continue;
+			followers = r;
+			followers_cap = new_cap;
 		}
 
 		n->period = period;
@@ -612,8 +997,19 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 		 * size so offset always lands on a slot boundary. */
 		struct sample *s = (struct sample *)((uint8_t *)drv->ring_slots + offset);
 		s->node_id = tnode->info.id;
-		s->_pad = 0;
+		/* Stamp the follower's current placement CPU. The
+		 * follower has been pinned by sched_setaffinity since
+		 * the previous reconcile, so this is the CPU its thread
+		 * actually ran on for this cycle. Falls back to
+		 * SAMPLE_CPU_UNKNOWN before the first placement; the
+		 * worker then skips normalisation and treats the sample
+		 * as already in reference-CPU units. */
+		struct node *n_lookup = find_node_by_id(drv->impl,
+				tnode->info.id);
+		s->cpu = (n_lookup != NULL && n_lookup->last_applied) ?
+				n_lookup->last_cpu : SAMPLE_CPU_UNKNOWN;
 		s->runtime_ns = runtime;
+		s->cycles = SPA_ATOMIC_LOAD(t->activation->prev_run_cycles);
 		s->period_ns = period;
 		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
 	}
@@ -655,7 +1051,8 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 			}
 		}
 		if (n)
-			apply_sample(impl, n, s->runtime_ns, s->period_ns);
+			apply_sample(impl, n, s->runtime_ns, s->cycles,
+					s->cpu, s->period_ns);
 
 		processed += sizeof(struct sample);
 	}
@@ -1041,15 +1438,25 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 	impl->n_cpus = (int)impl->topology.num_cpus;
 
 	free(impl->relative_capacity);
+	free(impl->relative_capacity_nominal);
 	impl->relative_capacity = calloc(impl->topology.num_cpus,
 			sizeof(*impl->relative_capacity));
-	if (!impl->relative_capacity) {
+	impl->relative_capacity_nominal = calloc(impl->topology.num_cpus,
+			sizeof(*impl->relative_capacity_nominal));
+	if (!impl->relative_capacity || !impl->relative_capacity_nominal) {
+		free(impl->relative_capacity);
+		free(impl->relative_capacity_nominal);
+		impl->relative_capacity = NULL;
+		impl->relative_capacity_nominal = NULL;
 		cpu_topology_destroy(&impl->topology);
 		return -1;
 	}
-	for (i = 0; i < impl->topology.num_cpus; i++)
+	for (i = 0; i < impl->topology.num_cpus; i++) {
 		impl->relative_capacity[i] =
 			impl->topology.cpus[i].relative_capacity;
+		impl->relative_capacity_nominal[i] =
+			impl->topology.cpus[i].relative_capacity_nominal;
+	}
 
 	pw_log_info("cpu-topology: smt-policy=%s dvfs-policy=%s num_cpus=%u",
 			impl->smt_policy == CPU_SMT_STRICT ? "strict" :
@@ -1062,10 +1469,11 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 		pw_log_info("cpu-topology: cpu%u core=%u island=%u "
 				"raw_cap=%" PRIu64 " min_freq_khz=%" PRIu64
 				" max_freq_khz=%" PRIu64
-				" relative_capacity=%.3f",
+				" relative_capacity=%.3f nominal=%.3f",
 				ci->cpu_id, ci->core_id, ci->island_id,
 				ci->raw_capacity, ci->min_freq_khz,
-				ci->max_freq_khz, ci->relative_capacity);
+				ci->max_freq_khz, ci->relative_capacity,
+				ci->relative_capacity_nominal);
 	}
 	return 0;
 }

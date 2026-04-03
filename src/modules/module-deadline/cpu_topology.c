@@ -117,53 +117,75 @@ static uint32_t read_cpu_list_file(const char *path, uint32_t *out, uint32_t cap
 	return w;
 }
 
-/* Compute relative_capacity[] across all entries in t, picking the
- * frequency per CPU according to `dvfs`. Sets reference_cpu_index to
- * the (deterministic, lowest) index whose relative_capacity == 1.0.
- * Must be invoked after raw_capacity / min_freq_khz / max_freq_khz
- * are filled. */
+/* Compute the relative_capacity / relative_capacity_nominal pair
+ * across all entries in t. Both vectors share the same denominator
+ * (the maximum *nominal* effective capacity in the set), so the
+ * nominal vector saturates at 1.0 on the fastest CPU(s) and the
+ * target vector falls below that on hosts where freq_for_policy <
+ * max_freq. Sets reference_cpu_index to the (deterministic, lowest)
+ * index whose nominal capacity == 1.0. Must be invoked after
+ * raw_capacity / min_freq_khz / max_freq_khz are filled. */
 static void cpu_topology_recompute_relative(struct cpu_topology *t,
 		enum cpu_dvfs_policy dvfs)
 {
 	uint32_t i;
-	double max_eff = 0.0;
-	double *eff;
+	double max_nom = 0.0;
+	double *nom, *tgt;
 
 	if (!t || t->num_cpus == 0)
 		return;
 
-	eff = calloc(t->num_cpus, sizeof(*eff));
-	if (!eff)
+	nom = calloc(t->num_cpus, sizeof(*nom));
+	tgt = calloc(t->num_cpus, sizeof(*tgt));
+	if (!nom || !tgt) {
+		free(nom);
+		free(tgt);
 		return;
+	}
 
 	for (i = 0; i < t->num_cpus; i++) {
-		uint64_t freq = (dvfs == CPU_DVFS_ASSUME_MAX) ?
+		uint64_t target_freq = (dvfs == CPU_DVFS_ASSUME_MAX) ?
 			t->cpus[i].max_freq_khz : t->cpus[i].min_freq_khz;
-		if (freq == 0)
-			freq = CPU_TOPO_DEFAULT_FREQ_KHZ;
-		eff[i] = (double)t->cpus[i].raw_capacity * (double)freq;
-		if (eff[i] > max_eff)
-			max_eff = eff[i];
+		uint64_t nominal_freq = t->cpus[i].max_freq_khz;
+		if (target_freq == 0)
+			target_freq = CPU_TOPO_DEFAULT_FREQ_KHZ;
+		if (nominal_freq == 0)
+			nominal_freq = CPU_TOPO_DEFAULT_FREQ_KHZ;
+		nom[i] = (double)t->cpus[i].raw_capacity * (double)nominal_freq;
+		tgt[i] = (double)t->cpus[i].raw_capacity * (double)target_freq;
+		if (nom[i] > max_nom)
+			max_nom = nom[i];
 	}
-	if (max_eff <= 0.0)
-		max_eff = 1.0;
+	if (max_nom <= 0.0)
+		max_nom = 1.0;
+
+	for (i = 0; i < t->num_cpus; i++) {
+		double rel_nom = nom[i] / max_nom;
+		double rel_tgt = tgt[i] / max_nom;
+		/* Defensive clamps: keep both strictly in (0, 1]; values
+		 * outside that range break the DAG-library admission and
+		 * the runtime denormalisation arithmetic. */
+		if (rel_nom <= 0.0)
+			rel_nom = 1.0 / max_nom;
+		if (rel_nom > 1.0)
+			rel_nom = 1.0;
+		if (rel_tgt <= 0.0)
+			rel_tgt = 1.0 / max_nom;
+		if (rel_tgt > 1.0)
+			rel_tgt = 1.0;
+		t->cpus[i].relative_capacity_nominal = rel_nom;
+		t->cpus[i].relative_capacity = rel_tgt;
+	}
 
 	t->reference_cpu_index = 0;
 	for (i = 0; i < t->num_cpus; i++) {
-		double rel = eff[i] / max_eff;
-		if (rel <= 0.0)
-			rel = 1.0 / max_eff;     /* defensive: keep >0 */
-		if (rel > 1.0)
-			rel = 1.0;
-		t->cpus[i].relative_capacity = rel;
-	}
-	for (i = 0; i < t->num_cpus; i++) {
-		if (t->cpus[i].relative_capacity >= 1.0) {
+		if (t->cpus[i].relative_capacity_nominal >= 1.0) {
 			t->reference_cpu_index = i;
 			break;
 		}
 	}
-	free(eff);
+	free(nom);
+	free(tgt);
 }
 
 /* Pass over `t` filling each cpu_info::smt_siblings/num_siblings with
@@ -348,14 +370,14 @@ int cpu_topology_apply_smt_policy(struct cpu_topology *t,
 			}
 		} while (changed);
 		cpu_topology_fill_siblings(t);
-		/* relative_capacity is independent of which siblings remain
-		 * (it is a per-CPU scalar), but reference_cpu_index may need
-		 * to move if a sibling was dropped. Recompute by reusing the
-		 * existing min/max freq pair, derived from the surviving
-		 * entries' relative_capacity values. */
+		/* Both relative_capacity vectors are per-CPU scalars and
+		 * independent of which siblings remain, so dedupe doesn't
+		 * touch them. reference_cpu_index, however, indexes into the
+		 * (now possibly shorter) cpus[] array; recompute it against
+		 * the nominal vector, matching cpu_topology_recompute_relative. */
 		t->reference_cpu_index = 0;
 		for (uint32_t i = 0; i < t->num_cpus; i++) {
-			if (t->cpus[i].relative_capacity >= 1.0) {
+			if (t->cpus[i].relative_capacity_nominal >= 1.0) {
 				t->reference_cpu_index = i;
 				break;
 			}
