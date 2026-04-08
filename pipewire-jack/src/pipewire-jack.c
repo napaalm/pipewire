@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <regex.h>
 #include <math.h>
 #include <threads.h>
@@ -34,6 +35,7 @@
 
 #include <pipewire/pipewire.h>
 #include <pipewire/private.h>
+#include <pipewire/cycle-counter.h>
 #include <pipewire/thread.h>
 #include <pipewire/data-loop.h>
 
@@ -447,6 +449,15 @@ struct client {
 		unsigned int prepared:1;
 		unsigned int first:1;
 		unsigned int thread_entered:1;
+		/* Per-thread perf_event cycle counter, lazy-initialised on
+		 * the first cycle so perf_event_open(pid=0) attaches to the
+		 * data-loop thread that owns the JACK process callback.
+		 * -1 means "not yet attempted", -2 is the post-failure
+		 * "do not retry" sentinel; a non-negative value is an open
+		 * fd whose delta read is the cycles spent in the user
+		 * process() callback. See cycle-counter.h. */
+		int cycle_fd;
+		uint64_t awake_cycles;
 	} rt;
 
 	pthread_mutex_t rt_lock;
@@ -2043,7 +2054,19 @@ static inline uint32_t cycle_run(struct client *c)
 		if (c->thread_init_callback)
 			c->thread_init_callback(c->thread_init_arg);
 		c->rt.first = false;
+		/* Bind the per-thread cycle counter on the first cycle:
+		 * cycle_run runs on the data-loop thread that owns this
+		 * client, so perf_event_open(pid=0) attaches to the right
+		 * thread. After this point cycle_fd is either >= 0 (open)
+		 * or -2 (open failed -- do not retry). */
+		if (c->rt.cycle_fd == -1) {
+			c->rt.cycle_fd = pw_cycle_counter_open();
+			if (c->rt.cycle_fd < 0)
+				c->rt.cycle_fd = -2;
+		}
 	}
+	c->rt.awake_cycles = pw_cycle_counter_read(c->rt.cycle_fd);
+	activation->awake_cycles = c->rt.awake_cycles;
 
 	if (SPA_UNLIKELY(pos == NULL)) {
 		pw_log_error("%p: missing position", c);
@@ -2161,7 +2184,22 @@ static inline void signal_sync(struct client *c)
 	activation->finish_cputime = fin_cputime;
 	if (fin_cputime >= awake_cputime && awake_cputime != 0 && fin_cputime != 0)
 		SPA_ATOMIC_STORE(activation->prev_run_time, fin_cputime - awake_cputime);
-		
+
+	/* Stamp the per-cycle CPU cycle count alongside the wall-clock
+	 * cputime. trigger_targets in impl-node copies awake/finish into
+	 * prev_run_cycles for daemon-driven nodes; JACK clients drive
+	 * their own activation, so we compute and store it here. Both
+	 * zero means the perf counter is disabled and consumers must
+	 * fall back on prev_run_time. */
+	uint64_t fin_cycles = pw_cycle_counter_read(c->rt.cycle_fd);
+	uint64_t awake_cycles = c->rt.awake_cycles;
+	activation->finish_cycles = fin_cycles;
+	if (fin_cycles >= awake_cycles && awake_cycles != 0 && fin_cycles != 0)
+		SPA_ATOMIC_STORE(activation->prev_run_cycles, fin_cycles - awake_cycles);
+	else
+		SPA_ATOMIC_STORE(activation->prev_run_cycles, 0);
+
+
 	if (c->async || old_status != PW_NODE_ACTIVATION_AWAKE)
 		return;
 
@@ -2486,6 +2524,8 @@ static int do_prepare_client(struct spa_loop *loop, bool async, uint32_t seq,
 	c->rt.first = true;
 	c->rt.thread_entered = false;
 	c->rt.prepared = true;
+	c->rt.cycle_fd = -1;
+	c->rt.awake_cycles = 0;
 	return 0;
 }
 
@@ -2514,6 +2554,11 @@ static int do_unprepare_client(struct spa_loop *loop, bool async, uint32_t seq,
 	pw_loop_update_io(c->l,
 			  c->socket_source, SPA_IO_ERR | SPA_IO_HUP);
 
+	if (c->rt.cycle_fd >= 0) {
+		close(c->rt.cycle_fd);
+		c->rt.cycle_fd = -2;
+	}
+	c->rt.awake_cycles = 0;
 	c->rt.prepared = false;
 	return 0;
 }
@@ -4842,9 +4887,59 @@ void jack_internal_client_close (const char *client_name)
 	pw_log_warn("not implemented %s", client_name);
 }
 
+/* Read the TID of the calling thread into the user pointer. Invoked
+ * synchronously on the data-loop thread via pw_loop_invoke so the TID
+ * we capture is the thread that will actually run cycle_run -- the
+ * one downstream consumers want when they look at PW_KEY_NODE_LOOP_TID
+ * on the daemon-side proxy of this client. */
+static int do_get_loop_tid(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+#if defined(HAVE_GETTID)
+	*(pid_t *)user_data = (pid_t) gettid();
+#elif defined(__linux__)
+	*(pid_t *)user_data = (pid_t) syscall(SYS_gettid);
+#elif defined(__FreeBSD__) || defined(__MidnightBSD__)
+	long tid;
+	thr_self(&tid);
+	*(pid_t *)user_data = (pid_t) tid;
+#else
+	*(pid_t *)user_data = -1;
+#endif
+	return 0;
+}
+
+/* Publish the JACK client data-loop TID as PW_KEY_NODE_LOOP_TID on
+ * the client-node proxy. JACK does not own a pw_impl_node on the
+ * client side, so impl-node's automatic do_gettid path that publishes
+ * the TID for pw_stream / pw_filter clients does not run for us; we
+ * have to publish it ourselves after the data loop's thread is up. */
+static void publish_loop_tid(struct client *c)
+{
+	pid_t tid = -1;
+
+	if (c->loop == NULL || c->l == NULL)
+		return;
+
+	pw_loop_invoke(c->l, do_get_loop_tid, SPA_ID_INVALID, NULL, 0, true, &tid);
+	if (tid <= 0)
+		return;
+
+	pw_properties_setf(c->props, PW_KEY_NODE_LOOP_TID, "%d", tid);
+	pw_log_info("%p: published node.loop.tid=%d", c, tid);
+
+	c->info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS;
+	c->info.props = &c->props->dict;
+	pw_client_node_update(c->node,
+			PW_CLIENT_NODE_UPDATE_INFO,
+			0, NULL, &c->info);
+	c->info.change_mask = 0;
+}
+
 static int do_activate(struct client *c)
 {
 	int res;
+	publish_loop_tid(c);
 	pw_client_node_set_active(c->node, true);
 	res = do_sync(c);
 	return res;
