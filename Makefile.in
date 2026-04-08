@@ -15,7 +15,14 @@ uninstall:
 clean:
 	ninja -C $(BUILD_ROOT) clean
 
-run: all
+DEADLINE_DISABLE = $(if $(filter 0,$(DEADLINE)),1,)
+
+maybe-setcap:
+	@PIPEWIRE_DISABLE_MODULE_DEADLINE=$(DEADLINE_DISABLE) \
+	bash "$(SOURCE_ROOT)/maybe-setcap.sh" "$(BUILD_ROOT)/src/daemon/pipewire"
+
+run: all maybe-setcap
+	PIPEWIRE_DISABLE_MODULE_DEADLINE=$(DEADLINE_DISABLE) \
 	SPA_PLUGIN_DIR=$(BUILD_ROOT)/spa/plugins \
 	SPA_DATA_DIR=$(SOURCE_ROOT)/spa/plugins \
 	PIPEWIRE_MODULE_DIR=$(BUILD_ROOT)/src/modules \
