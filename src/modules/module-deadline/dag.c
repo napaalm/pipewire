@@ -174,7 +174,8 @@ static dag_node_t *find_node(dag_t *g, uint32_t id)
 	return NULL;
 }
 
-int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
+int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid,
+		bool is_audio_source, bool is_audio_sink)
 {
 	if (!g) {
 		errno = EINVAL;
@@ -193,6 +194,8 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
 	n->index = DAG_NODE_INDEX_INVALID;
 	n->wcet = wcet;
 	n->tid = tid;
+	n->is_audio_source = is_audio_source;
+	n->is_audio_sink = is_audio_sink;
 	n->deadline = 0;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);
@@ -204,16 +207,10 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
 	return 0;
 }
 
-int dag_remove_node(dag_t *g, uint32_t id)
+static int dag_remove_node_ptr(dag_t *g, dag_node_t *n)
 {
-	if (!g) {
+	if (!g || !n) {
 		errno = EINVAL;
-		return -1;
-	}
-
-	dag_node_t *n = find_node(g, id);
-	if (!n) {
-		errno = ENOENT;
 		return -1;
 	}
 
@@ -234,6 +231,24 @@ int dag_remove_node(dag_t *g, uint32_t id)
 
 	spa_list_remove(&n->link);
 	free(n);
+	return 0;
+}
+
+int dag_remove_node(dag_t *g, uint32_t id)
+{
+	if (!g) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	dag_node_t *n = find_node(g, id);
+	if (!n) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (dag_remove_node_ptr(g, n) < 0)
+		return -1;
 
 	dag_invalidate_analysis(g);
 	dag_invalidate_schedule(g);
@@ -439,9 +454,9 @@ static void find_sources_and_sinks(dag_t *g, dag_node_t ***sources, uint32_t *ns
 		bool has_in = !spa_list_is_empty(&n->incoming);
 		bool has_out = !spa_list_is_empty(&n->outgoing);
 
-		if (!has_in)
+		if (!has_in && n->is_audio_source)
 			sarr[si++] = n;
-		if (!has_out)
+		if (!has_out && n->is_audio_sink)
 			tarr[ti++] = n;
 	}
 
@@ -643,6 +658,35 @@ static int dag_comp_relatives(dag_t *g)
 	return 0;
 }
 
+/* Removes all nodes that are not on a path from any source to any sink */
+static int dag_remove_spurious_nodes(dag_t *g, dag_node_t **sources, uint32_t nsources, dag_node_t **sinks, uint32_t nsinks)
+{
+	int removed = 0;
+	dag_node_t *n, *ntmp;
+	spa_list_for_each_safe(n, ntmp, &g->nodes, link) {
+		bool reachable_from_source = false;
+		bool can_reach_sink = false;
+		for (uint32_t i = 0; i < nsources; i++) {
+			if (g->relatives[sources[i]->index][n->index]) {
+				reachable_from_source = true;
+				break;
+			}
+		}
+		for (uint32_t i = 0; i < nsinks; i++) {
+			if (g->relatives[n->index][sinks[i]->index]) {
+				can_reach_sink = true;
+				break;
+			}
+		}
+		if (!reachable_from_source || !can_reach_sink) {
+			if (dag_remove_node_ptr(g, n) < 0)
+				return -1;
+			removed++;
+		}
+	}
+	return removed;
+}
+
 static int dag_ensure_unrelated_capacity(dag_t *g, uint32_t needed)
 {
 	if (g->unrelated_capacity >= needed)
@@ -787,9 +831,6 @@ static int dag_comp_unrelated(dag_t *g, dag_node_t **sources, uint32_t nsources)
 {
 	bitset_decl_zero(curr_cut, (int)g->indexed_count);
 
-	if (dag_comp_relatives(g) < 0)
-		return -1;
-
 	for (uint32_t i = 0; i < nsources; i++)
 		bitset_set(curr_cut, sources[i]->index);
 
@@ -804,12 +845,24 @@ static int dag_comp_unrelated(dag_t *g, dag_node_t **sources, uint32_t nsources)
 	return 0;
 }
 
-static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources)
+static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources, dag_node_t **sinks, uint32_t nsinks)
 {
+	int ret;
 	dag_invalidate_analysis(g);
 
 	if (dag_build_indexed_nodes(g) < 0)
 		goto error;
+
+	if (dag_comp_relatives(g) < 0)
+		goto error;
+
+	ret = dag_remove_spurious_nodes(g, sources, nsources, sinks, nsinks);
+	if (ret < 0)
+		goto error;
+	if (ret > 0) {
+		dag_invalidate_analysis(g);
+		return ret;
+	}
 
 	if (dag_comp_unrelated(g, sources, nsources) < 0)
 		goto error;
@@ -1043,6 +1096,8 @@ static int assign_cpus(dag_t *g)
 
 int dag_recalculate(dag_t *g)
 {
+	int ret;
+
 	if (!g) {
 		errno = EINVAL;
 		return -1;
@@ -1066,10 +1121,11 @@ int dag_recalculate(dag_t *g)
 		return -1;
 	}
 
-	if (dag_build_analysis(g, sources, nsources) < 0) {
+	ret = dag_build_analysis(g, sources, nsources, sinks, nsinks);
+	if (ret != 0) {
 		free(sources);
 		free(sinks);
-		return -1;
+		return ret > 0 ? dag_recalculate(g) : -1;
 	}
 
 	for (uint32_t i = 0; i < nsources; i++) {
