@@ -18,6 +18,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 #include <stdbool.h>
+#include <assert.h>
+
+#include "bitset.h"
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
@@ -38,6 +41,7 @@ struct dag_node {
 	struct spa_list incoming;    /* list of incoming edges (dag_edge_t) */
 
 	uint32_t id;
+	uint32_t index;      /* dense topological index for analysis caches */
 	uint64_t wcet;       /* worst case execution time */
 	uint64_t deadline;   /* assigned relative deadline */
 	uint32_t cpu;        /* assigned CPU */
@@ -62,6 +66,13 @@ struct dag {
 
 	struct spa_list nodes; /* list of dag_node_t */
 	struct spa_list edges; /* list of dag_edge_t */
+
+	dag_node_t **indexed_nodes;
+	uint32_t indexed_count;
+	int **relatives;
+	bitset_t **unrelated;
+	uint32_t unrelated_size;
+	uint32_t unrelated_capacity;
 };
 
 /* Create and destroy a DAG */
