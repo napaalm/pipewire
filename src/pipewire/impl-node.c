@@ -146,6 +146,52 @@ struct pw_node_peer *pw_node_peer_ref(struct pw_impl_node *onode, struct pw_impl
 	peer->ref = 1;
 	peer->output = onode;
 	copy_target(&peer->target, &inode->rt.target);
+	/* Arm the same-loop fast path in trigger_target_v1 when the
+	 * operator left context.inline-dispatch at its default of true.
+	 * We stamp the producer's data-loop system onto the peer's
+	 * target so the trigger function can do a single pointer
+	 * compare against peer->target.system (= the consumer's
+	 * system) to decide between the eventfd path and an inline
+	 * process_node call.
+	 *
+	 * The remote/exported/driver opt-out below covers the cases
+	 * where calling process_node on the consumer here would not
+	 * actually run the consumer's audio code:
+	 *
+	 *   - remote: the daemon-side proxy of a node whose real
+	 *     process callback runs in another pw_context. The local
+	 *     spa_node bound to it is a protocol stub that just
+	 *     re-writes the eventfd; inlining it saves nothing.
+	 *   - exported: locally-owned but its process callback is
+	 *     served through the client-node protocol. Same proxy-
+	 *     vs-real-node hazard.
+	 *   - driver: drivers are never fused with their followers
+	 *     and process_node on a driver finalises the cycle via
+	 *     the else branch that emits rt_complete; inlining would
+	 *     skip wake-back plumbing downstream relies on.
+	 *
+	 * Leaving src_system at NULL is always safe -- it keeps
+	 * trigger_target_v1 on the eventfd-write path. */
+	if (pw_properties_get_bool(onode->context->properties,
+				"context.inline-dispatch", true) &&
+	    onode->data_loop != NULL &&
+	    !onode->remote && !onode->exported && !onode->driver &&
+	    !inode->remote && !inode->exported && !inode->driver) {
+		peer->target.src_system = onode->data_loop->system;
+		pw_log_debug("peer %p (%u->%u): inline-dispatch armed "
+				"(src_system=%p loop=%s)",
+				peer, onode->info.id, inode->info.id,
+				peer->target.src_system,
+				onode->data_loop->name);
+	} else {
+		pw_log_debug("peer %p (%u->%u): inline-dispatch disarmed "
+				"(remote o:%d i:%d exported o:%d i:%d "
+				"driver o:%d i:%d)",
+				peer, onode->info.id, inode->info.id,
+				onode->remote, inode->remote,
+				onode->exported, inode->exported,
+				onode->driver, inode->driver);
+	}
 
 	spa_list_append(&onode->peer_list, &peer->link);
 	pw_log_debug("new peer %p from %p to %p", peer, onode, inode);
@@ -1622,6 +1668,39 @@ int pw_impl_node_trigger(struct pw_impl_node *node)
 	return t->trigger(t, nsec);
 }
 
+/* Out-of-line companion to trigger_target_v1's same-loop fast path
+ * (declared in private.h). Called when the producer that owns `t`
+ * runs on the same data-loop thread as the consumer t points at, so
+ * we can skip the eventfd write + epoll wake and call process_node
+ * directly. State-machine invariants the cross-thread path enforces:
+ *
+ *   - trigger_target_v1 already set a->signal_time and CAS'd
+ *     a->status from NOT_TRIGGERED to TRIGGERED, so process_node's
+ *     own TRIGGERED -> AWAKE CAS succeeds exactly as on the eventfd
+ *     path; if the consumer was concurrently driven INACTIVE between
+ *     the two CAS calls, the inner CAS fails and process_node bails
+ *     -- identical to the cross-thread case.
+ *   - awake_time stamps: the eventfd path reads wall + cputime in
+ *     node_on_fd_events AFTER the wake. Inline, we are running on
+ *     the consumer's data-loop thread already (same thread as the
+ *     producer's), so the awake clocks are the producer's finish
+ *     clocks plus a few ns of function-call overhead. We pass the
+ *     producer's nsec (= signal_time of the consumer) and resample
+ *     the per-thread CPU clock here so awake_cputime is accurate
+ *     under the same thread for both the producer's finish and the
+ *     consumer's awake.
+ *   - recursion: if the consumer has same-loop downstream targets,
+ *     process_node -> trigger_targets -> trigger_target_v1 will
+ *     nest further. The depth is bounded by the longest same-loop
+ *     chain in the fused subgraph, which audio graphs keep small
+ *     (tens of nodes); stack pressure is negligible. */
+SPA_EXPORT
+int pw_impl_node_dispatch_inline(struct pw_node_target *t, uint64_t nsec)
+{
+	uint64_t cpu_nsec = get_cputime_ns(t->system);
+	return process_node(t->node, nsec, cpu_nsec);
+}
+
 static void node_on_fd_events(struct spa_source *source)
 {
 	struct pw_impl_node *this = source->data;
@@ -1736,7 +1815,16 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 		goto error_clean;
 	}
 
-	if (this->data_loop != context->main_loop) {
+	if (this->data_loop != context->main_loop && !this->remote) {
+		/* Run do_gettid synchronously on the data loop so the
+		 * resulting PW_KEY_NODE_LOOP_TID is the TID of the thread
+		 * that will actually run the node's process callback. For
+		 * remote nodes (the daemon's view of a client-node proxy)
+		 * the callback runs in the client process, not here, so
+		 * publishing the daemon-side data-loop TID would mislead
+		 * downstream consumers; the client publishes its own TID
+		 * via the same property and the value propagates back
+		 * through the client-node info update path. */
 		pw_loop_invoke(this->data_loop,
 				do_gettid, SPA_ID_INVALID, NULL, 0, true, properties);
 	} else {
@@ -1800,6 +1888,17 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 	this->rt.target.system = this->data_loop->system;
 	this->rt.target.fd = this->source.fd;
 	this->rt.target.trigger = trigger_target_v1;
+	/* The self-target (rt.target) is only invoked from
+	 * pw_impl_node_trigger, the manual external-wake entry point.
+	 * That caller is generally NOT on this node's data-loop thread
+	 * (e.g. the main thread waking a driver, or a control thread
+	 * kicking a stalled node) -- the eventfd is precisely the
+	 * cross-thread handoff there. Leaving src_system at NULL keeps
+	 * pw_impl_node_trigger on the eventfd path. The same-loop
+	 * fast path is only activated for peer-owned target copies, by
+	 * pw_node_peer_ref (and refreshed by pw_impl_node_set_data_loop
+	 * when the producer's loop changes). */
+	this->rt.target.src_system = NULL;
 
 	reset_position(this, &this->rt.target.activation->position);
 	this->rt.target.activation->sync_timeout = DEFAULT_SYNC_TIMEOUT;
@@ -1831,6 +1930,312 @@ error_exit:
 	pw_properties_free(properties);
 	errno = -res;
 	return NULL;
+}
+
+/* ---------------------------------------------------------------------
+ * Runtime relocation of a node onto a different data loop. See
+ * pw_impl_node_set_data_loop() below for the API contract and the
+ * sequencing reasoning. The helpers here are private to this file
+ * because they are tightly coupled to do_node_prepare /
+ * do_node_unprepare and to the layout of struct pw_node_peer.
+ * ---------------------------------------------------------------------
+ *
+ * Brief sequencing argument:
+ *
+ *   1. (non-remote only) unprepare on old_loop (synchronous via
+ *      pw_loop_invoke) -> after this, no more dispatches on
+ *      old_loop for this node. Remote proxies skip this step --
+ *      see "remote-node activation preservation" below for why.
+ *   2. for each peer P that has cached our old system, pw_loop_invoke
+ *      on P's owning loop to update P->target.system -- runs on P's
+ *      loop so no trigger is in flight while the pointer flips
+ *   3. update node->rt.target.system / node->data_loop atomically from
+ *      the main loop
+ *   4. refresh src_system on every outbound peer so the
+ *      same-loop fast path in trigger_target_v1 reflects the
+ *      producer's new loop assignment
+ *   5. (non-remote only) prepare on new_loop (synchronous) ->
+ *      for non-remote nodes the source is re-added to the new
+ *      loop's epoll set. do_node_prepare drains the eventfd once
+ *      before adding, so any peer write that landed during the
+ *      migration window is consumed; the affected cycle is
+ *      reported as a missed wake by the driver's per-target reset
+ *      on the next cycle and the graph recovers from there.
+ *   6. emit data_loop_changed so listeners can rebind their own
+ *      loop-tied resources (notably client-node.c's wake-back
+ *      source on impl->data_source).
+ *   7. refresh PW_KEY_NODE_LOOP_TID by running do_gettid on new_loop
+ *
+ * fd lifetime across migration
+ * ----------------------------
+ *
+ * The eventfd backing node->source.fd is kept open across migration.
+ * The earlier design closed the old fd and allocated a new one on
+ * new_loop->system; that was unnecessary -- the fd is a counter, not
+ * a per-loop resource, and the spa_loop_*_source pair already handles
+ * the epoll-set membership move via do_node_unprepare /
+ * do_node_prepare. Keeping the fd has two payoffs:
+ *
+ *   - Remote-proxy migration becomes free of protocol coordination.
+ *     client_node_resource_transport published node->source.fd to
+ *     the client via SCM_RIGHTS; the client's dup keeps working as
+ *     long as the underlying eventfd exists. The previous
+ *     close-and-recreate forced a protocol round-trip to publish the
+ *     new fd and was the load-bearing reason fusion_node_eligible
+ *     refused remote nodes. With the fd preserved, that refusal can
+ *     be lifted (see context.c::fusion_node_eligible).
+ *
+ * *   - The peer fd-update invoke shrinks to a system-pointer write.
+ *     Inbound peers no longer have to flip an int fd value -- only
+ *     the spa_system handle, which is what trigger_target_v1 uses
+ *     to dispatch eventfd_write through the new loop's system
+ *     implementation. The peer's target.fd is the same kernel fd as
+ *     before, so the write hits the same eventfd object.
+ *
+ * Remote-node activation preservation
+ * -----------------------------------
+ *
+ * For non-remote nodes the do_node_unprepare / do_node_prepare pair
+ * around the migration is what removes node->source from the old
+ * loop's epoll set and re-adds it on the new loop. As a side effect
+ * it also resets the activation status: do_node_unprepare XCHGs the
+ * status to INACTIVE, do_node_prepare sets it back to FINISHED. The
+ * window between the two is racy: any producer trying to trigger
+ * the node during that window sees status=INACTIVE, its
+ * NOT_TRIGGERED->TRIGGERED CAS in trigger_target_v1 fails, and the
+ * cycle is silently dropped. For locally-owned nodes this is
+ * acceptable -- the next driver cycle resets all targets to
+ * NOT_TRIGGERED and the graph recovers, costing one missed cycle
+ * per migration.
+ *
+ * For remote-proxy nodes the same trick would land a perceptible
+ * xrun on the *other* side of the protocol: the client process is
+ * waiting for an eventfd wake that we suppressed by failing the
+ * CAS, and it cannot tell the difference between "trigger lost in
+ * migration" and "graph genuinely paused this cycle". Skipping
+ * do_node_unprepare / do_node_prepare for remote nodes preserves
+ * the activation status across migration -- the proxy's source
+ * was never on a daemon-side loop anyway (do_node_prepare's
+ * `if (!this->remote)` guard), so the only thing those calls did
+ * was the status flip and the symmetric target_list deactivate /
+ * activate. Skipping both keeps producers triggering the proxy
+ * uninterrupted; the wake-back source on the daemon side is
+ * relocated separately by the data_loop_changed listener in
+ * client-node.c, which is the one resource on the daemon that
+ * actually moves loops for a remote proxy.
+ */
+
+/* Payload of the inbound-target system-update invoke. Carries the
+ * migrating node's id (the discriminator for the targets we want to
+ * touch on the producer's loop) and the migrating node's new
+ * spa_system handle. The migrating node's fd does not move across
+ * migration -- see the fd-lifetime block in the file header above
+ * -- so the fd field on each matched target stays valid. */
+struct peer_target_update {
+	uint32_t            target_id;
+	struct spa_system  *system;
+};
+
+/* Runs on the producer's data-loop thread. Scans the producer's
+ * rt.target_list for every entry that points at the migrating node
+ * (matched by target.id) and rewrites target.system to the migrating
+ * node's new spa_system. Walking rt.target_list -- rather than the
+ * higher-level peer_list -- catches both kinds of producer-side
+ * outbound targets:
+ *
+ *   - daemon-side peers created by pw_node_peer_ref (the regular
+ *     graph link and the driver-follower glue);
+ *   - client-side links created by client_node_set_activation in
+ *     module-client-node/remote-node.c, which add to the producer's
+ *     rt.target_list directly without ever passing through
+ *     pw_node_peer_ref.
+ *
+ * Both kinds are touched in one pass, which is the load-bearing
+ * property for fusion-driven cross-context migrations: when a
+ * client's local pw_impl_node moves to a different data loop, its
+ * old loop is released and its spa_system goes away. Anyone still
+ * holding the old spa_system in a cached target would segfault on
+ * the next eventfd_write. */
+static int do_update_target_system(struct spa_loop *loop, bool async,
+		uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct pw_impl_node *producer = user_data;
+	const struct peer_target_update *u = data;
+	struct pw_node_target *t;
+
+	spa_list_for_each(t, &producer->rt.target_list, link) {
+		if (t->id != u->target_id)
+			continue;
+		pw_log_debug("producer %p target.id=%u: system %p -> %p "
+				"(fd %d unchanged)",
+				producer, t->id, t->system, u->system,
+				t->fd);
+		t->system = u->system;
+	}
+	return 0;
+}
+
+/* Walk every node in the context and tell each producer's data
+ * loop to rewrite its target.system pointers that point at the
+ * migrating node. Includes a self-walk so a node that is both
+ * producer and consumer for some peer (the driver-follower glue
+ * uses this) gets its bookkeeping coherent.
+ *
+ * We do not pre-filter to nodes that have at least one matching
+ * target -- the inner walk is cheap and a precise filter would
+ * require accessing the producer's rt.target_list outside its
+ * data-loop thread, which is the very contract this invoke is
+ * trying to honour. */
+static int update_inbound_peers(struct pw_impl_node *node,
+		struct spa_system *new_system)
+{
+	struct pw_context *context = node->context;
+	struct pw_impl_node *other;
+	struct peer_target_update upd = {
+		.target_id = node->info.id,
+		.system = new_system,
+	};
+
+	spa_list_for_each(other, &context->node_list, link) {
+		if (other->data_loop == NULL)
+			continue;
+		pw_loop_invoke(other->data_loop, do_update_target_system,
+				SPA_ID_INVALID, &upd, sizeof(upd),
+				true, other);
+	}
+	return 0;
+}
+
+SPA_EXPORT
+int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_loop)
+{
+	struct pw_loop *old_loop;
+	struct spa_system *new_system;
+
+	if (node == NULL || new_loop == NULL)
+		return -EINVAL;
+
+	/* Refuse to relocate a remote-proxy node from the daemon side.
+	 * The proxy is the daemon's stand-in for a node whose real
+	 * process callback runs in another pw_context (in-process for
+	 * daemon-loaded modules, cross-process for external clients).
+	 * Moving the proxy's daemon-side data loop without moving the
+	 * owning process's actual data-loop thread would advertise
+	 * fusion bookkeeping that does not reflect any real
+	 * consolidation of work, and the owning side's thread is the
+	 * only thing module-deadline (which reads node.loop.tid) can
+	 * use to group SCHED_DEADLINE budgets.
+	 *
+	 * The remote-aware path lives in the fusion pass and in the
+	 * client-node protocol: when the daemon decides a proxy
+	 * should join a co-location group, it stamps the desired
+	 * group on the proxy's properties and emits the
+	 * pw_client_node set_loop_group event; the owner reacquires
+	 * its own data loop with that group and publishes its new
+	 * thread back through the standard info-update path, so the
+	 * proxy's PW_KEY_NODE_LOOP_TID then reflects the actual
+	 * thread. The daemon-side proxy never moves. */
+	if (node->remote)
+		return -EINVAL;
+
+	old_loop = node->data_loop;
+	if (old_loop == new_loop)
+		return 0;
+
+	/* Refusing to move a node attached to the main loop keeps the
+	 * relocation surface limited to the dynamic-data-loop case.
+	 * Main-loop-bound nodes have no separate data-loop thread to
+	 * receive sched parameters anyway. */
+	if (old_loop == node->context->main_loop ||
+	    new_loop == node->context->main_loop)
+		return -EINVAL;
+
+	new_system = new_loop->system;
+
+	pw_log_info("%p: relocating from loop:'%s' to loop:'%s' "
+			"(fd=%d kept across migration)",
+			node, old_loop->name, new_loop->name,
+			node->source.fd);
+
+	/* 1. quiesce the source on the old loop: remove node->source
+	 *    from old_loop's epoll set and do a full state-machine
+	 *    reset (status -> INACTIVE, targets deactivated). */
+	pw_loop_invoke(old_loop, do_node_unprepare, 1, NULL, 0, true, node);
+
+	/* 2. publish the new spa_system to inbound peers. The fd does
+	 *    not move (see the fd-lifetime block in this file's header),
+	 *    so trigger_target_v1's spa_system_eventfd_write will hit
+	 *    the same kernel eventfd; only the routing of the write
+	 *    through the new loop's system implementation flips. */
+	update_inbound_peers(node, new_system);
+
+	/* 3. flip the node's own bookkeeping. node->source.fd and
+	 *    node->rt.target.fd are NOT touched -- they point at the
+	 *    same eventfd as before; only the system handle is swapped
+	 *    so subsequent eventfd reads (the drain in do_node_prepare,
+	 *    notably) go through new_loop's spa_system. */
+	node->rt.target.system = new_system;
+	node->data_loop = new_loop;
+
+	/* 4. refresh src_system on every outbound peer.
+	 *
+	 *    src_system encodes "the producer dispatches from this
+	 *    spa_system" for the same-loop fast path in
+	 *    trigger_target_v1 (private.h). Migrating the producer
+	 *    (= this node) means its outbound peers' src_system, which
+	 *    used to point at old_system, is now stale and must follow
+	 *    node->data_loop to new_system, or else the fast path
+	 *    would either false-positive (dispatch inline on a thread
+	 *    the consumer is no longer registered with) or
+	 *    false-negative (miss a now-coalescible same-loop hop
+	 *    after the producer landed on the consumer's loop).
+	 *
+	 *    Peers in node->peer_list are read by the producer's data
+	 *    loop during trigger_targets. The producer's loop is
+	 *    quiesced through this whole window (steps 1 and 5), so
+	 *    the main-thread write here is unobserved by any data-
+	 *    loop iteration.
+	 *
+	 *    Peers whose src_system was already NULL (peer creation
+	 *    happened with context.inline-dispatch=false, or either
+	 *    endpoint was remote/exported/driver, or onode->data_loop
+	 *    was unset at the time) are left at NULL so the opt-out
+	 *    remains sticky across migrations. */
+	{
+		struct pw_node_peer *peer;
+		spa_list_for_each(peer, &node->peer_list, link) {
+			if (peer->target.src_system != NULL)
+				peer->target.src_system = new_system;
+		}
+	}
+
+	/* 5. re-arm the source on the new loop. do_node_prepare
+	 *    drains the eventfd once before adding the source, so any
+	 *    peer write that landed during the migration window is
+	 *    consumed; the affected cycle is reported as a missed wake
+	 *    by the driver's per-target reset on the next cycle and
+	 *    the graph recovers from there. */
+	pw_loop_invoke(new_loop, do_node_prepare, 1, NULL, 0, true, node);
+
+	/* 6. notify listeners that the data_loop has been swapped.
+	 *    Fires BEFORE info_changed: listeners use this hook to
+	 *    rebind loop-tied resources they registered themselves.
+	 *    Doing it here -- after do_node_prepare on the new loop
+	 *    has returned -- ensures the listener can pw_loop_invoke
+	 *    on both old and new loops without re-entering the
+	 *    migration that is still in flight. */
+	pw_impl_node_emit_data_loop_changed(node, old_loop, new_loop);
+
+	/* 7. refresh the published TID. */
+	pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
+			node->properties);
+	pw_impl_node_emit_info_changed(node, &node->info);
+
+	pw_log_info("%p: relocation complete, new loop:'%s' new tid:%s",
+			node, new_loop->name,
+			pw_properties_get(node->properties, PW_KEY_NODE_LOOP_TID));
+
+	return 0;
 }
 
 SPA_EXPORT
@@ -2585,6 +2990,13 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 		close(node->cycle_fd);
 		node->cycle_fd = -2;
 	}
+
+	/* Free the per-node subgraph-fusion sliding-window backing
+	 * buffer. Allocated lazily by context.c::fusion_ensure_window_size
+	 * on first WCET sample; release here on node teardown so we do
+	 * not leak across destroys. */
+	free(node->fusion_window.samples);
+	node->fusion_window.samples = NULL;
 
 	if (node->data_loop)
 		pw_context_release_node_loop(context, node->data_loop);

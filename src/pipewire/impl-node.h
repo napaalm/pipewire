@@ -29,7 +29,7 @@ struct pw_impl_port;
 
 /** Node events, listen to them with \ref pw_impl_node_add_listener */
 struct pw_impl_node_events {
-#define PW_VERSION_IMPL_NODE_EVENTS	0
+#define PW_VERSION_IMPL_NODE_EVENTS	1
 	uint32_t version;
 
 	/** the node is destroyed */
@@ -73,6 +73,24 @@ struct pw_impl_node_events {
 	void (*peer_added) (void *data, struct pw_impl_node *peer);
 	/** a peer was removed */
 	void (*peer_removed) (void *data, struct pw_impl_node *peer);
+
+	/**
+	 * The node's data_loop has changed. Fires after
+	 * pw_impl_node_set_data_loop has finished the relocation,
+	 * before info_changed (so listeners can rebind loop-tied
+	 * resources before the public info advertises the new loop).
+	 *
+	 * Available in PW_VERSION_IMPL_NODE_EVENTS >= 1.
+	 *
+	 * Use cases: a listener that registered a spa_source on the
+	 * node's previous data_loop (notably the client-node-impl
+	 * wake-back source, which sits separately from node->source
+	 * and is bound to impl->data_loop) must remove it from the
+	 * old loop and add it to the new one. Listeners that did not
+	 * touch a loop can ignore the event.
+	 */
+	void (*data_loop_changed) (void *data, struct pw_loop *old_loop,
+			struct pw_loop *new_loop);
 };
 
 struct pw_impl_node_rt_events {
@@ -104,6 +122,29 @@ int pw_impl_node_register(struct pw_impl_node *node,		/**< node to register */
 
 /** Destroy a node */
 void pw_impl_node_destroy(struct pw_impl_node *node);
+
+/** Relocate a running node onto a different data loop. The node
+ * remains registered, its links remain intact, and its
+ * \ref PW_KEY_NODE_LOOP_TID property is refreshed once the new loop
+ * thread reports its tid. Must be called from the main loop; not
+ * thread-safe with concurrent main-loop mutation of the node. The
+ * new_loop must come from \ref pw_context_acquire_node_loop on the
+ * node's own context (so its ref count and lifetime are managed
+ * symmetrically with the old loop). On success the old loop is
+ * released via pw_context_release_node_loop; on failure the node is
+ * left on its original loop and the new_loop ref is dropped. Returns
+ * 0 on success or a negative errno on failure.
+ *
+ * Remote nodes (\ref PW_KEY_NODE_REMOTE = true on the server side
+ * stand-in) cannot be relocated -- their actual thread lives in the
+ * client process. -EINVAL is returned in that case.
+ *
+ * Triggers landing on the node during the brief migration window are
+ * absorbed into the new loop's eventfd and consumed when the source
+ * is re-armed, but the affected cycles may be late. Avoid calling
+ * this from latency-critical paths.
+ */
+int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_loop);
 
 /** Get the node info */
 const struct pw_node_info *pw_impl_node_get_info(struct pw_impl_node *node);
