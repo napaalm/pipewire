@@ -805,9 +805,10 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
 	const char *name, *klass;
 	struct pw_data_loop *loop;
+	bool request_dynamic = props ? pw_properties_get_bool(props, PW_KEY_NODE_LOOP_DYNAMIC, false) : false;
 
-	if (!impl->dynamic_data_loops || remote)
-		return pw_context_acquire_loop(context, &props->dict);
+	if (!impl->dynamic_data_loops || (remote && !request_dynamic))
+		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
 
 	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
 	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
