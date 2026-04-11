@@ -80,9 +80,9 @@ PWTEST(chain_uses_peak_not_sum)
 	dag_t *g = dag_create(100, 100, 0.55f, 1);
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, false, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 
@@ -118,10 +118,10 @@ PWTEST(fork_join_fails_on_peak_concurrency)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 10, 104, false, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 10, 104), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
@@ -145,10 +145,10 @@ PWTEST(multi_source_initial_cut_and_cleanup)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 10, 104, false, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 10, 104), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
 	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
@@ -170,9 +170,9 @@ PWTEST(topology_change_rebuilds_analysis)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, false, true), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, true, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
@@ -196,40 +196,6 @@ PWTEST(topology_change_rebuilds_analysis)
 	return PWTEST_PASS;
 }
 
-PWTEST(spurious_nodes_are_removed_from_analysis)
-{
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
-
-	pwtest_ptr_notnull(g);
-
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, false, true), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 10, 104, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 5, 10, 105, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 6, 10, 106, false, true), 0);
-	pwtest_int_eq(dag_add_node(g, 7, 10, 107, false, false), 0);
-
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 4), 0);
-
-	pwtest_int_eq(dag_recalculate(g), 0);
-
-	pwtest_int_eq((int)dag_node_count(g), 3);
-	pwtest_int_eq((int)g->indexed_count, 3);
-	pwtest_ptr_notnull(find_node_by_id(g, 1));
-	pwtest_ptr_notnull(find_node_by_id(g, 2));
-	pwtest_ptr_notnull(find_node_by_id(g, 3));
-	pwtest_ptr_eq(find_node_by_id(g, 4), NULL);
-	pwtest_ptr_eq(find_node_by_id(g, 5), NULL);
-	pwtest_ptr_eq(find_node_by_id(g, 6), NULL);
-	pwtest_ptr_eq(find_node_by_id(g, 7), NULL);
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
 PWTEST(independent_tasks_are_placed_by_descending_density)
 {
 	dag_t *g = dag_create(100, 100, 0.10f, 2);
@@ -237,9 +203,9 @@ PWTEST(independent_tasks_are_placed_by_descending_density)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 5, 101, true, true), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 4, 102, true, true), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 3, 103, true, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 4, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 3, 103), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
 
 	a = find_node_by_id(g, 1);
@@ -263,9 +229,9 @@ PWTEST(equal_load_ties_choose_lowest_cpu)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101, true, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102, false, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103, false, true), 0);
+	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
@@ -290,7 +256,7 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);
 	pwtest_add(topology_change_rebuilds_analysis, PWTEST_NOARG);
-	pwtest_add(spurious_nodes_are_removed_from_analysis, PWTEST_NOARG);
+	
 	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
 	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);
 
