@@ -181,6 +181,11 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid,
 		errno = EINVAL;
 		return -1;
 	}
+	if (wcet == 0) {
+		pw_log_error("Cannot add node %u with wcet=0", id);
+		errno = EINVAL;
+		return -1;
+	}
 	if (find_node(g, id)) {
 		errno = EEXIST;
 		return -1;
@@ -454,9 +459,9 @@ static void find_sources_and_sinks(dag_t *g, dag_node_t ***sources, uint32_t *ns
 		bool has_in = !spa_list_is_empty(&n->incoming);
 		bool has_out = !spa_list_is_empty(&n->outgoing);
 
-		if (!has_in && n->is_audio_source)
+		if (!has_in)
 			sarr[si++] = n;
-		if (!has_out && n->is_audio_sink)
+		if (!has_out)
 			tarr[ti++] = n;
 	}
 
@@ -528,6 +533,9 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	for (int i = src_idx; i <= dst_idx; i++) {
 		dag_node_t *u = topo[i];
 		dag_edge_t *e;
+
+		if (!g->relatives[src->index][u->index])
+			continue;
 
 		spa_list_for_each(e, &u->outgoing, src_link) {
 			int v = -1;
@@ -856,14 +864,6 @@ static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources,
 	if (dag_comp_relatives(g) < 0)
 		goto error;
 
-	ret = dag_remove_spurious_nodes(g, sources, nsources, sinks, nsinks);
-	if (ret < 0)
-		goto error;
-	if (ret > 0) {
-		dag_invalidate_analysis(g);
-		return ret;
-	}
-
 	if (dag_comp_unrelated(g, sources, nsources) < 0)
 		goto error;
 
@@ -1036,6 +1036,7 @@ static int assign_cpus(dag_t *g)
 
 	for (uint32_t i = 0; i < count; i++) {
 		if (!g->indexed_nodes[i]->deadline_assigned) {
+			pw_log_error("Node %u has no assigned deadline", g->indexed_nodes[i]->id);
 			errno = EFAULT;
 			return -1;
 		}

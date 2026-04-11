@@ -240,8 +240,8 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, ui
 		else
 			pw_log_error("failed to set DEADLINE attributes for tid %d: %s", tid, strerror(errno));
 	}
-	else 
-		pw_log_debug("set DEADLINE scheduling for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
+	// else 
+	// 	pw_log_debug("set DEADLINE scheduling for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
 
 	return ret;
 }
@@ -295,6 +295,18 @@ static bool is_audio_sink_media_class(const char *media_class)
 		 spa_strstartswith(media_class, "Stream/Input/Audio"));
 }
 
+static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_activation *na)
+{
+	uint64_t runtime = SPA_ATOMIC_LOAD(na->prev_run_time);
+	
+	if (runtime == 0 || runtime > UINT64_MAX / 2) {
+		pw_log_warn("invalid runtime %lu for node %d, using 0 instead", runtime, node->info.id);
+		return 0;
+	}
+
+	return runtime;
+}
+
 static void recalc_params(void *data)
 {
 	struct node *n = data;
@@ -310,7 +322,7 @@ static void recalc_params(void *data)
 	uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
 
 	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
-
+	
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *node = t->node;
 		struct pw_node_activation *na;
@@ -318,17 +330,16 @@ static void recalc_params(void *data)
 		pid_t tid = -1;
 
 		struct node *n = find_node(impl, node);
-		if (n == NULL) {
-			n = calloc(1, sizeof(*n));
-			n->impl = impl;
-			n->node = node;
-			n->enabled = true;
-			spa_list_insert(&impl->node_list, &n->link);
-		}
+        if (n == NULL) {
+            n = calloc(1, sizeof(*n));
+            n->impl = impl;
+            n->node = node;
+            n->enabled = true;
+            spa_list_insert(&impl->node_list, &n->link);
+        }
 
 		na = t->activation;
-
-		uint64_t runtime = node->async ? na->prev_run_time : na->finish_cputime - na->awake_cputime;
+		uint64_t runtime = get_runtime_ns(node, na);
 		if (runtime > period)
 			pw_log_warn("node %d runtime %lu exceeds period %lu", node->info.id, runtime, period);
 
@@ -336,8 +347,9 @@ static void recalc_params(void *data)
 			n->wcet = SPA_MAX(n->wcet, runtime);
 		else
 			n->wcet = runtime;
-		if (n->wcet == 0) {
+		if (n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
 			abort = true;
+			pw_log_warn("Abort trying to add node %d (wcet=0)", node->info.id);
 			continue;
 		}
 
