@@ -1629,6 +1629,16 @@ pw_filter_connect(struct pw_filter *filter,
 		if (pw_properties_get(filter->properties, PW_KEY_NODE_LOOP_CLASS) == NULL)
 			pw_properties_set(filter->properties, PW_KEY_NODE_LOOP_CLASS, "main");
 		pw_properties_set(filter->properties, PW_KEY_NODE_ASYNC, "true");
+	} else {
+		/* Mirror pw_stream: real-time filters default to a dedicated
+		 * dynamic data loop unless the caller pinned them to a
+		 * specific loop. The dedicated loop runs the filter's
+		 * process() callback on its own thread, isolating its TID
+		 * and per-thread CPUTIME / cycle measurements. */
+		if (pw_properties_get(filter->properties, PW_KEY_NODE_LOOP_DYNAMIC) == NULL &&
+		    pw_properties_get(filter->properties, PW_KEY_NODE_LOOP_NAME) == NULL &&
+		    pw_properties_get(filter->properties, PW_KEY_NODE_LOOP_CLASS) == NULL)
+			pw_properties_set(filter->properties, PW_KEY_NODE_LOOP_DYNAMIC, "true");
 	}
 	if (flags & PW_FILTER_FLAG_DRIVER)
 		pw_properties_set(filter->properties, PW_KEY_NODE_DRIVER, "true");

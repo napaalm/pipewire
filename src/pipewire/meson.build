@@ -55,6 +55,7 @@ pipewire_sources = [
   'conf.c',
   'context.c',
   'control.c',
+  'fusion-graph.c',
   'core.c',
   'data-loop.c',
   'impl-device.c',
