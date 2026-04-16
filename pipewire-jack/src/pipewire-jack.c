@@ -1998,6 +1998,13 @@ static inline int check_sample_rate(struct client *c, struct spa_io_position *po
 	return c->sample_rate == sample_rate;
 }
 
+static inline uint64_t get_cputime_ns_local(struct spa_system *system)
+{
+	struct timespec ts;
+	spa_system_clock_gettime(system, CLOCK_THREAD_CPUTIME_ID, &ts);
+	return SPA_TIMESPEC_TO_NSEC(&ts);
+}
+
 static inline uint32_t cycle_run(struct client *c)
 {
 	uint64_t cmd;
@@ -2030,6 +2037,7 @@ static inline uint32_t cycle_run(struct client *c)
 		return 0;
 
 	activation->awake_time = get_time_ns(c->l->system);
+	activation->awake_cputime = get_cputime_ns_local(c->l->system);
 
 	if (SPA_UNLIKELY(c->rt.first)) {
 		if (c->thread_init_callback)
@@ -2148,6 +2156,12 @@ static inline void signal_sync(struct client *c)
 	old_status = SPA_ATOMIC_XCHG(activation->status, PW_NODE_ACTIVATION_FINISHED);
 	activation->finish_time = nsec;
 
+	uint64_t fin_cputime = get_cputime_ns_local(c->l->system);
+	uint64_t awake_cputime = activation->awake_cputime;
+	activation->finish_cputime = fin_cputime;
+	if (fin_cputime >= awake_cputime && awake_cputime != 0 && fin_cputime != 0)
+		SPA_ATOMIC_STORE(activation->prev_run_time, fin_cputime - awake_cputime);
+		
 	if (c->async || old_status != PW_NODE_ACTIVATION_AWAKE)
 		return;
 
@@ -4430,6 +4444,7 @@ jack_client_t * jack_client_open (const char *client_name,
 		pw_properties_set(client->props, PW_KEY_NODE_ALWAYS_PROCESS, "true");
 	if (pw_properties_get(client->props, PW_KEY_NODE_LOCK_QUANTUM) == NULL)
 		pw_properties_set(client->props, PW_KEY_NODE_LOCK_QUANTUM, "true");
+	pw_properties_set(client->props, PW_KEY_NODE_LOOP_DYNAMIC, "true");
 	pw_properties_set(client->props, PW_KEY_NODE_TRANSPORT_SYNC, "true");
 
 	client->node = pw_core_create_object(client->core,
