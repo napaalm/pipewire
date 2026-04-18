@@ -27,7 +27,7 @@ extern "C" {
  * version 5: driver nodes are scheduled on the client
  * version 6: client needs to set activation INACTIVE -> FINISHED
  */
-#define PW_VERSION_CLIENT_NODE			6
+#define PW_VERSION_CLIENT_NODE			7
 struct pw_client_node;
 
 #ifndef PW_API_CLIENT_NODE_IMPL
@@ -56,11 +56,12 @@ struct pw_client_node_buffer {
 #define PW_CLIENT_NODE_EVENT_PORT_SET_IO	9
 #define PW_CLIENT_NODE_EVENT_SET_ACTIVATION	10
 #define PW_CLIENT_NODE_EVENT_PORT_SET_MIX_INFO	11
-#define PW_CLIENT_NODE_EVENT_NUM		12
+#define PW_CLIENT_NODE_EVENT_SET_LOOP_GROUP	12
+#define PW_CLIENT_NODE_EVENT_NUM		13
 
 /** \ref pw_client_node events */
 struct pw_client_node_events {
-#define PW_VERSION_CLIENT_NODE_EVENTS		1
+#define PW_VERSION_CLIENT_NODE_EVENTS		2
 	uint32_t version;
 	/**
 	 * Notify of a new transport area
@@ -225,6 +226,35 @@ struct pw_client_node_events {
 			uint32_t mix_id,
 			uint32_t peer_id,
 			const struct spa_dict *props);
+
+	/**
+	 * Place the client-owned node into a named data-loop
+	 * group so that all members of the group share a
+	 * single data-loop thread, or remove it from any group
+	 * by passing NULL/empty string.
+	 *
+	 * The server emits this event when its graph-wide
+	 * fusion analysis decides the node belongs to a
+	 * particular co-location set. The client honours the
+	 * request by updating its local node's
+	 * PW_KEY_NODE_LOOP_GROUP property and re-acquiring its
+	 * data loop with that group; the per-context dynamic
+	 * data-loop allocator already deduplicates loops by
+	 * group name.
+	 *
+	 * The published TID of the local node will change as a
+	 * side effect of the relocation; the standard info
+	 * update path propagates that change back to the
+	 * server's view of the proxy, so the proxy's
+	 * PW_KEY_NODE_LOOP_TID matches the actual client
+	 * thread.
+	 *
+	 * \param group the desired group name, or NULL to
+	 *	leave the node ungrouped.
+	 *
+	 * Since version 7:2
+	 */
+	int (*set_loop_group) (void *data, const char *group);
 };
 
 #define PW_CLIENT_NODE_METHOD_ADD_LISTENER	0

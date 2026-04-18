@@ -673,6 +673,28 @@ static int client_node_demarshal_set_io(void *data, const struct pw_protocol_nat
 	return 0;
 }
 
+static int client_node_demarshal_set_loop_group(void *data,
+		const struct pw_protocol_native_message *msg)
+{
+	struct pw_proxy *proxy = data;
+	struct spa_pod_parser prs;
+	const char *group = NULL;
+
+	spa_pod_parser_init(&prs, msg->data, msg->size);
+	if (spa_pod_parser_get_struct(&prs,
+			SPA_POD_String(&group)) < 0)
+		return -EINVAL;
+
+	/* Empty string means "no group" -- normalise both encodings
+	 * (NULL and "") to a single canonical value the listener can
+	 * compare against. */
+	if (group != NULL && group[0] == '\0')
+		group = NULL;
+
+	pw_proxy_notify(proxy, struct pw_client_node_events, set_loop_group, 2, group);
+	return 0;
+}
+
 static int client_node_marshal_transport(void *data, int readfd, int writefd,
 		uint32_t mem_id, uint32_t offset, uint32_t size)
 {
@@ -918,6 +940,23 @@ client_node_marshal_set_io(void *data,
 			       SPA_POD_Int(memid),
 			       SPA_POD_Int(offset),
 			       SPA_POD_Int(size));
+	return pw_protocol_native_end_resource(resource, b);
+}
+
+static int
+client_node_marshal_set_loop_group(void *data, const char *group)
+{
+	struct pw_resource *resource = data;
+	struct spa_pod_builder *b;
+
+	b = pw_protocol_native_begin_resource(resource,
+			PW_CLIENT_NODE_EVENT_SET_LOOP_GROUP, NULL);
+
+	/* SPA_POD_String of NULL would crash the builder; canonicalise
+	 * to an empty string and let the demarshaller flip it back. */
+	spa_pod_builder_add_struct(b,
+			SPA_POD_String(group ? group : ""));
+
 	return pw_protocol_native_end_resource(resource, b);
 }
 
@@ -1202,6 +1241,7 @@ static const struct pw_client_node_events pw_protocol_native_client_node_event_m
 	.port_set_io = &client_node_marshal_port_set_io,
 	.set_activation = &client_node_marshal_set_activation,
 	.port_set_mix_info = &client_node_marshal_port_set_mix_info,
+	.set_loop_group = &client_node_marshal_set_loop_group,
 };
 
 static const struct pw_protocol_native_demarshal
@@ -1218,7 +1258,8 @@ pw_protocol_native_client_node_event_demarshal[PW_CLIENT_NODE_EVENT_NUM] =
 	[PW_CLIENT_NODE_EVENT_PORT_USE_BUFFERS] = { &client_node_demarshal_port_use_buffers, 0 },
 	[PW_CLIENT_NODE_EVENT_PORT_SET_IO] = { &client_node_demarshal_port_set_io, 0 },
 	[PW_CLIENT_NODE_EVENT_SET_ACTIVATION] = { &client_node_demarshal_set_activation, 0 },
-	[PW_CLIENT_NODE_EVENT_PORT_SET_MIX_INFO] = { &client_node_demarshal_port_set_mix_info, 0 }
+	[PW_CLIENT_NODE_EVENT_PORT_SET_MIX_INFO] = { &client_node_demarshal_port_set_mix_info, 0 },
+	[PW_CLIENT_NODE_EVENT_SET_LOOP_GROUP] = { &client_node_demarshal_set_loop_group, 0 },
 };
 
 static const struct pw_protocol_marshal pw_protocol_native_client_node_marshal = {

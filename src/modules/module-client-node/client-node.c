@@ -124,6 +124,19 @@ struct impl {
 
 	uint32_t bind_node_version;
 	uint32_t bind_node_id;
+
+	/* Last loop group that was published to the owning client via
+	 * the set_loop_group protocol event. Tracked here so the
+	 * info_changed listener can detect transitions and avoid
+	 * resending the same value on every unrelated info update.
+	 *
+	 * NULL means "no group has ever been published" (the client
+	 * was created with no group, or the daemon has not yet
+	 * decided one); a non-NULL malloced string means the value
+	 * the client was last told to use, which by the protocol
+	 * contract is also the value the proxy's
+	 * PW_KEY_NODE_LOOP_GROUP property currently advertises. */
+	char *published_loop_group;
 };
 
 #define pw_client_node_resource(r,m,v,...)	\
@@ -153,6 +166,8 @@ struct impl {
 	pw_client_node_resource(r,set_activation,0,__VA_ARGS__)
 #define pw_client_node_resource_port_set_mix_info(r,...)	\
 	pw_client_node_resource(r,port_set_mix_info,1,__VA_ARGS__)
+#define pw_client_node_resource_set_loop_group(r,...)	\
+	pw_client_node_resource(r,set_loop_group,2,__VA_ARGS__)
 
 static int update_params(struct params *p, uint32_t n_params, const struct spa_pod **params)
 {
@@ -1441,6 +1456,7 @@ static void node_free(void *data)
 
 	if (impl->data_source.fd != -1)
 		spa_system_close(data_system, impl->data_source.fd);
+	free(impl->published_loop_group);
 	free(impl);
 }
 
@@ -1712,15 +1728,148 @@ static void node_port_removed(void *data, struct pw_impl_port *port)
 	clear_port(impl, p);
 }
 
+/* Trivial spa_loop callbacks used by node_data_loop_changed to move
+ * impl->data_source between loops. spa_loop_*_source must run on the
+ * owning loop's thread; pw_loop_invoke(..., block=true) gives us the
+ * synchronisation. */
+static int do_remove_data_source(struct spa_loop *loop, bool async,
+		uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct spa_source *source = user_data;
+	spa_loop_remove_source(loop, source);
+	return 0;
+}
+
+static int do_add_data_source(struct spa_loop *loop, bool async,
+		uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct spa_source *source = user_data;
+	spa_loop_add_source(loop, source);
+	return 0;
+}
+
+/* The proxy node's data_loop was just swapped (typically by the
+ * subgraph-fusion pass relocating a remote proxy onto a shared
+ * dynamic data loop). The proxy carries two loop-bound resources:
+ *
+ *   - node->source: the "daemon -> client" eventfd. For remote
+ *     nodes this is NOT registered on any daemon-side loop (see
+ *     do_node_prepare's `if (!this->remote)` guard); the client
+ *     side has the fd via SCM_RIGHTS and listens on its own loop.
+ *     pw_impl_node_set_data_loop's design keeps the kernel fd open
+ *     across migration, so the client's dup stays valid. Nothing
+ *     to do here for it.
+ *
+ *   - impl->data_source: the "client -> daemon" wake-back. The
+ *     client writes to this fd when it has finished a cycle; the
+ *     daemon's data loop reads it and emits rt_complete on the
+ *     proxy node. This source IS registered on a loop (set in
+ *     node_initialized via spa_loop_add_source on impl->data_loop)
+ *     and that loop is the proxy node's data_loop. When the proxy
+ *     migrates, the source must follow, or rt_complete would fire
+ *     on the wrong thread (stale loop) and downstream rt-listeners
+ *     would observe a thread mismatch against node->data_loop.
+ *
+ * We're called from the main thread (pw_impl_node_set_data_loop
+ * itself runs there). spa_loop_*_source must run inside the
+ * owning-loop's thread, so dispatch each leg via a blocking
+ * pw_loop_invoke. The old loop is quiesced of this node's other
+ * sources at this point but is still running for any unrelated
+ * activity it carries -- the invoke serialises against that. */
+static void node_data_loop_changed(void *data, struct pw_loop *old_loop,
+		struct pw_loop *new_loop)
+{
+	struct impl *impl = data;
+
+	if (impl->data_source.fd < 0)
+		return;
+
+	pw_log_info("%p: rebinding wake-back source fd %d from loop '%s' to '%s'",
+			impl, impl->data_source.fd,
+			old_loop ? old_loop->name : "<none>",
+			new_loop->name);
+
+	if (old_loop != NULL)
+		pw_loop_invoke(old_loop, do_remove_data_source, SPA_ID_INVALID,
+				NULL, 0, true, &impl->data_source);
+
+	impl->data_loop = new_loop->loop;
+	impl->data_system = new_loop->system;
+
+	pw_loop_invoke(new_loop, do_add_data_source, SPA_ID_INVALID,
+			NULL, 0, true, &impl->data_source);
+}
+
+/* Detect a change in PW_KEY_NODE_LOOP_GROUP on the proxy and
+ * forward it to the owning client via the set_loop_group protocol
+ * event. The proxy property is what the server-side fusion pass
+ * stamps when it decides this node should join (or leave) a
+ * co-location group; the value is the daemon's intent, and the
+ * client honours it by re-acquiring its own data loop with that
+ * group. The proxy's TID property only updates after the client
+ * has actually relocated and published the new TID back via
+ * pw_client_node_update, so consumers that group on
+ * PW_KEY_NODE_LOOP_TID (notably module-deadline) never see
+ * fusion bookkeeping that the owning side has not committed to.
+ *
+ * We track impl->published_loop_group so that unrelated info
+ * changes (port additions, state transitions, ...) do not cause
+ * us to re-emit the same group repeatedly; the client handler is
+ * idempotent but spamming the wire on every recalc is wasteful. */
+static void node_info_changed(void *data, const struct pw_node_info *info)
+{
+	struct impl *impl = data;
+	const char *new_group;
+	bool changed;
+
+	if (impl->resource == NULL)
+		return;
+	/* The client must understand the event; older clients silently
+	 * ignored unknown event ids in the protocol but we want a clean
+	 * version gate so the wire never carries something the peer
+	 * cannot parse. */
+	if (impl->resource->version < 7)
+		return;
+	if (info == NULL || info->props == NULL)
+		return;
+
+	new_group = spa_dict_lookup(info->props, PW_KEY_NODE_LOOP_GROUP);
+	if (new_group != NULL && new_group[0] == '\0')
+		new_group = NULL;
+
+	if (new_group == NULL && impl->published_loop_group == NULL)
+		changed = false;
+	else if (new_group != NULL && impl->published_loop_group != NULL)
+		changed = !spa_streq(new_group, impl->published_loop_group);
+	else
+		changed = true;
+
+	if (!changed)
+		return;
+
+	pw_log_info("%p: forwarding loop-group '%s' -> '%s' to client",
+			impl,
+			impl->published_loop_group ?
+				impl->published_loop_group : "<none>",
+			new_group ? new_group : "<none>");
+
+	pw_client_node_resource_set_loop_group(impl->resource, new_group);
+
+	free(impl->published_loop_group);
+	impl->published_loop_group = new_group ? strdup(new_group) : NULL;
+}
+
 static const struct pw_impl_node_events node_events = {
 	PW_VERSION_IMPL_NODE_EVENTS,
 	.free = node_free,
 	.initialized = node_initialized,
+	.info_changed = node_info_changed,
 	.port_init = node_port_init,
 	.port_added = node_port_added,
 	.port_removed = node_port_removed,
 	.peer_added = node_peer_added,
 	.peer_removed = node_peer_removed,
+	.data_loop_changed = node_data_loop_changed,
 };
 
 static const struct pw_resource_events resource_events = {

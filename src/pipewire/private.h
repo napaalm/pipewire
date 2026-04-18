@@ -11,6 +11,7 @@
 #include <sys/types.h> /* for pthread_t */
 
 #include "pipewire/impl.h"
+#include "pipewire/fusion-cost.h"
 
 #include <spa/support/plugin.h>
 #include <spa/pod/builder.h>
@@ -525,6 +526,14 @@ struct pw_node_target {
 	struct pw_impl_node *node;
 	struct pw_node_activation *activation;
 	struct spa_system *system;
+	/* If non-NULL and equal to `system`, the consumer this target
+	 * points at lives on the same data-loop thread as the producer
+	 * that owns this target struct. trigger_target_v1 then bypasses
+	 * the eventfd write + epoll wake and dispatches the consumer's
+	 * process inline on the producer's stack. NULL means "always
+	 * use the eventfd path" and is the safe default. See
+	 * pw_impl_node_dispatch_inline. */
+	struct spa_system *src_system;
 	int fd;
 	int (*trigger)(struct pw_node_target *t, uint64_t nsec);
 	unsigned int active:1;
@@ -540,6 +549,9 @@ static inline void copy_target(struct pw_node_target *dst, const struct pw_node_
 	dst->system = src->system;
 	dst->fd = src->fd;
 	dst->trigger = src->trigger;
+	/* src_system is NOT copied: it identifies which loop the
+	 * *owner* of the destination target dispatches on, which is set
+	 * by the owner (pw_node_peer_ref) after copy_target returns. */
 }
 
 /* versions:
@@ -637,6 +649,38 @@ struct pw_node_activation {
 	uint32_t command;				/* next command */
 	uint32_t reposition_owner;			/* owner id with new reposition info, last one
 							 * to update wins */
+
+	/* Per-cycle CPU-cycle counters captured around the node's
+	 * spa_node_process callback. When the runtime can open a
+	 * thread-attached PERF_COUNT_HW_CPU_CYCLES counter, it reads
+	 * the count at the awake and finish points alongside the
+	 * existing CLOCK_THREAD_CPUTIME_ID captures, and prev_run_cycles
+	 * is set to (finish - awake) at the same point prev_run_time is.
+	 *
+	 * Cycle counts are frequency-invariant by construction: 1000
+	 * cycles is 1000 cycles regardless of the cpufreq state the
+	 * CPU was in. Consumers that want a frequency-invariant work
+	 * estimate (e.g. for SCHED_DEADLINE budget computation) can
+	 * derive it from prev_run_cycles divided by the CPU's known
+	 * maximum frequency, instead of inferring it from the
+	 * wall-clock prev_run_time which is sensitive to whatever
+	 * P-state the governor happened to pick.
+	 *
+	 * Zero means "no perf data available" -- either the kernel
+	 * refused perf_event_open (kernel.perf_event_paranoid > 1
+	 * with no CAP_PERFMON, an older kernel, or a non-Linux host),
+	 * the executor predates this field, or the read failed.
+	 * Consumers must treat zero as a "fall back on the existing
+	 * prev_run_time wall-clock value" signal.
+	 *
+	 * Fields appended at the end of pw_node_activation so old
+	 * clients with the smaller struct layout keep working: they
+	 * never read or write past the activation_size they were
+	 * built against, and the server writing into the trailing
+	 * region only affects readers that explicitly opt in. */
+	uint64_t awake_cycles;
+	uint64_t finish_cycles;
+	uint64_t prev_run_cycles;
 };
 
 static inline uint64_t get_time_ns(struct spa_system *system)
@@ -652,6 +696,16 @@ static inline uint64_t get_cputime_ns(struct spa_system *system)
 	spa_system_clock_gettime(system, CLOCK_THREAD_CPUTIME_ID, &ts);
 	return SPA_TIMESPEC_TO_NSEC(&ts);
 }
+
+/* Called when a producer's data-loop thread observes that its own
+ * process has finished and one of its targets needs to advance. The
+ * fast path activates when the target sits on the same data-loop
+ * thread as the producer: skip the eventfd write + epoll wake and
+ * dispatch the consumer's process inline on the producer's stack.
+ * The state machine is identical: pw_impl_node_dispatch_inline does
+ * the same CAS TRIGGERED -> AWAKE transition that node_on_fd_events
+ * would have done after waking. */
+int pw_impl_node_dispatch_inline(struct pw_node_target *t, uint64_t nsec);
 
 /* called from data-loop decrement the dependency counter of the target and when
  * there are no more dependencies, trigger the node. */
@@ -670,6 +724,18 @@ static inline int trigger_target_v1(struct pw_node_target *t, uint64_t nsec)
 					PW_NODE_ACTIVATION_NOT_TRIGGERED,
 					PW_NODE_ACTIVATION_TRIGGERED))) {
 			a->signal_time = nsec;
+			/* Same-loop fast path: when src_system was populated
+			 * by pw_node_peer_ref / pw_impl_node_set_data_loop
+			 * to mean "the producer that owns this target lives
+			 * on the same spa_system (and therefore the same OS
+			 * thread) as the consumer it points at", the
+			 * eventfd round-trip is pure overhead -- the next
+			 * thing the producer's epoll iteration would do is
+			 * read the byte we just wrote and call process_node
+			 * on this very thread. Skip both syscalls and
+			 * inline-dispatch instead. */
+			if (t->src_system != NULL && t->src_system == t->system)
+				return pw_impl_node_dispatch_inline(t, nsec);
 			if (SPA_UNLIKELY((r = spa_system_eventfd_write(t->system, t->fd, 1)) < 0)) {
 				pw_log_warn("%p: write failed %s", t->node, spa_strerror(r));
 				res = r;
@@ -732,6 +798,7 @@ void pw_node_peer_unref(struct pw_node_peer *peer);
 #define pw_impl_node_emit_driver_changed(n,o,d)		pw_impl_node_emit(n, driver_changed, 0, o, d)
 #define pw_impl_node_emit_peer_added(n,p)		pw_impl_node_emit(n, peer_added, 0, p)
 #define pw_impl_node_emit_peer_removed(n,p)		pw_impl_node_emit(n, peer_removed, 0, p)
+#define pw_impl_node_emit_data_loop_changed(n,o,nl)	pw_impl_node_emit(n, data_loop_changed, 1, o, nl)
 
 #define pw_impl_node_rt_emit(o,m,v,...) spa_hook_list_call(&o->rt_listener_list, struct pw_impl_node_rt_events, m, v, ##__VA_ARGS__)
 #define pw_impl_node_rt_emit_drained(n)			pw_impl_node_rt_emit(n, drained, 0)
@@ -858,6 +925,50 @@ struct pw_impl_node {
 
 	uint64_t driver_start;
 	uint64_t elapsed;		/* elapsed time in playing */
+
+	/* perf_event_open fd for PERF_COUNT_HW_CPU_CYCLES, attached
+	 * to the thread that runs spa_node_process. Opened lazily on
+	 * first dispatch so the fd binds to the data-loop thread
+	 * (perf_event_open with pid=0 attaches to the calling
+	 * thread). -1 means "not yet attempted", -2 means
+	 * "permanently disabled" (open failed and we won't retry,
+	 * e.g. because the kernel refused or perf_event_paranoid is
+	 * too high). When >= 0 it is read once at awake and once at
+	 * finish; the delta is stamped into the activation's
+	 * prev_run_cycles. */
+	int cycle_fd;
+
+	/* Per-node sliding-window WCET estimator used by the subgraph-
+	 * fusion cost model in context.c (Sarkar 1989 §5.3
+	 * internalisation criterion). Each call to
+	 * pw_context_recalc_graph reads rt.target.activation->prev_run_time
+	 * and folds it into the sliding mean via
+	 * pw_fusion_window_update(); the window's `count` field tracks
+	 * how many measurements have accumulated so the cost model can
+	 * refuse to apply the inequality until the estimate is warm
+	 * (Gerasoulis-Yang 1993 chain-only fallback runs in the
+	 * meantime).
+	 *
+	 * The samples buffer is allocated lazily on first call from
+	 * context.c, sized to the auto-derived N for the current cycle
+	 * period; reallocated when the period changes meaningfully.
+	 * Cleared (count reset to 0, sum to 0) when the node migrates
+	 * to a new data loop -- the previous owning thread's
+	 * prev_run_time is no longer representative.
+	 *
+	 * Owned by the main loop; nothing in the RT path reads or
+	 * writes these fields. fusion_window.samples is freed in
+	 * pw_impl_node's destroy path. */
+	struct pw_fusion_window fusion_window;
+
+	/* The most recent decision the fusion pass applied to the
+	 * component this node belongs to. Replayed back into the
+	 * cost model on the next scan via
+	 * pw_fusion_graph_set_prev_decision so the hysteresis path
+	 * can suppress flip-flops near Sarkar's threshold. SPLIT
+	 * (the default) means "no prior decision recorded yet". */
+	enum pw_fusion_decision fusion_prev_decision;
+
 
 	void *user_data;                /**< extra user data */
 };

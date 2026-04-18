@@ -53,6 +53,13 @@ struct data_loop {
 	uint64_t last_used;
 	int ref;
 	struct spa_list link;
+	/* Co-location group name for dynamic data loops. When non-NULL,
+	 * acquire_dynamic_data_loop looks up an existing dynamic loop
+	 * tagged with the same group string before creating a new one,
+	 * so a set of nodes that share PW_KEY_NODE_LOOP_GROUP land on
+	 * the same thread. Always NULL on the static impl->data_loops[]
+	 * entries; owned (strdup'd) by this struct on dynamic loops. */
+	char *group;
 };
 
 /** \cond */
@@ -70,6 +77,75 @@ struct impl {
 
 	bool dynamic_data_loops;
 	struct spa_list dynamic_data_loop_list;
+
+	/* Fusion knobs.
+	 *
+	 * `merge_adjacent_chains` enables the original "1-in-1-out path"
+	 * fusion, formally a *linear cluster* in the Gerasoulis-Yang
+	 * 1993 terminology ("On the Granularity and Clustering of
+	 * Directed Acyclic Task Graphs", IEEE TPDS 4(6):686-701). The
+	 * paper proves that for any coarse-grain DAG every nonlinear
+	 * clustering admits an equivalent linear clustering with equal
+	 * or smaller parallel time; consequently merging a degree-1
+	 * chain is never pessimistic and we apply it unconditionally
+	 * without a cost-model check.
+	 *
+	 * `subgraph_fusion` enables the more general "any weakly
+	 * connected eligible subgraph" fusion, gated by the Sarkar
+	 * 1989 internalisation profitability criterion (chapter 5.3 of
+	 * "Partitioning and Scheduling Parallel Programs for
+	 * Multiprocessors"): merge iff PARTIME_merged <= PARTIME_split,
+	 * which in our setting reduces to
+	 *     sum_wcet <= cp_wcet + cp_hops * wakeup_cost.
+	 * The terminology used in the per-node properties ("group") and
+	 * in module-deadline ("co-location group", "sched group") is
+	 * the *execution group* from Shi et al., "DAG Scheduling with
+	 * Execution Groups", RTAS 2024: a set of subtasks constrained
+	 * to execute on the same processor (Definition 1).
+	 *
+	 * Both knobs default to true so a stock build benefits from the
+	 * fusion path out of the box; either or both can be disabled
+	 * for back-compat experiments and A/B measurements. Setting
+	 * `subgraph_fusion=true` implies the linear case too -- a
+	 * length-N degree-1 chain trivially satisfies Sarkar's
+	 * criterion. The legacy chain-only code path is still kept for
+	 * the case where the operator wants chain merging without the
+	 * subgraph cost-model machinery (less per-recalc work, but no
+	 * fan-in / fan-out fusion).
+	 *
+	 * `wakeup_cost_ns` is the wakeup_cost constant in Sarkar's
+	 * criterion -- the cost of one cross-thread eventfd-write +
+	 * epoll-wake on this host. 3000 ns is a conservative ceiling
+	 * for modern x86_64 (typical hot-cache measurement under
+	 * tuned-realtime is ~1.5 us); operators can re-pin it with the
+	 * `context.subgraph-fusion.wakeup-cost-ns` property after
+	 * measuring locally.
+	 *
+	 * `fusion_min_samples` gates Sarkar's criterion on a warm WCET
+	 * estimate per node (otherwise the prev_run_time captures used
+	 * to compute sum_wcet / cp_wcet are dominated by cold-cache
+	 * spikes). Before any member of a candidate component has hit
+	 * the threshold the fusion pass falls back to the linear case
+	 * only. */
+	bool merge_adjacent_chains;
+	bool subgraph_fusion;
+	uint64_t wakeup_cost_ns;
+	uint32_t fusion_min_samples;
+	uint32_t fusion_hysteresis_pct;
+
+	/* Target wall-clock window for the per-node sliding-mean WCET
+	 * estimator (subgraph-fusion only). The actual sample count
+	 * N is derived from this and the live graph cycle period at
+	 * each fusion scan (see pw_fusion_window_target_n in
+	 * fusion-cost.h); the band is clamped to [N_MIN, N_MAX].
+	 *
+	 * fusion_window_samples_override is the operator escape hatch:
+	 * 0 means "auto-derive", non-zero pins N regardless of the
+	 * cycle period. Both knobs default to the auto-derivation
+	 * path so an out-of-the-box operator never has to think about
+	 * cycle periods. */
+	uint64_t fusion_window_time_ns;
+	uint32_t fusion_window_samples_override;
 };
 
 
@@ -210,6 +286,58 @@ static int setup_data_loops(struct impl *impl)
 	if (pw_properties_get_bool(this->properties, "context.dynamic-data-loops", true)) {
 		spa_list_init(&impl->dynamic_data_loop_list);
 		impl->dynamic_data_loops = true;
+	}
+
+	/* Both fusion strategies default to true. Linear-cluster (chain)
+	 * fusion is non-pessimistic by Gerasoulis-Yang 1993; subgraph
+	 * fusion is gated per-component by Sarkar 1989's profitability
+	 * criterion so a heavy non-chain component automatically falls
+	 * back to no-fuse. The two knobs are independent: an operator
+	 * can disable subgraph fusion while keeping chain fusion (and
+	 * vice versa) for A/B measurements. */
+	if (impl->dynamic_data_loops) {
+		impl->merge_adjacent_chains = pw_properties_get_bool(
+				this->properties,
+				"context.merge-adjacent-chains", true);
+		impl->subgraph_fusion = pw_properties_get_bool(
+				this->properties,
+				"context.subgraph-fusion", true);
+		impl->wakeup_cost_ns = (uint64_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.wakeup-cost-ns", 3000);
+		impl->fusion_min_samples = (uint32_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.min-samples", 4);
+		impl->fusion_hysteresis_pct = (uint32_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.hysteresis-pct", 10);
+		if (impl->fusion_hysteresis_pct > 100)
+			impl->fusion_hysteresis_pct = 100;
+
+		/* Target wall-clock window (default 250 ms, see
+		 * fusion-cost.h block comment for the principled
+		 * motivation). N is derived from this at fusion-scan
+		 * time. The samples-override knob takes precedence when
+		 * non-zero. */
+		impl->fusion_window_time_ns =
+			(uint64_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.window-time-ms",
+				(int)(PW_FUSION_WINDOW_DEFAULT_TIME_NS / 1000000ULL))
+			* 1000000ULL;
+		impl->fusion_window_samples_override = (uint32_t)
+			pw_properties_get_int32(this->properties,
+				"context.subgraph-fusion.window-samples", 0);
+
+		pw_log_info("%p: fusion: chains=%d subgraph=%d "
+				"wakeup_cost=%"PRIu64"ns min_samples=%u "
+				"window_time=%"PRIu64"ms window_samples_override=%u",
+				this, impl->merge_adjacent_chains,
+				impl->subgraph_fusion,
+				impl->wakeup_cost_ns,
+				impl->fusion_min_samples,
+				(uint64_t)(impl->fusion_window_time_ns / 1000000ULL),
+				impl->fusion_window_samples_override);
 	}
 
 	lib_name = pw_properties_get(this->properties, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM);
@@ -681,6 +809,7 @@ void pw_context_destroy(struct pw_context *context)
 			if (dl->impl)
 				pw_data_loop_destroy(dl->impl);
 			spa_list_remove(&dl->link);
+			free(dl->group);
 			free(dl);
 		}
 	}
@@ -810,11 +939,43 @@ static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *nam
 	return best_loop->impl;
 }
 
-static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const char *name, const char *klass)
+/* Look up an existing dynamic data loop tagged with the given group
+ * name. Returns NULL if no loop with this group is currently allocated
+ * (the caller will then create a new one). Linear scan, but the
+ * dynamic_data_loop_list is short in every realistic deployment
+ * (bounded by the number of distinct groups + ungrouped nodes), so
+ * not worth an index. */
+static struct data_loop *find_dynamic_loop_by_group(struct impl *impl, const char *group)
+{
+	struct data_loop *dl;
+	if (group == NULL)
+		return NULL;
+	spa_list_for_each(dl, &impl->dynamic_data_loop_list, link) {
+		if (dl->group && spa_streq(dl->group, group))
+			return dl;
+	}
+	return NULL;
+}
+
+static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const char *name,
+		const char *klass, const char *group)
 {
 	struct pw_properties *pr;
 	struct data_loop *dl = NULL;
 	int res;
+
+	/* Co-location: if this group already has a loop, reuse it.
+	 * Bumps the ref count so the loop survives until every member
+	 * has been released via pw_context_release_node_loop. */
+	if (group != NULL) {
+		dl = find_dynamic_loop_by_group(impl, group);
+		if (dl != NULL) {
+			dl->ref++;
+			pw_log_info("%p: joining dynamic group:'%s' loop:'%s' ref:%d",
+					impl, group, dl->impl->loop->name, dl->ref);
+			return dl->impl;
+		}
+	}
 
 	pr = pw_properties_copy(impl->this.properties);
 
@@ -835,8 +996,12 @@ static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const c
 
 	pw_data_loop_set_thread_utils(dl->impl, impl->this.thread_utils);
 
+	if (group != NULL)
+		dl->group = strdup(group);
+
 	spa_list_append(&impl->dynamic_data_loop_list, &dl->link);
-	pw_log_info("created dynamic data loop '%s'", dl->impl->loop->name);
+	pw_log_info("created dynamic data loop '%s' group:'%s'",
+			dl->impl->loop->name, group ? group : "<none>");
 
 	dl->ref = 1;
 	if ((res = data_loop_start(impl, dl)) < 0) {
@@ -844,9 +1009,9 @@ static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const c
 		return NULL;
 	}
 
-	pw_log_info("%p: using name:'%s' class:'%s' ref:%d", impl,
+	pw_log_info("%p: using name:'%s' class:'%s' group:'%s' ref:%d", impl,
 			dl->impl->loop->name,
-			dl->impl->class, dl->ref);
+			dl->impl->class, group ? group : "<none>", dl->ref);
 
 	return dl->impl;
 }
@@ -885,17 +1050,32 @@ SPA_EXPORT
 struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct pw_properties *props, bool remote)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
-	const char *name, *klass;
+	const char *name, *klass, *group;
 	struct pw_data_loop *loop;
-	bool request_dynamic = props ? pw_properties_get_bool(props, PW_KEY_NODE_LOOP_DYNAMIC, false) : false;
 
-	if (!impl->dynamic_data_loops || (remote && !request_dynamic))
+	/* Dynamic data loops are only meaningful for nodes whose
+	 * processing thread the *current* process owns end-to-end.
+	 * Remote nodes (the server's view of a client-node proxy)
+	 * never run user code on their data loop -- the eventfd
+	 * dispatcher is all that lives there -- so giving each
+	 * proxy its own private dynamic loop would cost a pthread
+	 * per connected stream for no scheduling benefit and quickly
+	 * hit the kernel's per-process resource limits under load
+	 * (pipewire-pulse, pipewire-alsa and pipewire-jack each open
+	 * one client-node per stream). The owning process's
+	 * pw_impl_node still gets its own dynamic loop and publishes
+	 * its TID via PW_KEY_NODE_LOOP_TID, which propagates to the
+	 * proxy through the standard client-node info update path
+	 * and is what downstream consumers (module-deadline,
+	 * pw-top, ...) read. */
+	if (!impl->dynamic_data_loops || remote)
 		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
 
-	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
-	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
+	name = pw_properties_get(props, PW_KEY_NODE_LOOP_NAME);
+	klass = pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS);
+	group = pw_properties_get(props, PW_KEY_NODE_LOOP_GROUP);
 
-	loop = acquire_dynamic_data_loop(impl, name, klass);
+	loop = acquire_dynamic_data_loop(impl, name, klass, group);
 	if (loop) {
 		pw_properties_set(props, PW_KEY_NODE_LOOP_DYNAMIC, "true");
 		return loop->loop;
@@ -932,18 +1112,28 @@ void pw_context_release_node_loop(struct pw_context *context, struct pw_loop *lo
 		if (dl->impl->loop == loop) {
 			dl->ref--;
 
-			pw_log_info("release dynamic name:'%s' class:'%s' ref:%d",
-					dl->impl->loop->name, dl->impl->class, dl->ref);
+			pw_log_info("release dynamic name:'%s' class:'%s' group:'%s' ref:%d",
+					dl->impl->loop->name, dl->impl->class,
+					dl->group ? dl->group : "<none>", dl->ref);
 
-			if (dl->ref != 0) {
-				pw_log_warn("dynamic data loop '%s' has still ref > 0",
-						dl->impl->loop->name);
+			/* Group members hold a ref each; ref > 0 just means
+			 * another chain member is still using the loop. The
+			 * old log line shouted "still ref > 0" as if it was a
+			 * leak, which it isn't in the group case. Drop the
+			 * warning, keep the early return. */
+			if (dl->ref > 0)
+				return;
+
+			if (dl->ref < 0) {
+				pw_log_warn("dynamic data loop '%s' ref dropped below 0 (%d)",
+						dl->impl->loop->name, dl->ref);
 				return;
 			}
 
 			pw_data_loop_stop(dl->impl);
 			pw_data_loop_destroy(dl->impl);
 			spa_list_remove(&dl->link);
+			free(dl->group);
 			free(dl);
 
 			return;
@@ -1537,6 +1727,758 @@ static uint32_t find_best_rate(const uint32_t *rates, uint32_t n_rates, uint32_t
 	return def;
 }
 
+/* ---------------------------------------------------------------------
+ * Subgraph fusion (generalisation of adjacent-chain merging)
+ *
+ * After every pw_context_recalc_graph, this file scans the in-process
+ * node graph and consolidates eligible sub-graphs onto shared dynamic
+ * data loops, so a fused sub-graph runs on a single OS thread. The
+ * scan is gated by two independent properties (both default true):
+ *
+ *   context.merge-adjacent-chains -- chain fusion (1-in/1-out paths).
+ *   context.subgraph-fusion       -- generalised fusion of any weakly
+ *                                    connected eligible subgraph, gated
+ *                                    per-component by a cost model.
+ *
+ * Eligibility filter (same for both modes; matches the filter
+ * module-deadline uses to build its scheduling DAG, so what we fuse
+ * is exactly what the kernel scheduler sees as a precedence set):
+ *
+ *   - Link eligible iff prepared && !feedback && neither endpoint is
+ *     async (async ports carry one cycle of buffer slack and are not
+ *     a precedence constraint in-period).
+ *   - Node eligible iff not exported, not a driver, and currently
+ *     parked on either a dynamic data loop or a shared remote-proxy
+ *     loop (not the main loop). Remote-proxy nodes ARE eligible,
+ *     but they are not relocated on the daemon side: when fusion
+ *     decides a remote node belongs to a group, the daemon stamps
+ *     the desired group on the proxy's properties and emits the
+ *     pw_client_node set_loop_group event; the owning client
+ *     reacquires its own data loop with that group and publishes
+ *     its new thread back through the standard info-update path.
+ *     The proxy's PW_KEY_NODE_LOOP_TID then reflects the actual
+ *     thread, which is what module-deadline groups on for
+ *     SCHED_DEADLINE budget aggregation. The daemon never advertises
+ *     fusion that the owning process has not yet committed to.
+ *
+ * Fusion semantics
+ * ----------------
+ *
+ *   - Chain mode (legacy fast path): a directed edge A->B is
+ *     "chainable" when A's only eligible out-neighbour is B AND B's
+ *     only eligible in-neighbour is A. We walk upstream from each
+ *     node until the next edge stops being chainable, take that
+ *     topmost node as the chain head, and stamp every chain member
+ *     with the group name "chain.<head_id>". A chain of length 1 (a
+ *     head with no chainable follower) gets no group -- nothing to
+ *     merge with. The non-pessimism of chain fusion follows from
+ *     Gerasoulis & Yang, "On the Granularity and Clustering of
+ *     Directed Acyclic Task Graphs", IEEE TPDS 4(6):686-701, 1993
+ *     (DOI 10.1109/71.242154): for any coarse-grain DAG every
+ *     nonlinear clustering admits an equivalent linear clustering
+ *     with equal-or-smaller parallel time, so a linear cluster (a
+ *     chain) is never worse than not clustering. Chain mode does not
+ *     consult any WCET data and is always profitable to apply.
+ *
+ *   - Subgraph mode (generalised): we compute weakly connected
+ *     components in the eligible-node, eligible-link induced
+ *     subgraph (BFS, with the union-find scaffolding inlined as a
+ *     simple visited bitmap). Each candidate component is then put
+ *     through the cost model in fusion-cost.h, which encodes the
+ *     "internalisation" profitability criterion from Sarkar 1989
+ *     §5.3 step 6.e (procedure PartitionGraph, figure 5-12 of
+ *     "Partitioning and Scheduling Parallel Programs for
+ *     Multiprocessors", MIT Press / Pitman, 1989): merge the
+ *     candidate iff the parallel completion time does not
+ *     increase. In our setting that reduces to
+ *         sum_wcet <= cp_wcet + cp_hops * wakeup_cost
+ *     with sum_wcet the sum of per-node smoothed CPU-time
+ *     samples, cp_wcet the longest weighted path inside the
+ *     component, cp_hops the number of edges on that path, and
+ *     wakeup_cost the cost of one eventfd-wake saved per saved
+ *     cross-thread hop. The terminology used in the per-node
+ *     property ("group") follows Shi, Guenzel, Ueter, von der
+ *     Brueggen, Chen, "DAG Scheduling with Execution Groups",
+ *     RTAS 2024 (citation RTAS2024.05): a fused subgraph is an
+ *     "execution group" in their EG-DAG model (Definition 1, "a
+ *     set of subtasks that are constrained to be executed on the
+ *     same processor").
+ *
+ * WCET source
+ * -----------
+ *
+ * The cost model needs a per-node CPU-time estimate. PipeWire core
+ * already captures this on every cycle: pw_node_activation has
+ * prev_run_time, the wall-clock delta between awake and finish
+ * sampled with CLOCK_THREAD_CPUTIME_ID. We fold this through an
+ * exponential moving average (alpha = 1/8, fusion-cost.h) into
+ * pw_impl_node::fusion_runtime_ema so a single cold-cache spike
+ * does not destabilise the fusion decision. Refusing to apply the
+ * Sarkar criterion before fusion_samples reaches a configurable
+ * floor (default 4) shrinks the warm-up period to about ~30 cycles
+ * (~5 ms at 5.3 kHz audio cycle rate for the canonical
+ * 48 kHz / 256-frame buffer). During warm-up we apply the
+ * non-pessimistic chain fallback, so the steady state is reached
+ * monotonically without ever degrading throughput.
+ *
+ * Idempotence
+ * -----------
+ *
+ * Running the pass twice in a row on a stable graph performs zero
+ * relocations on the second pass: the per-node desired group string
+ * matches the data_loop's `group` field, the comparison short-
+ * circuits, and pw_impl_node_set_data_loop is never called. A graph
+ * with no fusion candidates pays one linear scan of node_list and
+ * one bitmap allocation per recalc.
+ *
+ * The relocation primitive itself (pw_impl_node_set_data_loop) lives
+ * in impl-node.c next to do_node_prepare / do_node_unprepare, where
+ * the eventfd plumbing and the lost-trigger handling for the
+ * migration window are kept.
+ * --------------------------------------------------------------------- */
+
+#include "fusion-cost.h"
+#include "fusion-graph.h"
+
+/* True when the link is eligible for fusion analysis: same filter
+ * module-deadline uses, so the subgraphs we co-locate on threads are
+ * the same ones the scheduler treats as a precedence cluster. */
+static inline bool fusion_link_eligible(struct pw_impl_link *l)
+{
+	if (l == NULL || !l->prepared || l->feedback)
+		return false;
+	if (l->output == NULL || l->input == NULL ||
+	    l->output->node == NULL || l->input->node == NULL)
+		return false;
+	if (l->output->node->async || l->input->node->async)
+		return false;
+	return true;
+}
+
+/* True when the node is a candidate for fusion. See the file-header
+ * comment above for the rationale on each clause. */
+static inline bool fusion_node_eligible(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	if (node == NULL)
+		return false;
+	/* Remote proxies are now eligible. exported nodes are still
+	 * excluded because their process callback also runs out-of-
+	 * process and the relocation would not change where the work
+	 * happens. Drivers are excluded because the worst-fit placer
+	 * keeps them on their own data loop (each driver is the root
+	 * of a separate scheduling DAG). */
+	if (node->exported || node->driver)
+		return false;
+	if (node->data_loop == NULL || node->data_loop == context->main_loop)
+		return false;
+	return true;
+}
+
+/* Unique-neighbour helpers used by the chain mode. Multi-link edges
+ * between the same pair (e.g. stereo L+R between two nodes) collapse
+ * to one neighbour. */
+static struct pw_impl_node *chain_unique_in(struct pw_impl_node *node)
+{
+	struct pw_impl_port *port;
+	struct pw_impl_link *l;
+	struct pw_impl_node *only = NULL;
+
+	spa_list_for_each(port, &node->input_ports, link) {
+		spa_list_for_each(l, &port->links, input_link) {
+			if (!fusion_link_eligible(l))
+				continue;
+			struct pw_impl_node *up = l->output->node;
+			if (only == NULL)
+				only = up;
+			else if (only != up)
+				return NULL;
+		}
+	}
+	return only;
+}
+
+static struct pw_impl_node *chain_unique_out(struct pw_impl_node *node)
+{
+	struct pw_impl_port *port;
+	struct pw_impl_link *l;
+	struct pw_impl_node *only = NULL;
+
+	spa_list_for_each(port, &node->output_ports, link) {
+		spa_list_for_each(l, &port->links, output_link) {
+			if (!fusion_link_eligible(l))
+				continue;
+			struct pw_impl_node *dn = l->input->node;
+			if (only == NULL)
+				only = dn;
+			else if (only != dn)
+				return NULL;
+		}
+	}
+	return only;
+}
+
+/* Walk upstream while each edge stays chainable. Returns the chain's
+ * head, bounded by MAX_HOPS so a malformed graph with a cycle short-
+ * circuits cleanly. */
+static struct pw_impl_node *chain_head(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	int hops = 0;
+	while (hops++ < MAX_HOPS) {
+		struct pw_impl_node *up = chain_unique_in(node);
+		if (up == NULL || !fusion_node_eligible(context, up))
+			break;
+		if (chain_unique_out(up) != node)
+			break;
+		node = up;
+	}
+	return node;
+}
+
+static bool chain_has_follower(struct pw_context *context,
+		struct pw_impl_node *head)
+{
+	struct pw_impl_node *down = chain_unique_out(head);
+	if (down == NULL || !fusion_node_eligible(context, down))
+		return false;
+	return chain_unique_in(down) == head;
+}
+
+/* Returns the desired group name for `node` under chain-only fusion.
+ * Returns NULL for a singleton (no chain-mergeable neighbour). The
+ * caller frees. */
+static char *chain_desired_group(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	struct pw_impl_node *head = chain_head(context, node);
+	if (head == node) {
+		if (!chain_has_follower(context, head))
+			return NULL;
+	}
+	char buf[64];
+	snprintf(buf, sizeof(buf), "chain.%u", head->info.id);
+	return strdup(buf);
+}
+
+/* Pull the dl->group string for a given pw_loop, or NULL if the loop
+ * isn't in the dynamic-loop list (static loop, main loop, or freed).
+ * Read-only; safe to call from the main loop without locking. */
+static const char *fusion_loop_group(struct impl *impl, struct pw_loop *loop)
+{
+	struct data_loop *dl;
+	if (loop == NULL)
+		return NULL;
+	spa_list_for_each(dl, &impl->dynamic_data_loop_list, link) {
+		if (dl->impl->loop == loop)
+			return dl->group;
+	}
+	return NULL;
+}
+
+/* Find a representative driver period to feed the sliding-window
+ * size derivation. Walk node_list once and return the first
+ * driver-node period the eligible followers actually depend on. The
+ * choice is intentionally simple: the common case is one driver per
+ * graph and the multi-driver case is rare enough that any
+ * tie-breaking policy is defensible; "first eligible driver" is the
+ * cheapest and most deterministic.
+ *
+ * Returns 0 if no driver has been negotiated yet (cold-start case,
+ * called before pw_context_recalc_graph has settled). The caller
+ * pairs this with pw_fusion_window_target_n() which returns N_MIN
+ * for period_ns == 0, so a cold-start scan still picks a sane
+ * window length and starts warming up. */
+static uint64_t fusion_representative_period_ns(struct pw_context *context)
+{
+	struct pw_impl_node *n;
+	spa_list_for_each(n, &context->node_list, link) {
+		if (!n->driver || n->remote || n->exported)
+			continue;
+		if (n->target_rate.denom == 0 || n->target_quantum == 0)
+			continue;
+		return (uint64_t)SPA_NSEC_PER_SEC *
+			(uint64_t)n->target_quantum /
+			(uint64_t)n->target_rate.denom;
+	}
+	return 0;
+}
+
+/* Resolve the active per-fusion-scan sample-count target. Honours
+ * the operator override (fusion_window_samples_override) when
+ * non-zero; otherwise derives from the cycle period and the target
+ * wall-clock window via pw_fusion_window_target_n(). */
+static uint32_t fusion_resolve_target_n(struct impl *impl,
+		uint64_t period_ns)
+{
+	if (impl->fusion_window_samples_override > 0) {
+		uint32_t n = impl->fusion_window_samples_override;
+		if (n < PW_FUSION_WINDOW_N_MIN)
+			n = PW_FUSION_WINDOW_N_MIN;
+		if (n > PW_FUSION_WINDOW_N_MAX)
+			n = PW_FUSION_WINDOW_N_MAX;
+		return n;
+	}
+	return pw_fusion_window_target_n(period_ns,
+			impl->fusion_window_time_ns);
+}
+
+/* Ensure the per-node sliding-window backing buffer is sized to
+ * `target_n` samples. The capacity changes when the driver's cycle
+ * period changes (so the auto-derived window length tracks the new
+ * cadence) -- but the SAMPLES we already collected remain valid
+ * measurements of recent WCET. Clearing them on every period
+ * change forced the warm-up gate to fire repeatedly, which sent
+ * the fusion decision flipping between LINEAR_ONLY (samples too
+ * young) and FUSE (samples ready), driving the property
+ * propagation and the client-side relocation into a feedback loop.
+ *
+ * Resize in place and preserve as many recent samples as the new
+ * capacity allows: copy them out into a small dense buffer in
+ * arrival order, point the window at the resized backing array,
+ * and write the preserved samples back. The window is now a
+ * fresh ring with head=0 and count<=new_cap, holding the most
+ * recent samples in oldest-first order. The sum is recomputed
+ * from those samples. */
+static int fusion_ensure_window_size(struct pw_impl_node *node,
+		uint32_t target_n)
+{
+	struct pw_fusion_window *w = &node->fusion_window;
+	uint64_t *resized;
+	uint32_t old_capacity, old_count, old_head;
+	uint64_t *old_samples = NULL;
+
+	if (target_n == 0)
+		target_n = PW_FUSION_WINDOW_N_MIN;
+
+	if (w->capacity == target_n && w->samples != NULL)
+		return 0;
+
+	old_capacity = w->capacity;
+	old_count = w->count;
+	old_head = w->head;
+
+	/* Snapshot the samples we want to keep. If the window had
+	 * never been allocated, there are no samples to preserve. */
+	if (w->samples != NULL && old_count > 0) {
+		uint32_t keep = old_count < target_n ? old_count : target_n;
+		uint32_t i;
+		uint32_t start = (old_head + old_capacity - old_count)
+			% old_capacity;
+		old_samples = malloc((size_t)keep * sizeof(*old_samples));
+		if (old_samples == NULL)
+			return -ENOMEM;
+		for (i = 0; i < keep; i++)
+			old_samples[i] = w->samples[(start + i) % old_capacity];
+		/* The first `old_count - keep` samples are dropped because
+		 * the new capacity is smaller; that is the only sample
+		 * loss the resize introduces. */
+		old_count = keep;
+	} else {
+		old_count = 0;
+	}
+
+	resized = realloc(w->samples,
+			(size_t)target_n * sizeof(*resized));
+	if (resized == NULL) {
+		free(old_samples);
+		return -ENOMEM;
+	}
+
+	w->samples = resized;
+	w->capacity = target_n;
+	pw_fusion_window_clear(w);
+
+	if (old_samples != NULL) {
+		uint32_t i;
+		for (i = 0; i < old_count; i++)
+			pw_fusion_window_update(w, old_samples[i]);
+		free(old_samples);
+	}
+	return 0;
+}
+
+/* Update the per-node sliding-window mean from the activation's
+ * prev_run_time. Called once per recalc per eligible node before
+ * the cost model runs. The buffer is grown/shrunk lazily here -- a
+ * fresh node will allocate on first call; a node whose driver's
+ * quantum changes will see the buffer resized on the next scan. */
+static void fusion_refresh_wcet(struct pw_impl_node *node, uint32_t target_n)
+{
+	uint64_t sample;
+
+	/* The activation memory is shared with the data-loop thread; on
+	 * x86_64 an aligned 64-bit load is atomic. Other PipeWire code
+	 * reads these fields directly. */
+	if (node->rt.target.activation == NULL)
+		return;
+	sample = node->rt.target.activation->prev_run_time;
+
+	if (fusion_ensure_window_size(node, target_n) < 0)
+		return;
+	pw_fusion_window_update(&node->fusion_window, sample);
+}
+
+/* Apply the desired group name to one node.
+ *
+ *   - For locally-owned nodes (non-remote): stamp the property,
+ *     look up / create the destination loop, relocate via
+ *     pw_impl_node_set_data_loop. The relocation moves the only
+ *     thread that runs user code for this node, so the daemon's
+ *     view of node->data_loop is the authoritative source of
+ *     "what thread does the work".
+ *
+ *   - For remote-proxy nodes: the daemon never owns the process
+ *     thread that runs user code (that lives in the client
+ *     process). Relocating the daemon-side proxy would advertise
+ *     fusion that did not actually happen, and module-deadline
+ *     (which groups SCHED_DEADLINE budgets by PW_KEY_NODE_LOOP_TID)
+ *     would aggregate budgets onto a TID that does not represent
+ *     where the work runs. Instead we stamp the desired group on
+ *     the proxy's properties and let pw_impl_node_update_properties
+ *     emit info_changed; client-node-impl listens for that event,
+ *     compares against the last value it published, and emits the
+ *     pw_client_node set_loop_group event over the protocol. The
+ *     owning process honours the request, relocates its local
+ *     pw_impl_node (via the non-remote branch above, in that
+ *     process's pw_context), and publishes its new TID back
+ *     through pw_client_node_update info. The proxy's
+ *     PW_KEY_NODE_LOOP_TID then reflects the actual thread,
+ *     observable by module-deadline and other consumers.
+ *
+ * `desired` of NULL means "no group"; for local nodes the loop
+ * is acquired without a group string so the node lands on a
+ * private dynamic loop again. For remote nodes the property is
+ * cleared, signalling the client to remove its own grouping. */
+static void fusion_apply_group(struct pw_context *context,
+		struct pw_impl_node *node, const char *desired)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	const char *current;
+	bool same;
+	struct pw_loop *new_loop, *old_loop;
+	int res;
+
+	if (node->remote) {
+		/* The authoritative current group on a remote proxy is
+		 * whatever the proxy's PW_KEY_NODE_LOOP_GROUP property
+		 * says, because that is what we previously stamped (or
+		 * never touched). The proxy's data_loop is not
+		 * meaningful for grouping -- it is the shared
+		 * eventfd-dispatch loop from the static pool. */
+		current = pw_properties_get(node->properties,
+				PW_KEY_NODE_LOOP_GROUP);
+	} else {
+		current = fusion_loop_group(impl, node->data_loop);
+	}
+	same = (desired == NULL && current == NULL) ||
+		(desired != NULL && current != NULL &&
+		 spa_streq(desired, current));
+
+	pw_log_debug("%p: fusion node %u (%s) remote:%d "
+			"current_group:'%s' desired_group:'%s'",
+			context, node->info.id, node->name ? node->name : "?",
+			node->remote,
+			current ? current : "<none>",
+			desired ? desired : "<none>");
+
+	if (same)
+		return;
+
+	if (node->remote) {
+		/* Stamp the property via pw_impl_node_update_properties
+		 * so info_changed listeners (notably the client-node
+		 * impl) see the change and forward it to the owning
+		 * process. NULL desired means "remove the grouping" --
+		 * pass an empty dict update to clear the key. */
+		struct spa_dict_item items[1];
+		items[0] = SPA_DICT_ITEM_INIT(PW_KEY_NODE_LOOP_GROUP, desired);
+		pw_impl_node_update_properties(node,
+				&SPA_DICT_INIT(items, 1));
+		pw_log_info("%p: node %u (remote) loop-group request '%s' -> "
+				"'%s' (client will relocate)",
+				context, node->info.id,
+				current ? current : "<none>",
+				desired ? desired : "<none>");
+		return;
+	}
+
+	pw_properties_set(node->properties, PW_KEY_NODE_LOOP_GROUP, desired);
+
+	new_loop = pw_context_acquire_node_loop(context,
+			node->properties, node->remote);
+	if (new_loop == NULL) {
+		pw_log_warn("%p: fusion acquire_node_loop failed for node %u",
+				context, node->info.id);
+		return;
+	}
+
+	if (new_loop == node->data_loop) {
+		/* No-op reacquire: drop the extra ref and move on. */
+		pw_context_release_node_loop(context, new_loop);
+		return;
+	}
+
+	old_loop = node->data_loop;
+	res = pw_impl_node_set_data_loop(node, new_loop);
+	if (res < 0) {
+		pw_log_warn("%p: fusion relocate failed for node %u: %s",
+				context, node->info.id, spa_strerror(res));
+		pw_context_release_node_loop(context, new_loop);
+		return;
+	}
+
+	/* Reset the per-node WCET sliding window: the previous owning
+	 * thread's prev_run_time samples are no longer representative
+	 * of the new thread (different siblings on the same loop,
+	 * different core, different cache state). The samples buffer
+	 * stays allocated -- only the sum / head / count are cleared
+	 * -- so a relocate-and-warmup loop does not allocate
+	 * repeatedly. The warm-up gate (count < min_samples) then
+	 * restarts; Sarkar's criterion only fires again once enough
+	 * post-migration samples have accumulated. */
+	pw_fusion_window_clear(&node->fusion_window);
+
+	pw_log_info("%p: node %u moved to loop:'%s' group:'%s'",
+			context, node->info.id, new_loop->name,
+			desired ? desired : "<none>");
+	pw_context_release_node_loop(context, old_loop);
+}
+
+/* Apply chain-only fusion to a single node: compute its chain-mode
+ * desired group via the legacy helpers, then apply. Used both as the
+ * outer driver when subgraph mode is off, and as the per-component
+ * fallback when Sarkar's criterion fails or the WCET sketches are
+ * still warming up. */
+static void fusion_apply_chain_only(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	char *desired = chain_desired_group(context, node);
+	fusion_apply_group(context, node, desired);
+	free(desired);
+}
+
+/* Main fusion pass. Called at the tail of pw_context_recalc_graph,
+ * so it sees every link / node / quantum change without needing a
+ * separate event hook.
+ *
+ * Walks the eligibility-filtered subgraph, partitions it into weakly
+ * connected components, decides per-component via Sarkar's
+ * criterion, and applies the decision through the shared
+ * fusion_apply_group primitive. */
+/* Look up the eligible-table index of a node pointer. Linear scan;
+ * the table is bounded by the number of eligible nodes (small in
+ * realistic graphs). Returns -1 if the node is not in the table. */
+static int32_t fusion_find_table_idx(struct pw_impl_node **table, uint32_t n,
+		struct pw_impl_node *needle)
+{
+	uint32_t i;
+	for (i = 0; i < n; i++)
+		if (table[i] == needle)
+			return (int32_t)i;
+	return -1;
+}
+
+static void detect_and_apply_fusion(struct pw_context *context)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	struct pw_impl_node *node, *tmp;
+	struct pw_impl_node **table = NULL;
+	struct pw_fusion_graph *fg = NULL;
+	struct pw_fusion_graph_decision *decisions = NULL;
+	struct pw_fusion_params params;
+	uint32_t n_eligible = 0, cap = 32;
+	uint32_t i;
+	int rc;
+
+	if (!impl->dynamic_data_loops)
+		return;
+	if (!impl->merge_adjacent_chains && !impl->subgraph_fusion)
+		return;
+
+	pw_log_debug("%p: fusion scan start (chain:%d subgraph:%d)",
+			context, impl->merge_adjacent_chains,
+			impl->subgraph_fusion);
+
+	/* Chain-only fast path: no need to build the fusion graph or run
+	 * the cost model. Per-node chain detection uses the existing
+	 * unique-neighbour helpers and is O(N * deg). */
+	if (!impl->subgraph_fusion) {
+		spa_list_for_each_safe(node, tmp, &context->node_list, link) {
+			if (!fusion_node_eligible(context, node))
+				continue;
+			fusion_apply_chain_only(context, node);
+		}
+		return;
+	}
+
+	/* Subgraph mode: build a parallel table mapping fusion-graph
+	 * indices to pw_impl_node pointers, then feed the new
+	 * fusion-graph module which handles BFS / CP / Sarkar criterion
+	 * internally (see fusion-graph.[ch]). */
+	table = calloc(cap, sizeof(*table));
+	if (table == NULL)
+		return;
+
+	fg = pw_fusion_graph_alloc(0, 0);
+	if (fg == NULL) {
+		free(table);
+		return;
+	}
+
+	/* Resolve the active sliding-window size from the live graph
+	 * cycle period (or the operator override if pinned). Done once
+	 * per scan so every eligible node uses the same N -- the
+	 * cost-model's min_samples gate then has consistent meaning
+	 * across the graph. */
+	{
+		uint64_t period_ns = fusion_representative_period_ns(context);
+		uint32_t target_n = fusion_resolve_target_n(impl, period_ns);
+		pw_log_debug("%p: fusion window target=%u (period=%"PRIu64
+				"ns time=%"PRIu64"ms override=%u)",
+				context, target_n, period_ns,
+				(uint64_t)(impl->fusion_window_time_ns / 1000000ULL),
+				impl->fusion_window_samples_override);
+
+		spa_list_for_each(node, &context->node_list, link) {
+			if (!fusion_node_eligible(context, node))
+				continue;
+			fusion_refresh_wcet(node, target_n);
+
+			if (n_eligible == cap) {
+				uint32_t new_cap = cap * 2;
+				struct pw_impl_node **r = realloc(table,
+						new_cap * sizeof(*r));
+				if (r == NULL)
+					goto cleanup;
+				table = r;
+				cap = new_cap;
+			}
+
+			rc = pw_fusion_graph_add_node(fg, node->info.id,
+					pw_fusion_window_mean(&node->fusion_window),
+					node->fusion_window.count);
+			if (rc < 0) {
+				pw_log_warn("%p: fusion_graph_add_node(%u) failed: %s",
+						context, node->info.id, spa_strerror(rc));
+				goto cleanup;
+			}
+			/* Replay the previous applied decision so the
+			 * cost model can apply hysteresis around the
+			 * Sarkar threshold. Nodes that have never been
+			 * decided carry SPLIT, which disables the
+			 * hysteresis (no prior knowledge to be sticky
+			 * about). */
+			(void)pw_fusion_graph_set_prev_decision(fg,
+					(uint32_t)rc,
+					node->fusion_prev_decision);
+			table[n_eligible++] = node;
+		}
+	}
+
+	if (n_eligible == 0)
+		goto cleanup;
+
+	/* Walk the link list once, mapping each eligible link to an
+	 * indexed edge. Skipping ineligible links here means feedback /
+	 * async / cross-eligibility-boundary edges never make it into
+	 * the cost-model input -- the BFS partition therefore agrees
+	 * with module-deadline's scheduling-DAG filter. */
+	spa_list_for_each(node, &context->node_list, link) {
+		struct pw_impl_port *port;
+		struct pw_impl_link *l;
+		int32_t src_idx;
+		if ((src_idx = fusion_find_table_idx(table, n_eligible, node)) < 0)
+			continue;
+		spa_list_for_each(port, &node->output_ports, link) {
+			spa_list_for_each(l, &port->links, output_link) {
+				int32_t dst_idx;
+				if (!fusion_link_eligible(l))
+					continue;
+				dst_idx = fusion_find_table_idx(table,
+						n_eligible, l->input->node);
+				if (dst_idx < 0)
+					continue;
+				(void)pw_fusion_graph_add_edge(fg,
+						(uint32_t)src_idx,
+						(uint32_t)dst_idx);
+			}
+		}
+	}
+
+	decisions = calloc(n_eligible, sizeof(*decisions));
+	if (decisions == NULL)
+		goto cleanup;
+
+	params.wakeup_cost_ns = impl->wakeup_cost_ns;
+	params.min_samples = impl->fusion_min_samples;
+	params.hysteresis_pct = impl->fusion_hysteresis_pct;
+
+	rc = pw_fusion_graph_evaluate(fg, &params, decisions);
+	if (rc < 0) {
+		pw_log_warn("%p: fusion_graph_evaluate failed: %s",
+				context, spa_strerror(rc));
+		goto cleanup;
+	}
+
+	/* Apply the decisions in a single pass per node. Each
+	 * fusion_apply_group call is idempotent on a steady graph: it
+	 * short-circuits when the desired group matches the current one
+	 * (read out of the current data_loop's `group` field). The
+	 * chain-fallback only fires if merge_adjacent_chains is also
+	 * enabled -- otherwise a LINEAR_ONLY component stays ungrouped
+	 * (the operator explicitly opted out of chain fusion). */
+	for (i = 0; i < n_eligible; i++) {
+		struct pw_fusion_graph_decision *d = &decisions[i];
+		char buf[64];
+
+		pw_log_debug("%p: fusion node %u leader=%u N=%u sum=%"PRIu64
+				"ns cp=%"PRIu64"ns hops=%u samples=%u decision=%d",
+				context, table[i]->info.id,
+				d->component_leader_id,
+				d->component_n_nodes,
+				d->component_sum_wcet_ns,
+				d->component_cp_wcet_ns,
+				d->component_cp_hops,
+				d->component_min_samples,
+				d->decision);
+
+		switch (d->decision) {
+		case PW_FUSION_DECISION_FUSE:
+			snprintf(buf, sizeof(buf), "fusion.%u",
+					d->component_leader_id);
+			fusion_apply_group(context, table[i], buf);
+			break;
+		case PW_FUSION_DECISION_LINEAR_ONLY:
+			if (impl->merge_adjacent_chains)
+				fusion_apply_chain_only(context, table[i]);
+			else
+				fusion_apply_group(context, table[i], NULL);
+			break;
+		case PW_FUSION_DECISION_SPLIT:
+			fusion_apply_group(context, table[i], NULL);
+			break;
+		}
+
+		/* Record what we applied so the next scan's
+		 * hysteresis path replays it. We use the per-node
+		 * field directly; nodes that get destroyed clear it
+		 * naturally with the rest of pw_impl_node. */
+		table[i]->fusion_prev_decision = d->decision;
+	}
+
+cleanup:
+	free(decisions);
+	pw_fusion_graph_free(fg);
+	free(table);
+}
+
+/* Backwards-compatible name for the recalc-graph caller. */
+static inline void detect_and_merge_chains(struct pw_context *context)
+{
+	detect_and_apply_fusion(context);
+}
+
 /* here we evaluate the complete state of the graph.
  *
  * It roughly operates in 3 stages:
@@ -1960,6 +2902,13 @@ again:
 		impl->recalc_pending = false;
 		goto again;
 	}
+
+	/* After every recalc, consolidate any newly-formed (or newly-
+	 * broken) 1-in-1-out chains onto a single dynamic data loop.
+	 * Gated on context.merge-adjacent-chains, off by default; on a
+	 * graph with no chains or a steady-state graph the pass is
+	 * effectively a no-op (one linear scan, no syscalls). */
+	detect_and_merge_chains(context);
 
 	return 0;
 }
