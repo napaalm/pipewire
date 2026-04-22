@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 
 #include "pwtest.h"
@@ -108,23 +109,452 @@ static uint32_t dag_real_indexed_count(dag_t *g)
 	return count;
 }
 
+static bool dag_all_nodes_have_no_successors(dag_t *g)
+{
+	dag_node_t *n;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		if (n->successors != NULL)
+			return false;
+	}
+
+	return true;
+}
+
+static bool dag_unrelated_has_fictitious_nodes(dag_t *g)
+{
+	for (uint32_t i = 0; i < g->unrelated_size; i++) {
+		for (uint32_t j = 0; j < g->indexed_count; j++) {
+			if (bitset_test(g->unrelated[i], j) && g->indexed_nodes[j]->fictitious)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 struct foreach_info {
 	uint32_t count;
 	bool saw_internal_tid;
 };
 
-static void foreach_count_cb(void *data, pid_t tid, uint64_t wcet,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct foreach_info *info = data;
 
-	(void)deadline;
+	(void)id;
+	(void)cumulative_deadline;
+	(void)local_deadline;
 	(void)period;
 	(void)cpu;
+	(void)fusion_group_leader_id;
 
 	info->count++;
 	if (tid < 0 || wcet == 0)
 		info->saw_internal_tid = true;
+}
+
+/* Pin the contract for the explicit deadline fields after
+ * dag_recalculate: cumulative > 0 on every real node, local > 0 and
+ * <= cumulative, monotonicity along every edge, and source nodes
+ * (no real predecessor) have local == cumulative. */
+PWTEST(explicit_deadline_fields_populated_after_recalc)
+{
+	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	dag_node_t *n1 = find_node_by_id(g, 1);
+	dag_node_t *n2 = find_node_by_id(g, 2);
+	pwtest_int_eq((int)n1->cumulative_deadline, 0);
+	pwtest_int_eq((int)n1->local_deadline, 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(n1->deadline > 0);
+	pwtest_bool_true(n1->cumulative_deadline > 0);
+	pwtest_bool_true(n1->local_deadline > 0);
+	pwtest_bool_true(n2->cumulative_deadline > 0);
+	pwtest_bool_true(n2->local_deadline > 0);
+	/* Source: local equals cumulative (no real predecessor). */
+	pwtest_int_eq((int)n1->local_deadline, (int)n1->cumulative_deadline);
+	/* Monotonicity along the only real edge. */
+	pwtest_bool_true(n1->cumulative_deadline <= n2->cumulative_deadline);
+	/* For a non-source the local-vs-cumulative relation holds. */
+	pwtest_int_eq((int)n2->local_deadline,
+		      (int)(n2->cumulative_deadline - n1->cumulative_deadline));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Chain A->B->C: with the splitter producing per-node slices, the
+ * forward sum populates monotonically increasing cumulative
+ * deadlines; the local-deadline conversion produces the original
+ * per-node slices for the source and the difference downstream.
+ * Pins the kernel-API conversion the plan's pseudocode requires. */
+PWTEST(local_deadline_conversion_chain)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+
+	/* Cumulative is monotone non-decreasing along edges. */
+	pwtest_bool_true(a->cumulative_deadline <= b->cumulative_deadline);
+	pwtest_bool_true(b->cumulative_deadline <= c->cumulative_deadline);
+	/* Source: local == cumulative. */
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+	/* Non-source: local equals cumulative delta. */
+	pwtest_int_eq((int)b->local_deadline,
+		      (int)(b->cumulative_deadline - a->cumulative_deadline));
+	pwtest_int_eq((int)c->local_deadline,
+		      (int)(c->cumulative_deadline - b->cumulative_deadline));
+	/* Sink cumulative <= global D (the splitter enforces this
+	 * before this commit's pass runs). */
+	pwtest_bool_true(c->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Join A->C, B->C: local_deadline[C] = cumulative[C] - max(cumulative
+ * of predecessors). The forward sum picks the longer path. */
+PWTEST(local_deadline_conversion_join_uses_max_pred)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 300, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 200, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+
+	uint64_t max_pred = a->cumulative_deadline >= b->cumulative_deadline
+		? a->cumulative_deadline : b->cumulative_deadline;
+	pwtest_int_eq((int)c->local_deadline,
+		      (int)(c->cumulative_deadline - max_pred));
+	pwtest_bool_true(c->cumulative_deadline >= max_pred);
+	pwtest_bool_true(c->local_deadline > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* dag_compute_local_deadlines is callable as a stand-alone transform
+ * once cumulative_deadline has been assigned externally (the
+ * contracted-DAG path will exercise this). Drive it with the plan's
+ * pseudocode example: cumulative (100, 250, 500) on A -> B -> C must
+ * yield local (100, 150, 250). */
+PWTEST(local_deadline_conversion_direct_pseudocode_example)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 50, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Overwrite cumulative deadlines with the plan's reference
+	 * values, then ask the conversion function to derive locals. */
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+	a->cumulative_deadline = 100;
+	b->cumulative_deadline = 250;
+	c->cumulative_deadline = 500;
+
+	pwtest_bool_true(dag_compute_local_deadlines(g));
+	pwtest_int_eq((int)a->local_deadline, 100);
+	pwtest_int_eq((int)b->local_deadline, 150);
+	pwtest_int_eq((int)c->local_deadline, 250);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Same shape, join topology: A -> C, B -> C with cumulative
+ * (100, 200, 500) must yield C.local = 300. */
+PWTEST(local_deadline_conversion_direct_join_example)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+	a->cumulative_deadline = 100;
+	b->cumulative_deadline = 200;
+	c->cumulative_deadline = 500;
+
+	pwtest_bool_true(dag_compute_local_deadlines(g));
+	pwtest_int_eq((int)a->local_deadline, 100);
+	pwtest_int_eq((int)b->local_deadline, 200);
+	pwtest_int_eq((int)c->local_deadline, 300);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Non-monotonic cumulatives are rejected before any kernel call. */
+PWTEST(local_deadline_conversion_rejects_nonmonotonic)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	a->cumulative_deadline = 300;
+	b->cumulative_deadline = 200;
+
+	pwtest_bool_false(dag_compute_local_deadlines(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* --- per-CPU density predicate (Baruah 1990 sufficient test) --- */
+
+PWTEST(density_empty_cpu_returns_zero)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* CPU 0 carries the single node; CPU 1 is empty. */
+	pwtest_bool_true(dag_per_cpu_density(g, 1) == 0.0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* A single small task on one CPU: density = C/D well under 1. */
+PWTEST(density_feasible_chain_under_one)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, &failing_cpu));
+	pwtest_bool_true(max_d > 0.0);
+	pwtest_bool_true(max_d <= 1.0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Single CPU with a task whose wcet exceeds the local deadline ->
+ * density > 1. We construct it by post-hoc raising the wcet
+ * (the recalculate step gives a feasible split; tweak afterwards
+ * to drive density above 1). */
+PWTEST(density_infeasible_chain_above_one)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	dag_node_t *n;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Force a density > 1 by mutating WCET past the local
+	 * deadline after recalculate. The placer doesn't re-run; the
+	 * density predicate inspects current state. */
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+	n->wcet = (uint64_t)((double)n->local_deadline * 2.0);
+
+	pwtest_bool_false(dag_density_feasible(g, &max_d, &failing_cpu));
+	pwtest_bool_true(max_d > 1.0);
+	pwtest_int_eq((int)failing_cpu, (int)n->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* With three CPUs and unrelated tasks, each task lands on its own
+ * CPU and the per-CPU density does not aggregate across CPUs. */
+PWTEST(density_per_cpu_isolates_workloads)
+{
+	dag_t *g = dag_create(1000, 1000, 0.55f, 3, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	uint32_t i;
+	double total = 0.0;
+	pwtest_ptr_notnull(g);
+	/* Three independent sources -> each gets its own CPU under
+	 * worst-fit when admission_ceiling = 0.55 forces a spread. */
+	pwtest_int_eq(add_real_node(g, 1, 300, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 300, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 300, 1003), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, &failing_cpu));
+	/* Sum across CPUs is the workload's total density; no single
+	 * CPU should hit anywhere near total. */
+	for (i = 0; i < 3; i++)
+		total += dag_per_cpu_density(g, i);
+	pwtest_bool_true(max_d < total);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Relative capacity scaling: a slower CPU's density is divided by
+ * its relative_capacity. Same node, same deadline -> density on
+ * a 0.5-capacity CPU is 2x that on a 1.0-capacity CPU. */
+PWTEST(density_relative_capacity_scaling)
+{
+	double rel[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, rel);
+	dag_node_t *n;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+
+	/* If the placer chose CPU 0 (fastest), force the node to CPU
+	 * 1 (slow) and observe the density jump. */
+	uint32_t orig_cpu = n->cpu;
+	(void)orig_cpu;
+	double d0_native = dag_per_cpu_density(g, n->cpu);
+	pwtest_bool_true(d0_native > 0.0);
+
+	/* Pretend the node sits on CPU 1 -- density should be the
+	 * D=local_deadline normalised result divided by 0.5. */
+	uint32_t saved = n->cpu;
+	n->cpu = 1;
+	double d_slow = dag_per_cpu_density(g, 1);
+	n->cpu = saved;
+	pwtest_bool_true(d_slow > 0.0);
+	/* Ratio == relative_capacity[0] / relative_capacity[1] = 2.0,
+	 * but only when the node was originally on CPU 0. Verify
+	 * directly: density on the slow CPU is twice the contribution
+	 * the fast CPU would have seen for the same node. */
+	double expected_fast_contrib = (double)n->wcet /
+		(double)(n->local_deadline ? n->local_deadline : g->period);
+	pwtest_bool_true(d_slow > expected_fast_contrib * 1.5);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(density_null_safe)
+{
+	pwtest_bool_true(dag_per_cpu_density(NULL, 0) == 0.0);
+	pwtest_bool_false(dag_density_feasible(NULL, NULL, NULL));
+	return PWTEST_PASS;
+}
+
+/* --- processor-demand (DBF) feasibility (Baruah 1990) --- */
+
+PWTEST(dbf_feasible_single_task)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_dbf_feasible(g, NULL, NULL, NULL));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_infeasible_when_demand_exceeds_t)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	dag_node_t *n;
+	uint32_t failing_cpu;
+	uint64_t failing_t, failing_demand;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Force C > D so the first checkpoint t = D fails because
+	 * demand C > t. */
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+	n->wcet = n->local_deadline + 1;
+
+	pwtest_bool_false(dag_dbf_feasible(g, &failing_cpu, &failing_t,
+				&failing_demand));
+	pwtest_int_eq((int)failing_cpu, (int)n->cpu);
+	pwtest_bool_true(failing_t == n->local_deadline);
+	pwtest_bool_true(failing_demand > failing_t);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_passes_when_density_passes)
+{
+	/* A density-feasible schedule (every per-CPU density <= 1) is
+	 * also DBF-feasible: the dbf criterion is strictly weaker
+	 * than density for synchronously-released constrained-
+	 * deadline task sets. Construct a comfortably under-loaded
+	 * task set and verify both predicates agree. */
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, NULL));
+	pwtest_bool_true(max_d <= 1.0);
+	pwtest_bool_true(dag_dbf_feasible(g, NULL, NULL, NULL));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_null_safe)
+{
+	pwtest_bool_false(dag_dbf_feasible(NULL, NULL, NULL, NULL));
+	return PWTEST_PASS;
 }
 
 PWTEST(chain_uses_peak_not_sum)
@@ -149,11 +579,14 @@ PWTEST(chain_uses_peak_not_sum)
 
 	pwtest_int_eq((int)dag_real_indexed_count(g), 3);
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
-	pwtest_int_eq(g->relatives[n1->index][n1->index], 1);
-	pwtest_int_eq(g->relatives[n1->index][n2->index], 1);
-	pwtest_int_eq(g->relatives[n2->index][n1->index], 1);
-	pwtest_int_eq(g->relatives[n1->index][n3->index], 1);
-	pwtest_int_eq(g->relatives[n3->index][n1->index], 1);
+	pwtest_ptr_notnull(n1->successors);
+	pwtest_ptr_notnull(n2->successors);
+	pwtest_ptr_notnull(n3->successors);
+	pwtest_bool_true(bitset_test(n1->successors, n1->index));
+	pwtest_bool_true(bitset_test(n1->successors, n2->index));
+	pwtest_bool_false(bitset_test(n2->successors, n1->index));
+	pwtest_bool_true(bitset_test(n1->successors, n3->index));
+	pwtest_bool_false(bitset_test(n3->successors, n1->index));
 	pwtest_int_eq((int)dag_max_unrelated_size(g), 1);
 	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
 	pwtest_int_eq((int)n1->cpu, 0);
@@ -294,12 +727,18 @@ PWTEST(recalculate_keeps_exactly_two_fictitious_nodes)
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+	pwtest_ptr_notnull(find_node_by_id(g, 1)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 2)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 3)->successors);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
 	pwtest_int_eq((int)dag_real_node_count(g), 3);
 	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
 	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+	pwtest_ptr_notnull(find_node_by_id(g, 1)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 2)->successors);
+	pwtest_ptr_notnull(find_node_by_id(g, 3)->successors);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -634,18 +1073,22 @@ struct dirty_test_stats {
 };
 
 static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct dirty_test_stats *s = data;
 
 	(void)id;
 	(void)tid;
 	(void)wcet;
+	(void)cumulative_deadline;
 	(void)period;
 	(void)cpu;
+	(void)fusion_group_leader_id;
 
 	s->callbacks++;
-	s->deadline_sum += deadline;
+	s->deadline_sum += local_deadline;
 }
 
 /* after a clean recalc, a second dag_foreach_node with
@@ -1101,6 +1544,294 @@ PWTEST(cpu_placement_equal_density_lowest_cpu)
 	/* First placement goes to CPU 0 (lowest-index tie). The next
 	 * placement sees CPU 0 at u and CPU 1 at 0, so picks CPU 1
 	 * (worst-fit). The third sees both CPUs at u; tied → CPU 0. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* CP-aware placement order: assign_cpus sorts candidates by
+ * downstream critical-path priority (longest_len, equivalent to
+ * HEFT's upward rank rank_u with zero communication cost --
+ * Topcuoglu et al. 2002, papers/Topcuoglu-HEFT-TPDS2002.pdf, eq.
+ * 8). Density is the secondary key; topological index is the
+ * final tie-breaker.
+ *
+ * Regression test: a 4-node chain (A->B->C->D, all WCET=1, chain
+ * CP=4 ns, chain density 0.04) plus one independent node E
+ * (WCET=3, CP=3, density 0.03) lays the chain on a single CPU
+ * (the unrelated-set sums never accumulate across related chain
+ * nodes, so cpu_peak does not grow past the chain density) and
+ * sends the independent node to the next free CPU. The CP-aware
+ * ordering visits B (CP=3, density 0.04) before E (CP=3, density
+ * 0.03 -- density loses the tie-break); the density-only ordering
+ * visits B (idx 1, density 0.04) before E (idx 4, density 0.03)
+ * via the index tie-break. Either order produces the same final
+ * placement because related chain nodes do not bump cpu_peak.
+ *
+ * This test pins the placement so that any future change to the
+ * worst-fit's interaction with CP priority is caught. */
+PWTEST(cp_aware_chain_plus_independent_placement)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 5, NULL);
+	dag_node_t *a, *b, *c, *d, *e;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(add_real_node(g, 5, 3, 105), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	d = find_node_by_id(g, 4);
+	e = find_node_by_id(g, 5);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(d);
+	pwtest_ptr_notnull(e);
+
+	/* Chain piles onto CPU 0; the independent node goes to CPU 1. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 0);
+	pwtest_int_eq((int)c->cpu, 0);
+	pwtest_int_eq((int)d->cpu, 0);
+	pwtest_int_eq((int)e->cpu, 1);
+
+	/* CP priorities (longest_len) must reflect the chain
+	 * structure: A is the head of the longest path (CP=4), and
+	 * each step downstream loses one WCET unit. E is its own
+	 * source-to-sink, CP equal to its WCET. */
+	pwtest_int_eq((int)a->longest_len, 4);
+	pwtest_int_eq((int)b->longest_len, 3);
+	pwtest_int_eq((int)c->longest_len, 2);
+	pwtest_int_eq((int)d->longest_len, 1);
+	pwtest_int_eq((int)e->longest_len, 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* CP-aware placement on two parallel chains of different lengths.
+ * The longer chain (A->B->C->D->E, density 0.05) and the shorter
+ * chain (F->G, density 0.02) are independent of each other. The
+ * chains pile onto separate CPUs (CPU 0 and CPU 1 respectively)
+ * because the unrelated-set sums for cross-chain pairs (e.g.,
+ * {A,F}, {B,F}, ..., {E,F}) push F off CPU 0 to the empty CPU 1.
+ * The internal chain order (CP priorities A=5, B=4, C=3, D=2,
+ * E=1 for the long chain; F=2, G=1 for the short one) is
+ * exercised by the deadline-splitting pass; this test pins the
+ * placement and the CP values to lock the analysis in. */
+PWTEST(cp_aware_two_chains_placement)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 7, NULL);
+	dag_node_t *a, *b, *c, *d, *e, *f, *gn;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(add_real_node(g, 5, 1, 105), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 4, 5), 0);
+	pwtest_int_eq(add_real_node(g, 6, 1, 106), 0);
+	pwtest_int_eq(add_real_node(g, 7, 1, 107), 0);
+	pwtest_int_eq(dag_add_edge(g, 6, 7), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a  = find_node_by_id(g, 1);
+	b  = find_node_by_id(g, 2);
+	c  = find_node_by_id(g, 3);
+	d  = find_node_by_id(g, 4);
+	e  = find_node_by_id(g, 5);
+	f  = find_node_by_id(g, 6);
+	gn = find_node_by_id(g, 7);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(d);
+	pwtest_ptr_notnull(e);
+	pwtest_ptr_notnull(f);
+	pwtest_ptr_notnull(gn);
+
+	/* Chain 1 lives on CPU 0; chain 2 lives on CPU 1. */
+	pwtest_int_eq((int)a->cpu,  0);
+	pwtest_int_eq((int)b->cpu,  0);
+	pwtest_int_eq((int)c->cpu,  0);
+	pwtest_int_eq((int)d->cpu,  0);
+	pwtest_int_eq((int)e->cpu,  0);
+	pwtest_int_eq((int)f->cpu,  1);
+	pwtest_int_eq((int)gn->cpu, 1);
+
+	pwtest_int_eq((int)a->longest_len, 5);
+	pwtest_int_eq((int)b->longest_len, 4);
+	pwtest_int_eq((int)c->longest_len, 3);
+	pwtest_int_eq((int)d->longest_len, 2);
+	pwtest_int_eq((int)e->longest_len, 1);
+	pwtest_int_eq((int)f->longest_len, 2);
+	pwtest_int_eq((int)gn->longest_len, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* When every node is independent (no edges), each node's
+ * critical-path priority collapses to its own WCET. The CP-aware
+ * order therefore coincides with WCET-descending order, which on
+ * an end-to-end deadline equal to the period also coincides with
+ * density-descending order. This regression test pins that
+ * coincidence so existing density-driven tests stay valid. */
+PWTEST(cp_aware_independent_set_matches_density_order)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 4, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 3, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Nodes truly identical by (CP, density) fall to the topological
+ * index tie-breaker; on the worst-fit pass with two empty CPUs the
+ * first identical node lands on CPU 0, the second on CPU 1, the
+ * third on whichever side is lighter -- here CPU 0. This is the
+ * same deterministic ordering that the pre-CP-aware code
+ * produced; the final tie-breaker is unchanged. */
+PWTEST(cp_aware_equal_cp_and_density_breaks_by_topological_index)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Co-location groups force every group member onto the same CPU
+ * as the first-visited member of the group, regardless of how the
+ * placement order interleaves the rest of the DAG. With CP-aware
+ * ordering the high-CP group member is visited first and pins the
+ * CPU; subsequent members still land on that pinned CPU. */
+PWTEST(cp_aware_group_keeps_co_location)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	/* Chain A->B (WCET 5, 5). CP(A)=10, CP(B)=5, density 0.10. */
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	/* Independent C (WCET 5). CP=5, density 0.05. */
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* A is visited first (CP=10) and picks CPU 0 (empty, lowest
+	 * tied). C (CP=5, density 0.05) ties with B (CP=5, density
+	 * 0.10) by CP; density tie-break visits B before C, but B is
+	 * forced to A's CPU by group 1. C then lands on CPU 1
+	 * (worst-fit picks the empty bin). */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 0);
+	pwtest_int_eq((int)c->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Heterogeneous CPUs: relative_capacity scales how much room a
+ * CPU has, not the CP-priority of the candidates. The chain head
+ * is still visited first (it has the highest CP); the worst-fit
+ * inner loop then picks the CPU with the most remaining capacity
+ * after dividing the candidate's density by the per-CPU
+ * relative_capacity (i.e., a slower CPU at 0.5x looks twice as
+ * loaded as the same WCET on a 1.0x CPU). On two CPUs with
+ * capacities {1.0, 0.5} and three independent nodes, the densest
+ * candidate is placed on the faster CPU because it is the
+ * least-loaded option under relative utilisation. */
+PWTEST(cp_aware_hetero_capacity_picks_faster_cpu_first)
+{
+	double caps[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(100, 100, 0.50f, 2, caps);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* A (CP=10, density 0.10) lands on CPU 0 (relative load
+	 * 0.10/1.0 = 0.10 vs 0.10/0.5 = 0.20 on CPU 1; CPU 0 is the
+	 * worst-fit winner on an empty bin too). B and C then tie at
+	 * CP=5 and density 0.05; index tie-break visits B first.
+	 * After A, CPU 0 carries 0.10 of relative load and CPU 1
+	 * carries 0; B's relative load is 0.05 on CPU 0 vs 0.10 on
+	 * CPU 1, so worst-fit picks CPU 1 (whichever has lower peak
+	 * after the candidate is added: CPU 1 ends at 0.10, CPU 0
+	 * would end at 0.15 -- CPU 1 wins). C then sees CPU 0 at
+	 * 0.10 (would become 0.15) and CPU 1 at 0.10 (would become
+	 * 0.20); CPU 0 wins, again by lower projected load. */
 	pwtest_int_eq((int)a->cpu, 0);
 	pwtest_int_eq((int)b->cpu, 1);
 	pwtest_int_eq((int)c->cpu, 0);
@@ -2334,8 +3065,421 @@ PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
 	return PWTEST_PASS;
 }
 
+/* -------------------------------------------------------------------
+ * Merged/fused-group collapse in the antichain enumeration.
+ *
+ * Nodes that share a non-zero dag_node::group_id (stamped by the
+ * reconcile layer when libpipewire's chain-merge or subgraph-fusion
+ * has put them on the same data-loop thread) are co-located on the
+ * same CPU and execute sequentially. Treating each group as a single
+ * virtual node in dag_comp_unrelated:
+ *
+ *   - shrinks the branch-and-bound search space from |real nodes| to
+ *     |groups| -- the run-time win the optimisation targets;
+ *   - emits antichains whose bitsets contain every member of every
+ *     chosen group, so assign_cpus still accounts for the full
+ *     per-CPU load contribution of the group (sum across members,
+ *     which matches the actual single-thread utilisation model).
+ *
+ * The tests below verify both effects on small, hand-traceable
+ * graphs. They also document the equivalence with the pre-collapse
+ * behaviour on ungrouped (singleton) graphs.
+ * ------------------------------------------------------------------- */
+
+PWTEST(unrelated_collapse_chain_pair_with_independent_node)
+{
+	/* 1 -> 2 chain plus an independent node 3. With no grouping
+	 * the enumeration emits two maximal antichains: {1, 3} and
+	 * {2, 3}. Stamping {1, 2} as one co-location group collapses
+	 * the pair into a single virtual node, leaving a single
+	 * antichain whose bitset still contains all three real
+	 * indices. CPU placement and node deadlines are independent
+	 * of the change; both baselines must continue to admit. */
+	static const uint32_t all_ids[] = { 1, 2, 3 };
+	static const uint32_t pair_13[] = { 1, 3 };
+	static const uint32_t pair_23[] = { 2, 3 };
+
+	dag_t *g_base = dag_create(100, 100, 0.90f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+
+	pwtest_int_eq((int)g_base->unrelated_size, 2);
+	pwtest_bool_true(dag_has_unrelated_subset(g_base, pair_13, 2));
+	pwtest_bool_true(dag_has_unrelated_subset(g_base, pair_23, 2));
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 42), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 3));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 3);
+	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_two_chains_to_single_antichain)
+{
+	/* Two independent 2-node chains: 1 -> 3 and 2 -> 4. Without
+	 * grouping the enumeration finds four maximal antichains:
+	 * {1,2}, {1,4}, {3,2}, {3,4}. Stamping each chain as its own
+	 * group collapses the search to two virtual nodes that are
+	 * mutually unrelated, leaving exactly one antichain whose
+	 * bitset is the union of both groups' members. The total
+	 * relative deadline budget is unchanged (4 real nodes), so a
+	 * 0.50 ceiling still admits with one CPU. */
+	static const uint32_t all_ids[] = { 1, 2, 3, 4 };
+
+	dag_t *g_base = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 5, 103), 0);
+	pwtest_int_eq(add_real_node(g_base, 4, 5, 104), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 2, 4), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+	pwtest_int_eq((int)g_base->unrelated_size, 4);
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 5, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 10), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 10), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 20), 0);
+	pwtest_int_eq(dag_set_node_group(g, 4, 20), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 4));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 4);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_chain_three_nodes_one_group)
+{
+	/* A 3-node chain 1 -> 2 -> 3 has three maximal real-node
+	 * antichains in the baseline ({1}, {2}, {3} -- each cut is
+	 * maximal because every other node is a successor or
+	 * predecessor). Stamping all three with the same group_id
+	 * collapses the enumeration to a single antichain whose
+	 * bitset is the union of all members; this is the case
+	 * where expansion adds bits that the rep-only bitset would
+	 * have missed. The placement is unchanged (every node ends
+	 * up on the same CPU either way). */
+	static const uint32_t all_ids[] = { 1, 2, 3 };
+
+	dag_t *g_base = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+	pwtest_int_eq((int)g_base->unrelated_size, 3);
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 9), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 3));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_group_relation_via_non_rep_member)
+{
+	/* A group's relation to a third node depends on whether
+	 * ANY member is reachable from / reaches the third node,
+	 * not just the representative. Picking the rep alone (the
+	 * lowest-index member, here node 1) would miss the case
+	 * where a non-rep member is the related one.
+	 *
+	 * Graph: node 1 is isolated; 2 -> 3. Group {1, 3} stamped
+	 * with the same group_id; node 2 ungrouped. The rep of the
+	 * group is node 1 (lowest index in topo order); node 1 is
+	 * unrelated to node 2, but the non-rep member node 3 IS
+	 * reachable from node 2. The group-level check must report
+	 * RELATED -- otherwise the enumeration would put the group
+	 * and node 2 in one antichain, which would be wrong because
+	 * the actual execution chain 2 -> 3 is preserved at the
+	 * node level. */
+	static const uint32_t group_only[] = { 1, 3 };
+	static const uint32_t solo[] = { 2 };
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 42), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 2);
+	pwtest_bool_true(dag_has_unrelated_subset(g, group_only, 2));
+	pwtest_bool_true(dag_has_unrelated_subset(g, solo, 1));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_mixed_grouped_and_ungrouped)
+{
+	/* A 2-node grouped chain plus a single ungrouped neighbour.
+	 * The group must collapse to one rep; the ungrouped node
+	 * stays its own singleton; the resulting CPU placement is the
+	 * same as the grouped-only case where ordinary worst-fit
+	 * picks the emptier CPU for the ungrouped node. The
+	 * antichain count drops from two (pre-collapse: {1,3} and
+	 * {2,3}) to one (post-collapse: {1,2,3}). */
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 5), 0);
+	/* node 3 stays ungrouped (group_id = 0) */
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_bool_true(a->cpu != c->cpu);
+
+	pwtest_int_eq((int)g->unrelated_size, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_no_groups_matches_baseline)
+{
+	/* A graph with no group_id stamps must continue to produce
+	 * its pre-collapse antichains under the new code path (where
+	 * every real node becomes its own singleton dense group --
+	 * the rep equals the sole member, group_node_succ equals
+	 * node->successors, and expansion is a no-op). The diamond
+	 * 1 -> {2, 3} -> 4 has three maximal real-node antichains
+	 * ({1} alone, {2,3} together, {4} alone); the fork-mid
+	 * antichain {2, 3} must still be present, and its bitset
+	 * must contain exactly two bits. */
+	static const uint32_t mids[] = { 2, 3 };
+
+	dag_t *g = dag_create(100, 100, 0.90f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 3);
+	pwtest_bool_true(dag_has_unrelated_subset(g, mids, 2));
+	pwtest_int_eq((int)dag_max_unrelated_size(g), 2);
+	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_chain_proportional)
+{
+	/* A chain A(100) -> B(200) -> C(300) with a 1000ns end-to-end
+	 * deadline gets cumulative deadlines proportional to the
+	 * cumulative WCET: A=100/600, B=300/600, C=600/600 of D.
+	 * Sum equals 1000ns. */
+	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
+	double obj = -1.0;
+	uint32_t clipped = 99;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 200, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
+	pwtest_int_eq((int)clipped, 0);
+	pwtest_bool_true(obj == 0.0);
+
+	{
+		dag_node_t *a = dag_find_node(g, 1);
+		dag_node_t *b = dag_find_node(g, 2);
+		dag_node_t *c = dag_find_node(g, 3);
+		pwtest_ptr_notnull(a);
+		pwtest_ptr_notnull(b);
+		pwtest_ptr_notnull(c);
+		/* A's cumulative ~= 100/600 * 1000 = 166ns. */
+		pwtest_bool_true(a->cumulative_deadline >= 150);
+		pwtest_bool_true(a->cumulative_deadline <= 200);
+		/* B's cumulative ~= 300/600 * 1000 = 500ns. */
+		pwtest_bool_true(b->cumulative_deadline >= 450);
+		pwtest_bool_true(b->cumulative_deadline <= 550);
+		/* C's cumulative = D = 1000. */
+		pwtest_int_eq((int)c->cumulative_deadline, 1000);
+		/* Local deadlines must satisfy wcet <= local <= period. */
+		pwtest_bool_true(a->wcet <= a->local_deadline);
+		pwtest_bool_true(b->wcet <= b->local_deadline);
+		pwtest_bool_true(c->wcet <= c->local_deadline);
+		pwtest_bool_false(dag_node_budget_clipped(g, 1));
+		pwtest_bool_false(dag_node_budget_clipped(g, 2));
+		pwtest_bool_false(dag_node_budget_clipped(g, 3));
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_overload_clips_nodes)
+{
+	/* A chain A(800) -> B(500) -> C(300) with end-to-end 1000ns
+	 * cannot fit: path sum 1600 > 1000. The hard-mode splitter
+	 * (dag_recalculate) refuses the workload; the soft-mode
+	 * heuristic runs directly on the DAG and produces a clipped
+	 * proportional assignment. A's wcet (800) > local (500) means
+	 * the budget got clipped against the redistributed deadline;
+	 * the objective records the overflow as a unitless fraction
+	 * of the end-to-end deadline. */
+	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
+	double obj = -1.0;
+	uint32_t clipped = 0;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 800, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 500, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	/* dag_recalculate is expected to refuse this workload; the
+	 * soft heuristic must work on the un-analysed DAG. */
+	(void)dag_recalculate(g);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
+	pwtest_bool_true(clipped >= 1);
+	pwtest_bool_true(obj > 0.0);
+	pwtest_bool_true(dag_node_budget_clipped(g, 1));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_diamond_keeps_monotonicity)
+{
+	/* A diamond A -> B -> D, A -> C -> D with A=B=C=D=100 (so
+	 * path sum 300, longest 300). The redistribution must keep
+	 * cumulative_deadline monotonic along every edge. */
+	dag_t *g = dag_create(1200, 1200, 1.0, 4, NULL);
+	double obj = -1.0;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 100, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 100, 1003, false), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 100, 1004, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, NULL));
+
+	{
+		dag_node_t *a = dag_find_node(g, 1);
+		dag_node_t *b = dag_find_node(g, 2);
+		dag_node_t *c = dag_find_node(g, 3);
+		dag_node_t *d = dag_find_node(g, 4);
+		pwtest_ptr_notnull(a);
+		pwtest_ptr_notnull(b);
+		pwtest_ptr_notnull(c);
+		pwtest_ptr_notnull(d);
+		pwtest_bool_true(a->cumulative_deadline <= b->cumulative_deadline);
+		pwtest_bool_true(a->cumulative_deadline <= c->cumulative_deadline);
+		pwtest_bool_true(b->cumulative_deadline <= d->cumulative_deadline);
+		pwtest_bool_true(c->cumulative_deadline <= d->cumulative_deadline);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_rejects_invalid_inputs)
+{
+	double obj;
+	uint32_t clipped;
+	pwtest_bool_false(dag_soft_redistribute_deadlines(NULL, &obj, &clipped));
+	pwtest_bool_false(dag_node_budget_clipped(NULL, 0));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
+	pwtest_add(explicit_deadline_fields_populated_after_recalc, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_chain, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_join_uses_max_pred, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_direct_pseudocode_example, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_direct_join_example, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_rejects_nonmonotonic, PWTEST_NOARG);
+	pwtest_add(density_empty_cpu_returns_zero, PWTEST_NOARG);
+	pwtest_add(density_feasible_chain_under_one, PWTEST_NOARG);
+	pwtest_add(density_infeasible_chain_above_one, PWTEST_NOARG);
+	pwtest_add(density_per_cpu_isolates_workloads, PWTEST_NOARG);
+	pwtest_add(density_relative_capacity_scaling, PWTEST_NOARG);
+	pwtest_add(density_null_safe, PWTEST_NOARG);
+	pwtest_add(dbf_feasible_single_task, PWTEST_NOARG);
+	pwtest_add(dbf_infeasible_when_demand_exceeds_t, PWTEST_NOARG);
+	pwtest_add(dbf_passes_when_density_passes, PWTEST_NOARG);
+	pwtest_add(dbf_null_safe, PWTEST_NOARG);
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);
@@ -2347,11 +3491,87 @@ PWTEST_SUITE(module_deadline_dag)
 	
 	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
 	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);
+	pwtest_add(single_node_deadline, PWTEST_NOARG);
+	pwtest_add(chain_deadlines, PWTEST_NOARG);
+	pwtest_add(diamond_deadlines, PWTEST_NOARG);
+	pwtest_add(branch_tightening_residual_budget, PWTEST_NOARG);
+	pwtest_add(residual_budget_no_double_credit, PWTEST_NOARG);
+	pwtest_add(self_loop_rejected_with_einval, PWTEST_NOARG);
+	pwtest_add(cycle_creating_edge_rejected_with_eloop, PWTEST_NOARG);
+	pwtest_add(dag_has_cycle_predicate, PWTEST_NOARG);
+	pwtest_add(disconnect_two_parallel_chains, PWTEST_NOARG);
+	pwtest_add(disconnect_chain_plus_isolated, PWTEST_NOARG);
+	pwtest_add(unrelated_set_chain_admits_serially, PWTEST_NOARG);
+	pwtest_add(unrelated_set_independent_spreads, PWTEST_NOARG);
+	pwtest_add(unrelated_set_diamond_admits_on_two_cpus, PWTEST_NOARG);
+	pwtest_add(dirty_noop_after_clean_recalc, PWTEST_NOARG);
+	pwtest_add(dirty_set_node_wcet, PWTEST_NOARG);
+	pwtest_add(dirty_set_global_period_deadline, PWTEST_NOARG);
+	pwtest_add(dirty_on_add_edge, PWTEST_NOARG);
+	pwtest_add(feasibility_tight_critical_path, PWTEST_NOARG);
+	pwtest_add(feasibility_critical_path_overrun, PWTEST_NOARG);
+	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
+	pwtest_add(cpu_placement_orders_by_descending_density, PWTEST_NOARG);
+	pwtest_add(cpu_placement_equal_density_lowest_cpu, PWTEST_NOARG);
+	pwtest_add(cp_aware_chain_plus_independent_placement, PWTEST_NOARG);
+	pwtest_add(cp_aware_two_chains_placement, PWTEST_NOARG);
+	pwtest_add(cp_aware_independent_set_matches_density_order, PWTEST_NOARG);
+	pwtest_add(cp_aware_equal_cp_and_density_breaks_by_topological_index,
+			PWTEST_NOARG);
+	pwtest_add(cp_aware_group_keeps_co_location, PWTEST_NOARG);
+	pwtest_add(cp_aware_hetero_capacity_picks_faster_cpu_first, PWTEST_NOARG);
+	pwtest_add(load_reject_non_finite_or_out_of_range, PWTEST_NOARG);
+	pwtest_add(load_ordinary_cap_admits, PWTEST_NOARG);
+	pwtest_add(load_near_bound_admits, PWTEST_NOARG);
+	pwtest_add(timing_invalid_inputs_rejected, PWTEST_NOARG);
+	pwtest_add(zero_wcet_rejected, PWTEST_NOARG);
+	pwtest_add(timing_edge_deadline_equals_period, PWTEST_NOARG);
+	pwtest_add(workspace_reuse_across_recalcs, PWTEST_NOARG);
+	pwtest_add(id_index_empty, PWTEST_NOARG);
+	pwtest_add(id_index_single, PWTEST_NOARG);
+	pwtest_add(id_index_remove, PWTEST_NOARG);
+	pwtest_add(id_index_shuffled_insertion_stays_sorted, PWTEST_NOARG);
+	pwtest_add(id_index_add_remove_stress, PWTEST_NOARG);
+	pwtest_add(id_index_duplicate_add_leaves_index_intact, PWTEST_NOARG);
+
+	pwtest_add(group_two_independent_share_cpu, PWTEST_NOARG);
+	pwtest_add(group_chain_keeps_chain_on_one_cpu, PWTEST_NOARG);
+	pwtest_add(group_distinct_groups_do_not_unify, PWTEST_NOARG);
+	pwtest_add(group_ungrouped_neighbour_unaffected, PWTEST_NOARG);
+	pwtest_add(group_overcapacity_returns_eagain, PWTEST_NOARG);
+	pwtest_add(group_invalid_id_returns_enoent, PWTEST_NOARG);
+	pwtest_add(group_null_dag_returns_einval, PWTEST_NOARG);
+	pwtest_add(group_same_value_is_noop_for_dirty, PWTEST_NOARG);
+	pwtest_add(group_clear_returns_to_default, PWTEST_NOARG);
+	pwtest_add(group_survives_wcet_update, PWTEST_NOARG);
+	pwtest_add(group_three_members_partial_clear, PWTEST_NOARG);
+	pwtest_add(group_member_removed_does_not_leak, PWTEST_NOARG);
+
+	pwtest_add(group_high_id_does_not_overflow, PWTEST_NOARG);
+	pwtest_add(group_many_groups_each_co_locates, PWTEST_NOARG);
+	pwtest_add(group_eagain_recoverable_after_clear, PWTEST_NOARG);
+	pwtest_add(group_migration_between_groups, PWTEST_NOARG);
+	pwtest_add(group_fictitious_node_ignored, PWTEST_NOARG);
+	pwtest_add(group_competes_with_ungrouped_for_capacity, PWTEST_NOARG);
+	pwtest_add(group_topology_edge_addition_keeps_placement, PWTEST_NOARG);
+	pwtest_add(group_set_after_recalc_marks_dirty, PWTEST_NOARG);
 
 	pwtest_add(hetero_all_ones_matches_null_vector, PWTEST_NOARG);
 	pwtest_add(hetero_high_density_picks_faster_cpu, PWTEST_NOARG);
 	pwtest_add(hetero_admission_rejects_workload_that_only_fits_at_full_capacity, PWTEST_NOARG);
 	pwtest_add(hetero_feasibility_scaled_by_slowest_cpu, PWTEST_NOARG);
+
+	pwtest_add(unrelated_collapse_chain_pair_with_independent_node, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_two_chains_to_single_antichain, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_chain_three_nodes_one_group, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_group_relation_via_non_rep_member, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_mixed_grouped_and_ungrouped, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_no_groups_matches_baseline, PWTEST_NOARG);
+
+	pwtest_add(soft_redistribute_chain_proportional, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_overload_clips_nodes, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_diamond_keeps_monotonicity, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_rejects_invalid_inputs, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
