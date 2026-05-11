@@ -11,6 +11,11 @@
 
 #include "../src/modules/module-deadline/dag.h"
 
+static int add_real_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid)
+{
+	return dag_add_node(g, id, wcet, tid, false);
+}
+
 static dag_node_t *find_node_by_id(dag_t *g, uint32_t id)
 {
 	dag_node_t *n;
@@ -64,15 +69,62 @@ static uint32_t dag_max_unrelated_size(dag_t *g)
 	return max_size;
 }
 
-static uint32_t dag_node_count(dag_t *g)
+static uint32_t dag_real_node_count(dag_t *g)
 {
 	uint32_t count = 0;
 	dag_node_t *n;
 
-	spa_list_for_each(n, &g->nodes, link)
+	spa_list_for_each(n, &g->nodes, link) {
+		if (n->fictitious)
+			continue;
 		count++;
+	}
 
 	return count;
+}
+
+static uint32_t dag_fictitious_node_count(dag_t *g)
+{
+	uint32_t count = 0;
+	dag_node_t *n;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		if (n->fictitious)
+			count++;
+	}
+
+	return count;
+}
+
+static uint32_t dag_real_indexed_count(dag_t *g)
+{
+	uint32_t count = 0;
+
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		if (!g->indexed_nodes[i]->fictitious)
+			count++;
+	}
+
+	return count;
+}
+
+struct foreach_info {
+	uint32_t count;
+	bool saw_internal_tid;
+};
+
+static void foreach_count_cb(void *data, pid_t tid, uint64_t wcet,
+		uint64_t deadline, uint64_t period, uint32_t cpu)
+{
+	struct foreach_info *info = data;
+
+	(void)deadline;
+	(void)period;
+	(void)cpu;
+
+	info->count++;
+	if (tid < 0 || wcet == 0)
+		info->saw_internal_tid = true;
 }
 
 PWTEST(chain_uses_peak_not_sum)
@@ -80,9 +132,9 @@ PWTEST(chain_uses_peak_not_sum)
 	dag_t *g = dag_create(100, 100, 0.55f, 1);
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 
@@ -95,7 +147,8 @@ PWTEST(chain_uses_peak_not_sum)
 	pwtest_ptr_notnull(n2);
 	pwtest_ptr_notnull(n3);
 
-	pwtest_int_eq((int)g->indexed_count, 3);
+	pwtest_int_eq((int)dag_real_indexed_count(g), 3);
+	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_int_eq(g->relatives[n1->index][n1->index], 1);
 	pwtest_int_eq(g->relatives[n1->index][n2->index], 1);
 	pwtest_int_eq(g->relatives[n2->index][n1->index], 1);
@@ -105,6 +158,12 @@ PWTEST(chain_uses_peak_not_sum)
 	pwtest_int_eq((int)n1->cpu, 0);
 	pwtest_int_eq((int)n2->cpu, 0);
 	pwtest_int_eq((int)n3->cpu, 0);
+	pwtest_bool_true(n1->deadline_assigned);
+	pwtest_bool_true(n2->deadline_assigned);
+	pwtest_bool_true(n3->deadline_assigned);
+	pwtest_bool_true(n1->deadline > 0);
+	pwtest_bool_true(n2->deadline > 0);
+	pwtest_bool_true(n3->deadline > 0);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -118,10 +177,10 @@ PWTEST(fork_join_fails_on_peak_concurrency)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
@@ -145,10 +204,10 @@ PWTEST(multi_source_initial_cut_and_cleanup)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
 	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
@@ -170,13 +229,14 @@ PWTEST(topology_change_rebuilds_analysis)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
-	pwtest_int_eq((int)g->indexed_count, 3);
+	pwtest_int_eq((int)dag_real_indexed_count(g), 3);
+	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_int_eq((int)dag_max_unrelated_size(g), 2);
 	pwtest_bool_true(dag_has_unrelated_subset(g, concurrent_pair, 2));
 
@@ -188,9 +248,114 @@ PWTEST(topology_change_rebuilds_analysis)
 	pwtest_int_eq((int)g->unrelated_size, 0);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
-	pwtest_int_eq((int)g->indexed_count, 3);
+	pwtest_int_eq((int)dag_real_indexed_count(g), 3);
+	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
 	pwtest_int_eq((int)dag_max_unrelated_size(g), 1);
 	pwtest_bool_false(dag_has_unrelated_subset(g, concurrent_pair, 2));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(fictitious_nodes_allow_zero_wcet)
+{
+	dag_t *g = dag_create(100, 100, 0.90f, 1);
+
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 0, 101, false), -1);
+	pwtest_int_eq(errno, EINVAL);
+	pwtest_int_eq(dag_add_node(g, UINT32_MAX, 1, 101, false), -1);
+	pwtest_int_eq(errno, EINVAL);
+	pwtest_int_eq(dag_add_node(g, UINT32_MAX, 0, -1, true), 0);
+	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(recalculate_keeps_exactly_two_fictitious_nodes)
+{
+	dag_t *g = dag_create(100, 100, 0.90f, 1);
+
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)dag_real_node_count(g), 3);
+	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
+	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
+	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)dag_real_node_count(g), 3);
+	pwtest_int_eq((int)dag_fictitious_node_count(g), 2);
+	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX));
+	pwtest_ptr_notnull(find_node_by_id(g, UINT32_MAX - 1));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dag_foreach_node_skips_fictitious_nodes)
+{
+	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	struct foreach_info info = { 0 };
+
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_foreach_node(g, foreach_count_cb, &info), 0);
+	pwtest_int_eq((int)info.count, 3);
+	pwtest_bool_false(info.saw_internal_tid);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(iterative_deadlines_assign_fork_join)
+{
+	dag_t *g = dag_create(100, 100, 0.90f, 2);
+	dag_node_t *n1, *n2, *n3, *n4;
+
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n1 = find_node_by_id(g, 1);
+	n2 = find_node_by_id(g, 2);
+	n3 = find_node_by_id(g, 3);
+	n4 = find_node_by_id(g, 4);
+	pwtest_ptr_notnull(n1);
+	pwtest_ptr_notnull(n2);
+	pwtest_ptr_notnull(n3);
+	pwtest_ptr_notnull(n4);
+	pwtest_bool_true(n1->deadline_assigned);
+	pwtest_bool_true(n2->deadline_assigned);
+	pwtest_bool_true(n3->deadline_assigned);
+	pwtest_bool_true(n4->deadline_assigned);
+	pwtest_bool_true(n1->deadline > 0);
+	pwtest_bool_true(n2->deadline > 0);
+	pwtest_bool_true(n3->deadline > 0);
+	pwtest_bool_true(n4->deadline > 0);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -203,9 +368,9 @@ PWTEST(independent_tasks_are_placed_by_descending_density)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 5, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 4, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 3, 103), 0);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 4, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 3, 103), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
 
 	a = find_node_by_id(g, 1);
@@ -229,9 +394,9 @@ PWTEST(equal_load_ties_choose_lowest_cpu)
 
 	pwtest_ptr_notnull(g);
 
-	pwtest_int_eq(dag_add_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
@@ -256,6 +421,10 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);
 	pwtest_add(topology_change_rebuilds_analysis, PWTEST_NOARG);
+	pwtest_add(fictitious_nodes_allow_zero_wcet, PWTEST_NOARG);
+	pwtest_add(recalculate_keeps_exactly_two_fictitious_nodes, PWTEST_NOARG);
+	pwtest_add(dag_foreach_node_skips_fictitious_nodes, PWTEST_NOARG);
+	pwtest_add(iterative_deadlines_assign_fork_join, PWTEST_NOARG);
 	
 	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
 	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);

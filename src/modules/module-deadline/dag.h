@@ -47,6 +47,11 @@ struct dag_node {
 	uint32_t cpu;        /* assigned CPU */
 	pid_t tid;           /* associated thread id */
 
+	bool fictitious;
+	uint64_t remaining_deadline;
+	uint64_t longest_len;
+	int longest_next;
+
 	bool deadline_assigned;
 };
 
@@ -83,7 +88,7 @@ void dag_destroy(dag_t *g);
 int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline);
 
 /* Add and remove nodes */
-int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid);
+int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitious);
 int dag_remove_node(dag_t *g, uint32_t id);
 
 /* Add and remove edges */
