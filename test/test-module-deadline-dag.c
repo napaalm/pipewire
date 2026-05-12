@@ -694,6 +694,89 @@ static void dirty_test_count_cb(void *data, pid_t tid, uint64_t wcet,
  * different (less-loaded) CPU; etc. */
 /* U-load-reject: dag_create rejects non-finite, zero and >1
  * utilization caps before any allocation happens. */
+/* U-timing-invalid: dag_create and dag_set_global_period_deadline
+ * reject period=0, deadline=0, and deadline>period. */
+PWTEST(timing_invalid_inputs_rejected)
+{
+	dag_t *g;
+
+	errno = 0;
+	g = dag_create(0, 10, 0.95, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	errno = 0;
+	g = dag_create(10, 0, 0.95, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* deadline > period: reject. */
+	errno = 0;
+	g = dag_create(10, 11, 0.95, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* Successful create, then bad set. */
+	g = dag_create(100, 100, 0.95, 1);
+	pwtest_ptr_notnull(g);
+	errno = 0;
+	pwtest_int_eq(dag_set_global_period_deadline(g, 100, 0), -1);
+	pwtest_int_eq(errno, EINVAL);
+	errno = 0;
+	pwtest_int_eq(dag_set_global_period_deadline(g, 0, 100), -1);
+	pwtest_int_eq(errno, EINVAL);
+	errno = 0;
+	pwtest_int_eq(dag_set_global_period_deadline(g, 50, 60), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-zero-wcet: dag_add_node and dag_set_node_wcet reject wcet=0 for
+ * real nodes consistently (fictitious are an internal exception
+ * not exposed to public callers). */
+PWTEST(zero_wcet_rejected)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+
+	pwtest_ptr_notnull(g);
+
+	errno = 0;
+	pwtest_int_eq(dag_add_node(g, 1, 0, 101, false), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	errno = 0;
+	pwtest_int_eq(dag_set_node_wcet(g, 2, 0), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* No side-effect: WCET is still 10. */
+	{
+		dag_node_t *n = find_node_by_id(g, 2);
+		pwtest_ptr_notnull(n);
+		pwtest_int_eq((int)n->wcet, 10);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-timing-edge: a DAG created with deadline == period (the
+ * canonical implicit-deadline case) is accepted and produces a
+ * valid schedule. */
+PWTEST(timing_edge_deadline_equals_period)
+{
+	dag_t *g = dag_create(50, 50, 0.95, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(load_reject_non_finite_or_out_of_range)
 {
 	dag_t *g;
@@ -1358,6 +1441,9 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(load_reject_non_finite_or_out_of_range, PWTEST_NOARG);
 	pwtest_add(load_ordinary_cap_admits, PWTEST_NOARG);
 	pwtest_add(load_near_bound_admits, PWTEST_NOARG);
+	pwtest_add(timing_invalid_inputs_rejected, PWTEST_NOARG);
+	pwtest_add(zero_wcet_rejected, PWTEST_NOARG);
+	pwtest_add(timing_edge_deadline_equals_period, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

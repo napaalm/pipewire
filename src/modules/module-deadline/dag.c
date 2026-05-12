@@ -119,7 +119,16 @@ static void dag_invalidate_analysis(dag_t *g)
 
 dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
 {
-	if (period == 0 || deadline == 0 || num_cpus == 0) {
+	if (period == 0 || num_cpus == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	/* Timing contract: deadline must be strictly positive and no
+	 * greater than the period. A relative deadline beyond the
+	 * period would let a job overrun into the next period's slack,
+	 * which the kernel rejects. Reject before any allocation so
+	 * the caller doesn't have to free a partially-built DAG. */
+	if (deadline == 0 || deadline > period) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -181,7 +190,8 @@ int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 		errno = EINVAL;
 		return -1;
 	}
-	if (period == 0 || deadline == 0) {
+	/* Same contract as dag_create: period > 0, 0 < deadline <= period. */
+	if (period == 0 || deadline == 0 || deadline > period) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -545,6 +555,14 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet)
 	dag_node_t *n = find_node(g, id);
 	if (!n) {
 		errno = ENOENT;
+		return -1;
+	}
+
+	/* Reject zero-WCET sets the same way dag_add_node does, except
+	 * for fictitious nodes (internal endpoints only -- the public
+	 * dag_set_node_wcet should never be called on those). */
+	if (wcet == 0 && !n->fictitious) {
+		errno = EINVAL;
 		return -1;
 	}
 
