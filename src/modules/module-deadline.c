@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include <sys/syscall.h>
 #include <linux/capability.h>
 #include <linux/sched.h>
+#include <pthread.h>
 
 #include "config.h"
 
@@ -46,10 +48,13 @@
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
+#include <spa/utils/ringbuffer.h>
+#include <spa/utils/atomic.h>
 
 #include <pipewire/private.h>
 #include <pipewire/impl.h>
 #include <pipewire/thread.h>
+#include <pipewire/thread-loop.h>
 
 /** \page page_module_deadline Deadline
  *
@@ -120,6 +125,26 @@
  *                       protects against a sketch quantile collapsing
  *                       the budget from a few early atypical samples.
  *                       Default 32.
+ * - `recalc.sync`:      If true (default false), run the parameter
+ *                       recalculation synchronously on the driver's RT
+ *                       data-loop thread, as the module did before the
+ *                       async refactor. Useful only for benchmarking
+ *                       the cost the async path removes from the RT
+ *                       path. Production should leave it false.
+ * - `recalc.rt-prio`:   SCHED_FIFO priority of the async recalculation
+ *                       worker thread. Must be strictly lower than the
+ *                       audio processing priority (PipeWire defaults
+ *                       client=83, server=88; min configurable=11), so
+ *                       the worker never preempts audio. The worker is
+ *                       also pinned away from the deadline cores
+ *                       (cpus.available) so it never shares CPU time
+ *                       with the SCHED_DEADLINE threads it configures.
+ *                       Default 5.
+ * - `recalc.fake-delay-us`: Debug knob. If non-zero, the worker sleeps
+ *                       this many microseconds inside each recalc
+ *                       callback to simulate a slow analysis stage and
+ *                       exercise the CAS-coalesced "many RT cycles per
+ *                       worker wake" path. Default 0.
  *
  * ## Example configuration
  *
@@ -234,6 +259,31 @@
  *   ~= 11 kB. For 30 nodes in a graph, ~330 kB total -- negligible. */
 #define WCET_DEFAULT_COMPRESSION	100.0
 
+/* Async worker defaults. */
+
+/* SCHED_FIFO priority of the worker thread. Strictly lower than every
+ * audio-processing thread, so the worker cannot preempt audio. The
+ * meson options rtprio-server/rtprio-client clamp PipeWire's audio
+ * threads to >=11; we pick 5 to leave clear headroom on both sides
+ * (>0 means SCHED_FIFO at all; <11 means audio threads always win). */
+#define WORKER_DEFAULT_RT_PRIO		5
+
+/* Per-driver SPSC sample ring capacity, in slots of struct sample.
+ * Power of two for cheap modulo. Sized for the case where the worker
+ * is a few periods behind the RT thread: at 48 kHz with an 8-frame
+ * quantum every cycle emits ~30 samples; 4096 slots = ~130 cycles
+ * worth, well beyond any plausible worker lag. Overflow policy is
+ * drop-oldest (we just stop writing), which the WCET sketch absorbs
+ * naturally. */
+#define WORKER_RING_CAPACITY		4096u
+
+/* Maximum nodes/edges a topology snapshot can hold. The snapshot
+ * lives on the driver sentinel; arrays are realloc()d at snapshot
+ * time on the main loop if needed. Initial value is just the starting
+ * allocation. */
+#define TOPO_INITIAL_NODES		64u
+#define TOPO_INITIAL_EDGES		128u
+
 /* Bootstrap threshold, in cycles.
  *
  * Below this number of samples the module ignores the sketch quantile
@@ -302,24 +352,86 @@ static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
 
+/* A single RT->worker sample. node_id+period_ns are enough for the
+ * worker to look up (or lazily create) the node estimator and to
+ * detect period changes. The RT thread writes; the worker reads. */
+struct sample {
+	uint32_t node_id;
+	uint32_t _pad;
+	uint64_t runtime_ns;
+	uint64_t period_ns;
+};
+
+/* Topology snapshot for one driver. Populated only on the main loop
+ * (inside snapshot_topology() dispatched via pw_loop_invoke); read
+ * only by the worker, between the moment the main-loop callback
+ * returns and the moment we issue the next snapshot request. No
+ * other reader exists, so no locking. */
+struct topo_node {
+	uint32_t id;
+	pid_t    tid;
+};
+struct topo_edge {
+	uint32_t src;
+	uint32_t dst;
+};
+struct topo_snap {
+	struct topo_node *nodes;
+	struct topo_edge *edges;
+	uint32_t n_nodes, nodes_cap;
+	uint32_t n_edges, edges_cap;
+	uint64_t period;
+	bool     ok;
+	uint32_t pending;  /* atomic, CAS-coalesces async snapshot invokes */
+};
+
 struct node {
 	struct spa_list link;
 	struct impl *impl;
 
-	struct pw_impl_node *node;
+	struct pw_impl_node *node;        /* may be NULL on worker-created
+					   * follower entries; lookup by id
+					   * goes through `node_id` below. */
+	uint32_t node_id;                 /* always set; mirrors node->info.id
+					   * when `node` is known. */
 	struct spa_hook node_rt_listener;
 
-	bool enabled:true;
+	bool enabled:1;
+	bool is_driver:1;
 
+	/* Per-node WCET estimator. Only meaningful for follower nodes
+	 * (is_driver=false); the driver sentinel keeps zeros. */
 	uint64_t wcet;
 	uint64_t period;
-
-	/* Streaming-quantile estimator over a sliding window of recent
-	 * runtime samples. Lazily initialized on the first sample seen
-	 * for this node; falls back to plain peak-hold (the previous
-	 * behaviour) when sketch initialization fails. */
 	wcet_sketch_t sketch;
 	bool sketch_ready;
+
+	/* Per-driver async state. Only valid when is_driver=true. */
+	/* SPSC sample ring: producer is this driver's data-loop thread
+	 * (inside the complete/incomplete RT hook), consumer is the
+	 * impl->worker thread. */
+	struct spa_ringbuffer ring;          /* byte indices into ring_slots */
+	struct sample        *ring_slots;
+	uint32_t              ring_capacity; /* count of slots */
+	uint64_t              ring_dropped;  /* monotonic; written by RT */
+
+	/* Coalescing flag: RT CAS 0->1 before signaling worker; worker
+	 * CAS->0 at start of its callback. Atomic. */
+	uint32_t              recalc_inflight;
+
+	/* Most recent topology snapshot of the targets scheduled by
+	 * this driver. Filled by the main-loop callback; consumed by
+	 * the worker. */
+	struct topo_snap      topo;
+
+	/* Per-driver RT-hook timing histogram. Log2-bucket of CPU-time
+	 * nanoseconds spent in the RT hook body. Worker reads at
+	 * destroy; RT writer otherwise has exclusive access. */
+	uint64_t              hist_buckets[32];
+	uint64_t              hist_count;
+	uint64_t              hist_sum_ns;
+	uint64_t              hist_min_ns;
+	uint64_t              hist_max_ns;
 };
 
 struct impl {
@@ -341,12 +453,74 @@ struct impl {
 	double   sketch_compression;
 	uint32_t sketch_min_samples;
 
+	/* Async worker. Created at init when deadline policy is available;
+	 * NULL when sync_mode is true. */
+	bool                  sync_mode;
+	int                   worker_rt_prio;
+	uint32_t              worker_fake_delay_us;
+	struct pw_thread_loop *worker_tloop;
+	struct pw_loop       *worker_loop;
+	struct pw_loop       *main_loop;
+	/* Worker wake-up is an eventfd source signaled by the RT hook
+	 * with a single eventfd_write (sub-microsecond cross-CPU). The
+	 * source must be added before pw_thread_loop_start (see init):
+	 * sources added from inside a worker invoke proved unreliable
+	 * on this host -- the worker's epoll set did not observe the
+	 * newly-registered fd. */
+	struct spa_source    *worker_wake;
+	cpu_set_t             worker_affinity; /* online CPUs - cpus.available */
+
 	struct spa_list node_list;
 };
+
+static void hist_dump(const char *who, struct node *drv);
 
 static void module_destroy(void *data)
 {
 	struct impl *impl = data;
+	struct node *n, *tmp;
+
+	/* Stop emitting RT signals first: drop the context listener so no
+	 * more drivers are added, then disable existing drivers so no
+	 * new samples are pushed into the rings. */
+	spa_hook_remove(&impl->context_listener);
+	spa_list_for_each(n, &impl->node_list, link) {
+		if (n->is_driver && n->enabled) {
+			SPA_FLAG_CLEAR(n->node->rt.target.activation->flags,
+				       PW_NODE_ACTIVATION_FLAG_PROFILER);
+			pw_impl_node_remove_rt_listener(n->node, &n->node_rt_listener);
+			n->enabled = false;
+		}
+	}
+
+	/* Stop the worker before tearing down per-driver buffers it
+	 * might still touch. Sources are owned by the worker loop and
+	 * are destroyed when the loop is destroyed -- but we destroy
+	 * them explicitly here so the order is unambiguous: no more
+	 * wakeups can be processed after pw_thread_loop_stop returns. */
+	if (impl->worker_tloop) {
+		pw_thread_loop_stop(impl->worker_tloop);
+		if (impl->worker_wake && impl->worker_loop)
+			pw_loop_destroy_source(impl->worker_loop, impl->worker_wake);
+		impl->worker_wake = NULL;
+		pw_thread_loop_destroy(impl->worker_tloop);
+		impl->worker_tloop = NULL;
+		impl->worker_loop = NULL;
+	}
+
+	/* Dump per-driver timing histograms for the live A/B test, then
+	 * release driver/follower bookkeeping. */
+	spa_list_for_each_safe(n, tmp, &impl->node_list, link) {
+		hist_dump("destroy", n);
+		if (n->sketch_ready)
+			wcet_sketch_fini(&n->sketch);
+		free(n->ring_slots);
+		free(n->topo.nodes);
+		free(n->topo.edges);
+		spa_list_remove(&n->link);
+		free(n);
+	}
+
 	spa_hook_remove(&impl->module_listener);
 
 	free(impl);
@@ -465,6 +639,71 @@ static struct node *find_node(struct impl *impl, struct pw_impl_node *node)
 	return NULL;
 }
 
+static struct node *find_node_by_id(struct impl *impl, uint32_t id)
+{
+	struct node *n;
+	spa_list_for_each(n, &impl->node_list, link) {
+		if (!n->is_driver && n->node_id == id)
+			return n;
+	}
+	return NULL;
+}
+
+/* Log2 bucket of x. Used to bin RT-hook timings cheaply (no log call,
+ * no division). bucket(0) returns 0; bucket(1) returns 0;
+ * bucket(2..3) returns 1; bucket(4..7) returns 2; ...; bucket(>=2^31)
+ * is clamped to 31. */
+static inline uint32_t log2_bucket(uint64_t x)
+{
+	if (x <= 1)
+		return 0;
+	uint32_t b = 63 - __builtin_clzll(x);
+	return b > 31 ? 31 : b;
+}
+
+static inline uint64_t now_thread_cputime_ns(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+		return 0;
+	return (uint64_t)ts.tv_sec * SPA_NSEC_PER_SEC + (uint64_t)ts.tv_nsec;
+}
+
+static void hist_record(struct node *drv, uint64_t dur_ns)
+{
+	if (dur_ns == 0)
+		return;
+	drv->hist_buckets[log2_bucket(dur_ns)]++;
+	drv->hist_count++;
+	drv->hist_sum_ns += dur_ns;
+	if (drv->hist_min_ns == 0 || dur_ns < drv->hist_min_ns)
+		drv->hist_min_ns = dur_ns;
+	if (dur_ns > drv->hist_max_ns)
+		drv->hist_max_ns = dur_ns;
+}
+
+static void hist_dump(const char *who, struct node *drv)
+{
+	if (drv->hist_count == 0)
+		return;
+	pw_log_info("deadline RT-hook timing [%s drv-node=%d mode=%s]:",
+		    who,
+		    drv->node ? drv->node->info.id : (uint32_t)-1,
+		    drv->impl->sync_mode ? "sync" : "async");
+	pw_log_info("  cycles=%lu min=%luns max=%luns avg=%luns",
+		    drv->hist_count, drv->hist_min_ns, drv->hist_max_ns,
+		    drv->hist_sum_ns / drv->hist_count);
+	pw_log_info("  bucket counts (lo bound ns -> count):");
+	for (uint32_t i = 0; i < 32; i++) {
+		if (drv->hist_buckets[i] == 0)
+			continue;
+		pw_log_info("    >=%luns -> %lu", (uint64_t)1 << i, drv->hist_buckets[i]);
+	}
+	drv->ring_dropped = SPA_ATOMIC_LOAD(drv->ring_dropped);
+	if (drv->ring_dropped)
+		pw_log_info("  ring-dropped samples (cumulative): %lu", drv->ring_dropped);
+}
+
 static SPA_UNUSED bool is_audio_source_media_class(const char *media_class)
 {
 	return media_class != NULL &&
@@ -491,11 +730,55 @@ static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_
 	return runtime;
 }
 
-static void recalc_params(void *data)
+/* Apply one sample to a follower's estimator. Worker-thread or RT-
+ * thread (in sync mode); never both for a given node. */
+static void apply_sample(struct impl *impl, struct node *n, uint64_t runtime, uint64_t period)
 {
-	struct node *n = data;
-	struct pw_impl_node *node = n->node;
-	struct impl *impl = n->impl;
+	if (!n->sketch_ready) {
+		if (wcet_sketch_init(&n->sketch,
+				     impl->sketch_window_size,
+				     impl->sketch_compression,
+				     impl->sketch_quantile) == 0) {
+			n->sketch_ready = true;
+		} else {
+			pw_log_warn("node %d: WCET sketch init failed; using peak-hold",
+				    n->node ? n->node->info.id : (uint32_t)-1);
+		}
+	}
+
+	if (n->period != period) {
+		if (n->sketch_ready)
+			wcet_sketch_reset(&n->sketch);
+		n->wcet = 0;
+	}
+
+	if (runtime > 0 && n->sketch_ready)
+		wcet_sketch_add(&n->sketch, (double)runtime);
+
+	if (!n->sketch_ready ||
+	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
+		n->wcet = SPA_MAX(n->wcet, runtime);
+	} else {
+		double q = wcet_sketch_quantile(&n->sketch);
+		if (q > 0.0 && q < (double)UINT64_MAX)
+			n->wcet = (uint64_t)q;
+		else
+			n->wcet = SPA_MAX(n->wcet, runtime);
+	}
+
+	n->period = period;
+}
+
+/* ------------------------------------------------------------------
+ * Sync path: original behaviour. Builds the DAG, runs P-EDF analysis
+ * and applies SCHED_DEADLINE/affinity all from the driver's data-loop
+ * thread, inside the RT hook. Kept as a benchmark/escape hatch via
+ * the recalc.sync=true option.
+ * ------------------------------------------------------------------ */
+static void recalc_params_sync(struct node *drv)
+{
+	struct pw_impl_node *node = drv->node;
+	struct impl *impl = drv->impl;
 	struct pw_node_target *t;
 	struct pw_impl_node *node2;
 	bool abort = false;
@@ -506,103 +789,62 @@ static void recalc_params(void *data)
 	uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
 
 	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
-	
+
 	spa_list_for_each(t, &node->rt.target_list, link) {
-		struct pw_impl_node *node = t->node;
+		struct pw_impl_node *tnode = t->node;
 		struct pw_node_activation *na;
-		// const char *media_class;
 		pid_t tid = -1;
 
-		struct node *n = find_node(impl, node);
-        if (n == NULL) {
-            n = calloc(1, sizeof(*n));
-            n->impl = impl;
-            n->node = node;
-            n->enabled = true;
-            spa_list_insert(&impl->node_list, &n->link);
-        }
+		struct node *n = find_node(impl, tnode);
+		if (n == NULL) {
+			n = calloc(1, sizeof(*n));
+			n->impl = impl;
+			n->node = tnode;
+			n->node_id = tnode->info.id;
+			n->enabled = true;
+			spa_list_insert(&impl->node_list, &n->link);
+		}
 
 		na = t->activation;
-		uint64_t runtime = get_runtime_ns(node, na);
+		uint64_t runtime = get_runtime_ns(tnode, na);
 		if (runtime > period)
-			pw_log_warn("node %d runtime %lu exceeds period %lu", node->info.id, runtime, period);
+			pw_log_warn("node %d runtime %lu exceeds period %lu",
+				    tnode->info.id, runtime, period);
 
-		/* Lazily attach the sliding-window quantile estimator the
-		 * first time we see this node. If init fails (OOM), the
-		 * node keeps running with plain peak-hold below. */
-		if (!n->sketch_ready) {
-			if (wcet_sketch_init(&n->sketch,
-					     impl->sketch_window_size,
-					     impl->sketch_compression,
-					     impl->sketch_quantile) == 0) {
-				n->sketch_ready = true;
-			} else {
-				pw_log_warn("node %d: WCET sketch init failed; using peak-hold",
-					    node->info.id);
-			}
-		}
+		apply_sample(impl, n, runtime, period);
 
-		/* On a quantum/rate change the prior samples no longer
-		 * represent the same workload; drop them. The user has
-		 * confirmed full reset is the desired semantics. */
-		if (n->period != period) {
-			if (n->sketch_ready)
-				wcet_sketch_reset(&n->sketch);
-			n->wcet = 0;
-		}
-
-		if (runtime > 0 && n->sketch_ready)
-			wcet_sketch_add(&n->sketch, (double)runtime);
-
-		/* Bootstrap: until enough samples have accumulated for the
-		 * quantile estimate to be meaningful, keep behaving like
-		 * the old peak-hold so that a single early sample cannot
-		 * collapse the budget to a too-small number. */
-		if (!n->sketch_ready ||
-		    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
-			n->wcet = SPA_MAX(n->wcet, runtime);
-		} else {
-			double q = wcet_sketch_quantile(&n->sketch);
-			if (q > 0.0 && q < (double)UINT64_MAX)
-				n->wcet = (uint64_t)q;
-			else
-				n->wcet = SPA_MAX(n->wcet, runtime);
-		}
 		if (n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
 			abort = true;
-			pw_log_warn("Abort trying to add node %d (wcet=0)", node->info.id);
+			pw_log_warn("Abort trying to add node %d (wcet=0)", tnode->info.id);
 			continue;
 		}
 
-		n->period = period;
-
-		if (pw_properties_get_bool(node->properties, PW_KEY_NODE_LOOP_DYNAMIC, false)) {
-			tid = pw_properties_get_int32(node->properties, PW_KEY_NODE_LOOP_TID, -1);
+		if (pw_properties_get_bool(tnode->properties, PW_KEY_NODE_LOOP_DYNAMIC, false)) {
+			tid = pw_properties_get_int32(tnode->properties, PW_KEY_NODE_LOOP_TID, -1);
 			if (tid == -1) {
-				pw_log_error("node %d has no TID", node->info.id);
+				pw_log_error("node %d has no TID", tnode->info.id);
+				dag_destroy(dag);
 				return;
 			}
 		} else {
-			pw_log_error("node %d is not a dynamic loop", node->info.id);
+			pw_log_error("node %d is not a dynamic loop", tnode->info.id);
+			dag_destroy(dag);
 			return;
 		}
 
-		// media_class = pw_properties_get(node->properties, PW_KEY_MEDIA_CLASS);
-		dag_add_node(dag, node->info.id, (uint64_t)(n->wcet * 1.05), tid, false);
+		dag_add_node(dag, tnode->info.id, (uint64_t)(n->wcet * 1.05), tid, false);
 	}
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
-		struct pw_impl_node *node = t->node;
+		struct pw_impl_node *tnode = t->node;
 		struct pw_impl_port *p;
 		struct pw_impl_link *l;
-		spa_list_for_each(p, &node->output_ports, link) {
+		spa_list_for_each(p, &tnode->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
 				node2 = l->input->node;
-
-				dag_add_edge(dag, node->info.id, node2->info.id);
+				dag_add_edge(dag, tnode->info.id, node2->info.id);
 			}
 		}
-		
 	}
 
 	if (!abort) {
@@ -613,10 +855,335 @@ static void recalc_params(void *data)
 	dag_destroy(dag);
 }
 
+/* ------------------------------------------------------------------
+ * Async path: the RT hook just pushes per-target samples to a per-
+ * driver SPSC ring and signals the worker via an eventfd. All the
+ * heavy work (sketch updates, DAG build, P-EDF analysis, syscalls)
+ * happens on the worker thread, which runs at a low SCHED_FIFO prio
+ * and is CPU-pinned away from the deadline cores so it never shares
+ * a CPU with the threads it configures.
+ * ------------------------------------------------------------------ */
+
+/* RT-context: push samples into drv's ring. Drops if full (worker is
+ * lagging); the WCET sketch tail stats absorb the loss naturally. */
+static void rt_push_samples(struct node *drv, uint64_t period)
+{
+	struct pw_impl_node *node = drv->node;
+	struct pw_node_target *t;
+	uint32_t buf_size_bytes = drv->ring_capacity * sizeof(struct sample);
+
+	spa_list_for_each(t, &node->rt.target_list, link) {
+		struct pw_impl_node *tnode = t->node;
+		uint64_t runtime = get_runtime_ns(tnode, t->activation);
+
+		uint32_t widx;
+		int32_t filled = spa_ringbuffer_get_write_index(&drv->ring, &widx);
+		if (filled < 0 || (uint32_t)filled >= buf_size_bytes) {
+			drv->ring_dropped++;
+			continue;
+		}
+		uint32_t offset = (widx % buf_size_bytes);
+		/* Slot-aligned writes only; capacity is power of two of slot
+		 * size so offset always lands on a slot boundary. */
+		struct sample *s = (struct sample *)((uint8_t *)drv->ring_slots + offset);
+		s->node_id = tnode->info.id;
+		s->_pad = 0;
+		s->runtime_ns = runtime;
+		s->period_ns = period;
+		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
+	}
+}
+
+/* Worker-context: drain everything the producer wrote since last time. */
+static void worker_drain_samples(struct impl *impl, struct node *drv)
+{
+	uint32_t buf_size_bytes = drv->ring_capacity * sizeof(struct sample);
+	uint32_t ridx;
+	int32_t avail = spa_ringbuffer_get_read_index(&drv->ring, &ridx);
+	if (avail <= 0)
+		return;
+
+	/* Process slot-by-slot. */
+	uint32_t processed = 0;
+	while ((uint32_t)avail - processed >= sizeof(struct sample)) {
+		uint32_t offset = ((ridx + processed) % buf_size_bytes);
+		const struct sample *s = (const struct sample *)
+			((uint8_t *)drv->ring_slots + offset);
+
+		struct node *n = find_node_by_id(impl, s->node_id);
+		if (n == NULL) {
+			n = calloc(1, sizeof(*n));
+			if (n) {
+				n->impl = impl;
+				n->node_id = s->node_id;
+				n->enabled = true;
+				/* n->node stays NULL: the worker never
+				 * dereferences pw_impl_node *; the
+				 * topology snapshot carries the id+tid
+				 * we need to apply DEADLINE. */
+				spa_list_insert(&impl->node_list, &n->link);
+			}
+		}
+		if (n)
+			apply_sample(impl, n, s->runtime_ns, s->period_ns);
+
+		processed += sizeof(struct sample);
+	}
+	spa_ringbuffer_read_update(&drv->ring, ridx + processed);
+	pw_log_trace("worker drained %u samples (drv-node=%d)",
+		     processed / (uint32_t)sizeof(struct sample),
+		     drv->node ? drv->node->info.id : (uint32_t)-1);
+}
+
+/* Main-loop context: walk the driver's follower list and the
+ * follower ports/links to capture a self-contained topology snapshot
+ * that the worker can consume without further main-loop access. */
+struct snapshot_arg {
+	struct node *drv;
+};
+
+static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
+				   bool async SPA_UNUSED, uint32_t seq SPA_UNUSED,
+				   const void *data, size_t size SPA_UNUSED,
+				   void *user_data SPA_UNUSED)
+{
+	const struct snapshot_arg *a = data;
+	struct node *drv = a->drv;
+	struct pw_impl_node *dnode = drv->node;
+	struct topo_snap *t = &drv->topo;
+
+	t->ok = false;
+	t->n_nodes = 0;
+	t->n_edges = 0;
+
+	if (dnode->target_rate.denom == 0 || dnode->target_quantum == 0) {
+		SPA_ATOMIC_STORE(t->pending, 0);
+		return 0;
+	}
+	t->period = SPA_NSEC_PER_SEC * dnode->target_quantum / dnode->target_rate.denom;
+
+	struct pw_impl_node *follower;
+	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
+		if (follower == dnode)
+			continue;
+		if (!pw_properties_get_bool(follower->properties,
+					    PW_KEY_NODE_LOOP_DYNAMIC, false))
+			continue;
+		pid_t tid = pw_properties_get_int32(follower->properties,
+						    PW_KEY_NODE_LOOP_TID, -1);
+		if (tid == -1)
+			continue;
+
+		if (t->n_nodes >= t->nodes_cap) {
+			uint32_t newcap = t->nodes_cap ? t->nodes_cap * 2 : TOPO_INITIAL_NODES;
+			struct topo_node *nn = realloc(t->nodes, newcap * sizeof(*nn));
+			if (!nn)
+				return -ENOMEM;
+			t->nodes = nn;
+			t->nodes_cap = newcap;
+		}
+		t->nodes[t->n_nodes].id = follower->info.id;
+		t->nodes[t->n_nodes].tid = tid;
+		t->n_nodes++;
+	}
+
+	/* Edges: for each follower, walk output ports -> links -> input node. */
+	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
+		if (follower == dnode)
+			continue;
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &follower->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				if (!l->input || !l->input->node)
+					continue;
+				if (t->n_edges >= t->edges_cap) {
+					uint32_t newcap = t->edges_cap ? t->edges_cap * 2 : TOPO_INITIAL_EDGES;
+					struct topo_edge *ne = realloc(t->edges, newcap * sizeof(*ne));
+					if (!ne)
+						return -ENOMEM;
+					t->edges = ne;
+					t->edges_cap = newcap;
+				}
+				t->edges[t->n_edges].src = follower->info.id;
+				t->edges[t->n_edges].dst = l->input->node->info.id;
+				t->n_edges++;
+			}
+		}
+	}
+
+	t->ok = true;
+	SPA_ATOMIC_STORE(t->pending, 0);
+	return 0;
+}
+
+/* Worker-context: rebuild and reapply the DAG using the freshest
+ * topology snapshot + current per-node sketch budgets. */
+static void worker_apply_dag(struct impl *impl, struct node *drv)
+{
+	struct topo_snap *t = &drv->topo;
+	if (!t->ok || t->n_nodes == 0)
+		return;
+
+	dag_t *dag = dag_create(t->period, t->period, impl->cpu_utilization, impl->n_cpus);
+	bool abort = false;
+
+	for (uint32_t i = 0; i < t->n_nodes; i++) {
+		struct node *n = find_node_by_id(impl, t->nodes[i].id);
+		if (n == NULL || n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
+			abort = true;
+			pw_log_debug("worker: node %u not ready (wcet=%lu)",
+				     t->nodes[i].id, n ? n->wcet : 0);
+			continue;
+		}
+		dag_add_node(dag, t->nodes[i].id,
+			     (uint64_t)(n->wcet * 1.05), t->nodes[i].tid, false);
+	}
+
+	if (!abort) {
+		for (uint32_t i = 0; i < t->n_edges; i++)
+			dag_add_edge(dag, t->edges[i].src, t->edges[i].dst);
+		dag_recalculate(dag);
+		dag_foreach_node(dag, sched_cb, impl);
+	}
+
+	dag_destroy(dag);
+}
+
+/* Worker-context: full recalc cycle for one driver. Drains samples,
+ * applies the DAG using the most recent topology snapshot, then
+ * kicks off a *non-blocking* refresh on the main loop for the next
+ * cycle. Non-blocking is essential: module_destroy runs on the main
+ * loop and would otherwise deadlock against a worker still parked in
+ * a synchronous main-loop invoke. The first wake uses topo.ok=false
+ * (skips apply); subsequent wakes use the topology refreshed by the
+ * previous wake's async invoke. Graph mutations are rare so trailing
+ * by one cycle is acceptable. */
+static void worker_recalc_one(struct impl *impl, struct node *drv)
+{
+	if (impl->worker_fake_delay_us > 0) {
+		struct timespec ts = {
+			.tv_sec  = impl->worker_fake_delay_us / 1000000u,
+			.tv_nsec = (impl->worker_fake_delay_us % 1000000u) * 1000u,
+		};
+		nanosleep(&ts, NULL);
+	}
+
+	worker_drain_samples(impl, drv);
+
+	worker_apply_dag(impl, drv);
+
+	/* Coalesce snapshot invokes: only queue a new one if no previous
+	 * one is still pending. The main-loop callback clears the flag
+	 * after writing. */
+	if (SPA_ATOMIC_CAS(drv->topo.pending, 0, 1)) {
+		struct snapshot_arg a = { .drv = drv };
+		pw_loop_invoke(impl->main_loop, snapshot_topology_main, 0,
+			       &a, sizeof(a), false, NULL);
+	}
+}
+
+/* Worker-thread self-setup: SCHED_FIFO + CPU affinity. The poll
+ * timer is registered separately from the main thread (before the
+ * worker starts running its loop) -- registering it from inside a
+ * worker invoke proved unreliable in earlier iterations of this
+ * file. Sched failures are warnings; the worker still runs, just
+ * at SCHED_OTHER. */
+struct worker_setup_arg {
+	cpu_set_t aff;
+	int       rt_prio;
+};
+
+static int worker_setup(struct spa_loop *loop SPA_UNUSED, bool async SPA_UNUSED,
+			uint32_t seq SPA_UNUSED, const void *data, size_t size SPA_UNUSED,
+			void *user_data SPA_UNUSED)
+{
+	const struct worker_setup_arg *p = data;
+	struct sched_param sp = { .sched_priority = p->rt_prio };
+	int rc;
+
+	if (sched_setaffinity(0, sizeof(p->aff), &p->aff) != 0)
+		pw_log_warn("deadline-recalc: sched_setaffinity failed: %m");
+
+	rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+	if (rc != 0)
+		pw_log_warn("deadline-recalc: pthread_setschedparam(FIFO,%d) failed: %s",
+			    p->rt_prio, strerror(rc));
+
+	int actual_policy = -1;
+	struct sched_param actual_sp = {0};
+	pthread_getschedparam(pthread_self(), &actual_policy, &actual_sp);
+	pid_t tid = (pid_t)syscall(SYS_gettid);
+
+	pw_log_info("deadline-recalc worker tid=%d: SCHED_FIFO prio %d (actual policy=%d, "
+		    "FIFO=%d), affinity=%d cpus",
+		    tid, p->rt_prio, actual_policy, SCHED_FIFO,
+		    CPU_COUNT(&p->aff));
+	return 0;
+}
+
+/* Worker-thread context: drain every driver whose recalc_inflight
+ * flag was raised on the RT side since the previous wakeup. The
+ * worker is woken by pw_loop_signal_event on the impl->worker_wake
+ * eventfd source -- the RT hook calls signal_event once on every
+ * 0->1 CAS of recalc_inflight, so a single wakeup covers all of the
+ * RT cycles that piled up while the worker was busy. */
+static void worker_wake_func(void *data, uint64_t count SPA_UNUSED)
+{
+	struct impl *impl = data;
+	struct node *drv;
+
+	spa_list_for_each(drv, &impl->node_list, link) {
+		if (!drv->is_driver)
+			continue;
+		uint32_t inflight = SPA_ATOMIC_XCHG(drv->recalc_inflight, 0);
+		if (inflight == 0)
+			continue;
+		worker_recalc_one(impl, drv);
+	}
+}
+
+/* RT-context dispatcher: measures CPU time and routes to sync or
+ * async body. Kept short so async-mode hook never grows beyond a
+ * ring write + an eventfd signal. */
+static void rt_hook(void *data)
+{
+	struct node *drv = data;
+	struct pw_impl_node *node = drv->node;
+	struct impl *impl = drv->impl;
+
+	if (node->target_rate.denom == 0 || node->target_quantum == 0)
+		return;
+
+	uint64_t t0 = now_thread_cputime_ns();
+
+	if (impl->sync_mode) {
+		recalc_params_sync(drv);
+	} else {
+		uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum
+				  / node->target_rate.denom;
+		rt_push_samples(drv, period);
+		/* CAS 0->1 to coalesce many RT cycles into one worker
+		 * pass; only signal the eventfd on the 0->1 transition.
+		 * If the worker is already scheduled (CAS fails because
+		 * inflight=1), the existing wakeup will pick up our
+		 * just-written sample on its next pass. The worker
+		 * XCHG-resets the flag at the start of its callback, so
+		 * the very next RT cycle after the worker starts
+		 * re-arms the wakeup. */
+		if (SPA_ATOMIC_CAS(drv->recalc_inflight, 0, 1))
+			pw_loop_signal_event(impl->worker_loop, impl->worker_wake);
+	}
+
+	uint64_t t1 = now_thread_cputime_ns();
+	if (t1 > t0)
+		hist_record(drv, t1 - t0);
+}
+
 static const struct pw_impl_node_rt_events node_rt_events = {
 	PW_VERSION_IMPL_NODE_RT_EVENTS,
-	.complete = recalc_params,
-	.incomplete = recalc_params,
+	.complete = rt_hook,
+	.incomplete = rt_hook,
 };
 
 static void set_driver_hook_state(struct node *n, bool enabled)
@@ -642,9 +1209,34 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 
 	n->impl = impl;
 	n->node = node;
-	spa_list_append(&impl->node_list, &n->link);
+	n->node_id = node->info.id;
+	n->is_driver = true;
 
+	/* Allocate the per-driver SPSC sample ring. Worker reads, RT
+	 * thread writes. Drop-oldest on overflow. */
+	n->ring_capacity = WORKER_RING_CAPACITY;
+	n->ring_slots = calloc(n->ring_capacity, sizeof(struct sample));
+	if (n->ring_slots == NULL) {
+		pw_log_warn("driver %d: failed to allocate sample ring; module disabled for this driver",
+			    node->info.id);
+		free(n);
+		return;
+	}
+	spa_ringbuffer_init(&n->ring);
+
+	spa_list_append(&impl->node_list, &n->link);
 	set_driver_hook_state(n, true);
+
+	/* Async mode: prime the first topology snapshot so the very
+	 * first worker wake has a populated topo to work with. The
+	 * driver may not have a period yet (target_rate/quantum=0 until
+	 * negotiated), in which case snapshot_topology_main sets
+	 * topo.ok=false and the worker will retry next wake. */
+	if (!impl->sync_mode && impl->main_loop != NULL) {
+		struct snapshot_arg a = { .drv = n };
+		SPA_ATOMIC_STORE(n->topo.pending, 1);
+		snapshot_topology_main(NULL, false, 0, &a, sizeof(a), NULL);
+	}
 }
 
 static void context_driver_removed(void *data, struct pw_impl_node *node)
@@ -657,8 +1249,15 @@ static void context_driver_removed(void *data, struct pw_impl_node *node)
 		return;
 
 	set_driver_hook_state(n, false);
+
+	/* After remove_rt_listener returns, no more RT callbacks for
+	 * this driver are in flight. Tear down its async state. */
+	hist_dump("driver-removed", n);
 	if (n->sketch_ready)
 		wcet_sketch_fini(&n->sketch);
+	free(n->ring_slots);
+	free(n->topo.nodes);
+	free(n->topo.edges);
 	spa_list_remove(&n->link);
 	free(n);
 }
@@ -759,6 +1358,26 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			pw_log_warn("wcet.min-samples %s ignored", s);
 	}
 
+	impl->sync_mode = pw_properties_get_bool(props, "recalc.sync", false);
+	impl->worker_rt_prio = WORKER_DEFAULT_RT_PRIO;
+	if ((s = pw_properties_get(props, "recalc.rt-prio")) != NULL) {
+		char *end;
+		long v = strtol(s, &end, 10);
+		if (end != s && v >= 1 && v <= 99)
+			impl->worker_rt_prio = (int)v;
+		else
+			pw_log_warn("recalc.rt-prio %s ignored", s);
+	}
+	impl->worker_fake_delay_us = 0;
+	if ((s = pw_properties_get(props, "recalc.fake-delay-us")) != NULL) {
+		char *end;
+		unsigned long v = strtoul(s, &end, 10);
+		if (end != s)
+			impl->worker_fake_delay_us = (uint32_t)v;
+		else
+			pw_log_warn("recalc.fake-delay-us %s ignored", s);
+	}
+
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
 	pw_impl_module_update_properties(module, &props->dict);
@@ -774,6 +1393,81 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		goto done;
 	}
 
+	impl->main_loop = pw_context_get_main_loop(impl->context);
+
+	/* Async worker setup. Computed in two pieces:
+	 * - CPU affinity mask: daemon's current online set MINUS the
+	 *   deadline cores (cpus.available). Worker must never share a
+	 *   CPU with a thread it has just promoted to SCHED_DEADLINE.
+	 * - SCHED_FIFO priority: strictly below PipeWire's audio
+	 *   threads (default 88; min configurable 11) so the worker
+	 *   never preempts audio. */
+	if (!impl->sync_mode) {
+		CPU_ZERO(&impl->worker_affinity);
+		cpu_set_t base;
+		CPU_ZERO(&base);
+		if (sched_getaffinity(0, sizeof(base), &base) == 0) {
+			for (int c = 0; c < CPU_SETSIZE; c++)
+				if (CPU_ISSET(c, &base))
+					CPU_SET(c, &impl->worker_affinity);
+		} else {
+			pw_log_warn("sched_getaffinity failed: %m; worker will run on all CPUs");
+			for (int c = 0; c < CPU_SETSIZE; c++)
+				CPU_SET(c, &impl->worker_affinity);
+		}
+		for (int i = 0; i < impl->n_cpus; i++) {
+			if (impl->cpus[i] >= 0 && impl->cpus[i] < CPU_SETSIZE)
+				CPU_CLR(impl->cpus[i], &impl->worker_affinity);
+		}
+		if (CPU_COUNT(&impl->worker_affinity) == 0) {
+			pw_log_warn("no housekeeping CPUs left for worker; falling back to all");
+			for (int c = 0; c < CPU_SETSIZE; c++)
+				CPU_SET(c, &impl->worker_affinity);
+		}
+
+		impl->worker_tloop = pw_thread_loop_new("deadline-recalc", NULL);
+		if (impl->worker_tloop == NULL) {
+			pw_log_error("failed to create deadline-recalc thread loop: %m");
+			goto worker_failed;
+		}
+		impl->worker_loop = pw_thread_loop_get_loop(impl->worker_tloop);
+
+		/* Register the wake source BEFORE starting the worker
+		 * thread. Sources added mid-iteration from within a
+		 * worker_setup invoke proved unreliable on this host:
+		 * the worker's epoll_wait would not observe the newly
+		 * added fd. Adding from main, pre-start, guarantees the
+		 * very first pw_loop_iterate already polls it. */
+		impl->worker_wake = pw_loop_add_event(impl->worker_loop,
+						      worker_wake_func, impl);
+		if (impl->worker_wake == NULL) {
+			pw_log_error("failed to add deadline-recalc wake source: %m");
+			pw_thread_loop_destroy(impl->worker_tloop);
+			impl->worker_tloop = NULL;
+			goto worker_failed;
+		}
+
+		if (pw_thread_loop_start(impl->worker_tloop) < 0) {
+			pw_log_error("failed to start deadline-recalc thread: %m");
+			pw_loop_destroy_source(impl->worker_loop, impl->worker_wake);
+			impl->worker_wake = NULL;
+			pw_thread_loop_destroy(impl->worker_tloop);
+			impl->worker_tloop = NULL;
+			goto worker_failed;
+		}
+
+		/* Apply scheduling+affinity to the worker thread itself
+		 * via a synchronous invoke. Failure is non-fatal: the
+		 * worker still works, just at SCHED_OTHER. */
+		struct worker_setup_arg setup = {
+			.aff = impl->worker_affinity,
+			.rt_prio = impl->worker_rt_prio,
+		};
+		(void)pw_loop_invoke(impl->worker_loop, worker_setup, 0,
+				     &setup, sizeof(setup), true, NULL);
+	}
+
+worker_failed:
 	pw_context_add_listener(impl->context, &impl->context_listener, &context_events, impl);
 
 	goto done;
