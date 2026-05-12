@@ -1267,9 +1267,8 @@ static uint64_t dag_critical_path_wcet(dag_t *g)
 	return crit;
 }
 
-/* Feasibility test (spec: deadline-stale 866ef4233). Run between
- * dag_build_analysis and the deadline-splitting step. Two failure
- * modes:
+/* Feasibility test. Run between dag_build_analysis and the
+ * deadline-splitting step. Two failure modes:
  *   1. Critical-path WCET exceeds the global end-to-end deadline.
  *      No assignment can hide the fact that the heavy chain alone
  *      already overruns the budget.
@@ -1480,9 +1479,9 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 
 /* Recursive splitter kept for the documentation it provides on the
  * discount / residual-budget contract. The active analysis uses the
- * iterative form (assign_deadlines_iterative below), which exercises
- * the same helpers; this routine matches the deadline-stale spec
- * commit (622bb0019) and is exercised by the U-resbudget regression. */
+ * iterative form (assign_deadlines_iterative below), which
+ * exercises the same helpers; this routine is exercised by the
+ * residual_budget_no_double_credit regression test. */
 static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst, uint64_t D)
 {
 	int path_len;

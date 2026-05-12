@@ -584,7 +584,7 @@ PWTEST(branch_tightening_residual_budget)
 	return PWTEST_PASS;
 }
 
-/* U-resbudget: a fork-join where one side of the fork has a much
+/* a fork-join where one side of the fork has a much
  * tighter critical-path constraint than the other forces the splitter
  * to assign a sub-proportional deadline to the tight branch before
  * the wider branch is considered. The wider branch then sees a
@@ -654,7 +654,7 @@ PWTEST(residual_budget_no_double_credit)
  * expected to compute scheduling over each, with no real node left
  * unassigned. The order in which they're processed is internal to
  * the analyser; we only assert the outcome. */
-/* U-unrelated-chain: a three-node chain has every node related to
+/* a three-node chain has every node related to
  * every other node (each can reach the next), so the max unrelated
  * set has size 1. With one CPU and a configured utilization >= the
  * per-node density, the analyser must succeed and place all three
@@ -683,26 +683,26 @@ static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wce
 	s->deadline_sum += deadline;
 }
 
-/* U-dirty-noop: after a clean recalc, a second dag_foreach_node with
+/* after a clean recalc, a second dag_foreach_node with
  * no mutation in between must not re-set dirty. The assignment values
  * are stable. */
-/* U-feasibility-tight: chain whose critical-path WCET exactly matches
+/* chain whose critical-path WCET exactly matches
  * the global deadline. Feasibility check must pass; every per-node
  * deadline is positive. */
-/* U-place-descending: three independent unrelated nodes with
+/* three independent unrelated nodes with
  * distinct densities. The CPU loop orders them by descending
  * density and the placements honour that. The densest goes to CPU
  * 0 (only choice for the first); the next densest goes to a
  * different (less-loaded) CPU; etc. */
-/* U-load-reject: dag_create rejects non-finite, zero and >1
+/* dag_create rejects non-finite, zero and >1
  * utilization caps before any allocation happens. */
-/* U-timing-invalid: dag_create and dag_set_global_period_deadline
+/* dag_create and dag_set_global_period_deadline
  * reject period=0, deadline=0, and deadline>period. */
-/* U-workspace-reuse: two consecutive recalcs on the same DAG must
+/* two consecutive recalcs on the same DAG must
  * produce identical assignments and reuse the per-recalc workspace
  * pointer (the pointer is allocated to indexed_count entries on
  * first build and survives until invalidate_analysis next runs). */
-/* U-index-1: empty DAG returns NULL from dag_find_node. */
+/* empty DAG returns NULL from dag_find_node. */
 PWTEST(id_index_empty)
 {
 	dag_t *g = dag_create(100, 100, 0.95, 1);
@@ -715,7 +715,7 @@ PWTEST(id_index_empty)
 	return PWTEST_PASS;
 }
 
-/* U-index-2: a single inserted node is found by dag_find_node. */
+/* a single inserted node is found by dag_find_node. */
 PWTEST(id_index_single)
 {
 	dag_t *g = dag_create(100, 100, 0.95, 1);
@@ -732,7 +732,7 @@ PWTEST(id_index_single)
 	return PWTEST_PASS;
 }
 
-/* U-index-3: dag_find_node after dag_remove_node returns NULL. */
+/* dag_find_node after dag_remove_node returns NULL. */
 PWTEST(id_index_remove)
 {
 	dag_t *g = dag_create(100, 100, 0.95, 1);
@@ -749,7 +749,7 @@ PWTEST(id_index_remove)
 	return PWTEST_PASS;
 }
 
-/* U-index-4: shuffled insertion order, every id found, array
+/* shuffled insertion order, every id found, array
  * stays sorted. */
 PWTEST(id_index_shuffled_insertion_stays_sorted)
 {
@@ -779,7 +779,7 @@ PWTEST(id_index_shuffled_insertion_stays_sorted)
 	return PWTEST_PASS;
 }
 
-/* U-index-5: many mixed add/remove operations leave the index in
+/* many mixed add/remove operations leave the index in
  * sync with the list. */
 PWTEST(id_index_add_remove_stress)
 {
@@ -828,7 +828,7 @@ PWTEST(id_index_add_remove_stress)
 	return PWTEST_PASS;
 }
 
-/* U-index-6: a duplicate add fails with EEXIST and leaves the
+/* a duplicate add fails with EEXIST and leaves the
  * index untouched. The original ptr from dag_find_node is
  * unchanged. */
 PWTEST(id_index_duplicate_add_leaves_index_intact)
@@ -982,7 +982,7 @@ PWTEST(zero_wcet_rejected)
 	return PWTEST_PASS;
 }
 
-/* U-timing-edge: a DAG created with deadline == period (the
+/* a DAG created with deadline == period (the
  * canonical implicit-deadline case) is accepted and produces a
  * valid schedule. */
 PWTEST(timing_edge_deadline_equals_period)
@@ -1031,7 +1031,7 @@ PWTEST(load_reject_non_finite_or_out_of_range)
 	return PWTEST_PASS;
 }
 
-/* U-load-ordinary: a normal in-range cap (e.g. 0.95) yields a valid
+/* a normal in-range cap (e.g. 0.95) yields a valid
  * DAG and the admission test admits an obviously feasible graph. */
 PWTEST(load_ordinary_cap_admits)
 {
@@ -1051,7 +1051,7 @@ PWTEST(load_ordinary_cap_admits)
 	return PWTEST_PASS;
 }
 
-/* U-load-near-bound: a graph whose summed per-CPU density falls
+/* a graph whose summed per-CPU density falls
  * inside the cap by exactly the floating-point roundoff window
  * still admits. The unrelated-set placement sum is a chain of
  * division roundoffs; without an epsilon, the load might project
@@ -1107,7 +1107,7 @@ PWTEST(cpu_placement_orders_by_descending_density)
 	return PWTEST_PASS;
 }
 
-/* U-place-tie: equal-density nodes placed by worst-fit must produce
+/* equal-density nodes placed by worst-fit must produce
  * the same assignment on every run. With identical inputs, equal
  * load on every CPU after the first placement, the next densest
  * also goes to CPU 0 (lowest-index tie-break). And with 2 CPUs,
@@ -1172,7 +1172,7 @@ PWTEST(feasibility_tight_critical_path)
 	return PWTEST_PASS;
 }
 
-/* U-feasibility-overrun: critical-path WCET exceeds the global
+/* critical-path WCET exceeds the global
  * deadline. dag_recalculate must fail with EAGAIN; the DAG stays
  * dirty, deadlines/cpus are cleared. */
 PWTEST(feasibility_critical_path_overrun)
@@ -1266,7 +1266,7 @@ PWTEST(dirty_noop_after_clean_recalc)
 	return PWTEST_PASS;
 }
 
-/* U-dirty-on-wcet: changing a node's WCET marks the DAG dirty. A
+/* changing a node's WCET marks the DAG dirty. A
  * no-op set (same wcet) does NOT mark dirty. */
 PWTEST(dirty_set_node_wcet)
 {
@@ -1305,7 +1305,7 @@ PWTEST(dirty_set_node_wcet)
 	return PWTEST_PASS;
 }
 
-/* U-dirty-on-period: changing global period+deadline marks dirty,
+/* changing global period+deadline marks dirty,
  * a no-op set does not. */
 PWTEST(dirty_set_global_period_deadline)
 {
@@ -1328,7 +1328,7 @@ PWTEST(dirty_set_global_period_deadline)
 	return PWTEST_PASS;
 }
 
-/* U-dirty-on-add-edge: adding an edge after a clean recalc marks
+/* adding an edge after a clean recalc marks
  * the DAG dirty. */
 PWTEST(dirty_on_add_edge)
 {
@@ -1380,7 +1380,7 @@ PWTEST(unrelated_set_chain_admits_serially)
 	return PWTEST_PASS;
 }
 
-/* U-unrelated-indep: three independent real nodes (no edges) are all
+/* three independent real nodes (no edges) are all
  * pairwise unrelated, so the max unrelated set has size 3. With a
  * tight per-CPU utilization bound, the analyser must spread them
  * across CPUs so that each CPU's max-unrelated-density stays within
@@ -1419,7 +1419,7 @@ PWTEST(unrelated_set_independent_spreads)
 	return PWTEST_PASS;
 }
 
-/* U-unrelated-diamond: a diamond 1->{2,3}->4 has {2,3} pairwise
+/* a diamond 1->{2,3}->4 has {2,3} pairwise
  * unrelated. With two CPUs, the analyser should be able to admit
  * the diamond by placing n2 and n3 on different CPUs. */
 PWTEST(unrelated_set_diamond_admits_on_two_cpus)

@@ -21,9 +21,9 @@ extern "C" {
  * The reconcile layer sits between module-deadline's topology
  * snapshot (taken on the main loop, consumed by the deadline-recalc
  * worker thread) and the DAG library that produces SCHED_DEADLINE
- * parameters. It owns the persistent DAG state (in the next commit),
- * the per-recalc dirty bookkeeping, and the orchestration of the
- * four reconcile phases:
+ * parameters. It owns the persistent DAG state, the per-recalc
+ * dirty bookkeeping, and the orchestration of the four reconcile
+ * phases:
  *
  *   1. period   -- mirror topo->period into the dag_t.
  *   2. topology -- add/remove nodes and edges to match the snapshot,
@@ -34,12 +34,6 @@ extern "C" {
  *                  does not invalidate the cached schedule.
  *   4. recalc   -- dag_recalculate then dag_foreach_node, calling
  *                  the caller-provided sched_cb for every follower.
- *
- * In this commit the reconcile_state is a thin façade: the destroy-
- * and-rebuild path that module-deadline.c used to inline as
- * worker_apply_dag now runs from reconcile_apply, but no DAG state
- * is yet persisted across calls. The next commit lands the
- * persistent dag_t and the dirty short-circuit.
  *
  * Soft-failure contract: any follower whose WCET is currently 0
  * (typically a node still bootstrapping, or one whose plugin

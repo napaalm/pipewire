@@ -27,9 +27,16 @@ struct reconcile_state {
 	uint64_t dag_period;
 	uint64_t topo_gen_applied;
 
-	/* Back-off counter (R16): consecutive reconcile_apply failures.
-	 * Reset on success or when the topology generation bumps. */
+	/* Back-off counter. Consecutive reconcile_apply failures. Reset
+	 * on success or when the topology generation bumps from the
+	 * value last *seen* by reconcile_apply (not just the last
+	 * successful one) -- otherwise a sequence of failures on the
+	 * same generation never accumulates, since topo_gen_applied
+	 * stays at the last success.
+	 */
 	uint32_t consecutive_failures;
+	uint64_t topo_gen_seen;
+	bool     topo_gen_seen_valid;
 };
 
 #define RECONCILE_FAILURE_BACKOFF 16u
@@ -325,15 +332,25 @@ int reconcile_apply(reconcile_state_t *state,
 		return -1;
 	}
 
-	if (state->consecutive_failures >= RECONCILE_FAILURE_BACKOFF &&
-			topo->generation == state->topo_gen_applied) {
+	/* Reset the back-off counter when the topology generation
+	 * differs from the last value reconcile_apply observed. The
+	 * comparison uses topo_gen_seen (every-call cursor), NOT
+	 * topo_gen_applied (success-only cursor) -- otherwise a
+	 * sequence of failures on the same generation never
+	 * accumulates the counter past 1. */
+	if (state->topo_gen_seen_valid &&
+			topo->generation != state->topo_gen_seen) {
+		state->consecutive_failures = 0;
+	}
+	state->topo_gen_seen = topo->generation;
+	state->topo_gen_seen_valid = true;
+
+	if (state->consecutive_failures >= RECONCILE_FAILURE_BACKOFF) {
 		/* Hit the back-off; do nothing until the topology
-		 * generation bumps (which resets the counter below). */
+		 * generation bumps (which resets the counter above). */
 		errno = EAGAIN;
 		return -1;
 	}
-	if (topo->generation != state->topo_gen_applied)
-		state->consecutive_failures = 0;
 
 	if (topo->n_followers == 0) {
 		/* Empty topology: drop any persistent state so a future

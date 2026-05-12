@@ -85,6 +85,16 @@ test('test-module-deadline-wcet-sketch',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-reconcile',
+    executable('test-module-deadline-reconcile',
+               'test-module-deadline-reconcile.c',
+               '../src/modules/module-deadline/dag.c',
+               '../src/modules/module-deadline/reconcile.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-client',
     executable('test-client',
                'test-client.c',
