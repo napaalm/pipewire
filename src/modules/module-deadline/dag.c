@@ -1417,6 +1417,20 @@ static bool prefer_cpu_choice(double projected, uint32_t cpu,
 	return projected == best_projected && (int) cpu < best_cpu;
 }
 
+/* Per-CPU admission accounting. Two tasks are *related* iff either
+ * can reach the other through some path (the bitset closure built
+ * by dag_build_successors makes this a constant-time test). Tasks
+ * on the same CPU that are mutually unrelated can in principle run
+ * concurrently in different periods, so their per-CPU densities
+ * must be summed; but the relevant quantity for admission is not the
+ * raw sum of densities -- it is the maximum total density over any
+ * pairwise-unrelated subset assigned to that CPU.
+ *
+ * The unrelated sets are pre-computed by dag_comp_unrelated (one
+ * pass over the antichain enumeration of the partial order); for
+ * each CPU we maintain a per-unrelated-set running sum
+ * (cpu_set_util[cpu * unrelated_size + s]), and admission checks
+ * the worst case across all sets containing the candidate node. */
 static int assign_cpus(dag_t *g)
 {
 	uint32_t count = g->indexed_count;

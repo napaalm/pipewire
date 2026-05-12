@@ -652,6 +652,120 @@ PWTEST(residual_budget_no_double_credit)
  * expected to compute scheduling over each, with no real node left
  * unassigned. The order in which they're processed is internal to
  * the analyser; we only assert the outcome. */
+/* U-unrelated-chain: a three-node chain has every node related to
+ * every other node (each can reach the next), so the max unrelated
+ * set has size 1. With one CPU and a configured utilization >= the
+ * per-node density, the analyser must succeed and place all three
+ * on the same CPU. */
+PWTEST(unrelated_set_chain_admits_serially)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_node_t *n1, *n2, *n3;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 20, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 20, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n1 = find_node_by_id(g, 1);
+	n2 = find_node_by_id(g, 2);
+	n3 = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(n1);
+	pwtest_ptr_notnull(n2);
+	pwtest_ptr_notnull(n3);
+
+	/* Max unrelated set has size 1: the chain is fully ordered. */
+	pwtest_int_eq((int)dag_max_unrelated_size(g), 1);
+
+	/* All three nodes go to the only CPU. */
+	pwtest_int_eq((int)n1->cpu, 0);
+	pwtest_int_eq((int)n2->cpu, 0);
+	pwtest_int_eq((int)n3->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-unrelated-indep: three independent real nodes (no edges) are all
+ * pairwise unrelated, so the max unrelated set has size 3. With a
+ * tight per-CPU utilization bound, the analyser must spread them
+ * across CPUs so that each CPU's max-unrelated-density stays within
+ * the bound. */
+PWTEST(unrelated_set_independent_spreads)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 3);
+	dag_node_t *a, *b, *c;
+	uint32_t cpus_used;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 20, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 20, 103), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* All three are pairwise unrelated. */
+	pwtest_int_eq((int)dag_max_unrelated_size(g), 3);
+
+	/* Three nodes, each on its own CPU (worst-fit). */
+	{
+		uint32_t mask = (1u << a->cpu) | (1u << b->cpu) | (1u << c->cpu);
+		cpus_used = (uint32_t)__builtin_popcount(mask);
+	}
+	pwtest_int_eq((int)cpus_used, 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-unrelated-diamond: a diamond 1->{2,3}->4 has {2,3} pairwise
+ * unrelated. With two CPUs, the analyser should be able to admit
+ * the diamond by placing n2 and n3 on different CPUs. */
+PWTEST(unrelated_set_diamond_admits_on_two_cpus)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_node_t *n1, *n2, *n3, *n4;
+	static const uint32_t middle[] = { 2, 3 };
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 30, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 30, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n1 = find_node_by_id(g, 1);
+	n2 = find_node_by_id(g, 2);
+	n3 = find_node_by_id(g, 3);
+	n4 = find_node_by_id(g, 4);
+	pwtest_ptr_notnull(n1);
+	pwtest_ptr_notnull(n2);
+	pwtest_ptr_notnull(n3);
+	pwtest_ptr_notnull(n4);
+
+	pwtest_bool_true(dag_has_unrelated_subset(g, middle, 2));
+	pwtest_bool_true(n2->cpu != n3->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(disconnect_two_parallel_chains)
 {
 	dag_t *g = dag_create(100, 100, 0.95f, 2);
@@ -842,6 +956,9 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(dag_has_cycle_predicate, PWTEST_NOARG);
 	pwtest_add(disconnect_two_parallel_chains, PWTEST_NOARG);
 	pwtest_add(disconnect_chain_plus_isolated, PWTEST_NOARG);
+	pwtest_add(unrelated_set_chain_admits_serially, PWTEST_NOARG);
+	pwtest_add(unrelated_set_independent_spreads, PWTEST_NOARG);
+	pwtest_add(unrelated_set_diamond_admits_on_two_cpus, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
