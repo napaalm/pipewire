@@ -700,6 +700,156 @@ static void dirty_test_count_cb(void *data, pid_t tid, uint64_t wcet,
  * produce identical assignments and reuse the per-recalc workspace
  * pointer (the pointer is allocated to indexed_count entries on
  * first build and survives until invalidate_analysis next runs). */
+/* U-index-1: empty DAG returns NULL from dag_find_node. */
+PWTEST(id_index_empty)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_ptr_null(dag_find_node(g, 42));
+	pwtest_int_eq((int)g->nodes_by_id_count, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-index-2: a single inserted node is found by dag_find_node. */
+PWTEST(id_index_single)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_node_t *n;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 42, 10, 142), 0);
+	n = dag_find_node(g, 42);
+	pwtest_ptr_notnull(n);
+	pwtest_int_eq((int)n->id, 42);
+	pwtest_int_eq((int)g->nodes_by_id_count, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-index-3: dag_find_node after dag_remove_node returns NULL. */
+PWTEST(id_index_remove)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 42, 10, 142), 0);
+	pwtest_ptr_notnull(dag_find_node(g, 42));
+
+	pwtest_int_eq(dag_remove_node(g, 42), 0);
+	pwtest_ptr_null(dag_find_node(g, 42));
+	pwtest_int_eq((int)g->nodes_by_id_count, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-index-4: shuffled insertion order, every id found, array
+ * stays sorted. */
+PWTEST(id_index_shuffled_insertion_stays_sorted)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+	static const uint32_t shuffled[] = { 7, 3, 11, 1, 5, 9, 2, 13, 4 };
+	uint32_t i;
+
+	pwtest_ptr_notnull(g);
+	for (i = 0; i < SPA_N_ELEMENTS(shuffled); i++) {
+		pwtest_int_eq(add_real_node(g, shuffled[i], 10,
+				(pid_t)(100 + shuffled[i])), 0);
+	}
+
+	/* Every shuffled id is locatable. */
+	for (i = 0; i < SPA_N_ELEMENTS(shuffled); i++) {
+		dag_node_t *n = dag_find_node(g, shuffled[i]);
+		pwtest_ptr_notnull(n);
+		pwtest_int_eq((int)n->id, (int)shuffled[i]);
+	}
+
+	/* Array is sorted by id. */
+	for (i = 1; i < g->nodes_by_id_count; i++) {
+		pwtest_bool_true(g->nodes_by_id[i - 1]->id < g->nodes_by_id[i]->id);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-index-5: many mixed add/remove operations leave the index in
+ * sync with the list. */
+PWTEST(id_index_add_remove_stress)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+	uint32_t i;
+
+	pwtest_ptr_notnull(g);
+
+	/* Insert 64 ids in a deliberate shuffle pattern, then remove
+	 * every other one, then re-insert them. */
+	for (i = 0; i < 64; i++) {
+		uint32_t id = ((i * 17u) % 64u) + 1u;
+		(void)add_real_node(g, id, 10, (pid_t)(100 + id));
+	}
+	for (i = 1; i <= 64; i += 2) {
+		(void)dag_remove_node(g, i);
+	}
+	for (i = 1; i <= 64; i += 2) {
+		(void)add_real_node(g, i, 10, (pid_t)(100 + i));
+	}
+
+	/* Index count matches list count. */
+	{
+		uint32_t list_count = 0;
+		dag_node_t *n;
+		spa_list_for_each(n, &g->nodes, link)
+			list_count++;
+		pwtest_int_eq((int)g->nodes_by_id_count, (int)list_count);
+	}
+
+	/* dag_find_node agrees with a linear scan over dag->nodes. */
+	for (i = 1; i <= 64; i++) {
+		dag_node_t *via_index = dag_find_node(g, i);
+		dag_node_t *via_scan = NULL;
+		dag_node_t *n;
+		spa_list_for_each(n, &g->nodes, link) {
+			if (n->id == i) {
+				via_scan = n;
+				break;
+			}
+		}
+		pwtest_ptr_eq(via_index, via_scan);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-index-6: a duplicate add fails with EEXIST and leaves the
+ * index untouched. The original ptr from dag_find_node is
+ * unchanged. */
+PWTEST(id_index_duplicate_add_leaves_index_intact)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_node_t *original;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 7, 10, 107), 0);
+	original = dag_find_node(g, 7);
+	pwtest_ptr_notnull(original);
+
+	errno = 0;
+	pwtest_int_eq(add_real_node(g, 7, 20, 207), -1);
+	pwtest_int_eq(errno, EEXIST);
+
+	pwtest_ptr_eq(dag_find_node(g, 7), original);
+	pwtest_int_eq((int)g->nodes_by_id_count, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(workspace_reuse_across_recalcs)
 {
 	dag_t *g = dag_create(100, 100, 0.95f, 2);
@@ -1513,6 +1663,12 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(zero_wcet_rejected, PWTEST_NOARG);
 	pwtest_add(timing_edge_deadline_equals_period, PWTEST_NOARG);
 	pwtest_add(workspace_reuse_across_recalcs, PWTEST_NOARG);
+	pwtest_add(id_index_empty, PWTEST_NOARG);
+	pwtest_add(id_index_single, PWTEST_NOARG);
+	pwtest_add(id_index_remove, PWTEST_NOARG);
+	pwtest_add(id_index_shuffled_insertion_stays_sorted, PWTEST_NOARG);
+	pwtest_add(id_index_add_remove_stress, PWTEST_NOARG);
+	pwtest_add(id_index_duplicate_add_leaves_index_intact, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

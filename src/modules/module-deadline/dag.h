@@ -103,6 +103,17 @@ struct dag {
 	uint32_t unrelated_size;
 	uint32_t unrelated_capacity;
 
+	/* Persistent O(log N) id -> dag_node_t* index. Sorted by
+	 * dag_node_t::id ascending; maintained by dag_add_node and
+	 * dag_remove_node, queried by dag_find_node. Geometric
+	 * reallocation (start 16, double on overflow). Outlives the
+	 * indexed_nodes / unrelated caches, which only exist between
+	 * dag_build_analysis and the next mutation; this index is
+	 * always valid as long as nodes exist. */
+	dag_node_t **nodes_by_id;
+	uint32_t     nodes_by_id_count;
+	uint32_t     nodes_by_id_cap;
+
 	/* Scratch buffers used inside a single dag_recalculate run.
 	 * Allocated once when the indexed-nodes cache is built (so
 	 * they share the same lifetime as indexed_nodes), reused across
@@ -133,6 +144,11 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 
 /* Update the WCET of a node */
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
+
+/* O(log N) lookup of a real or fictitious node by id. Returns
+ * NULL if the id is not in the graph. The returned pointer is
+ * stable until the next dag_remove_node touching this id. */
+dag_node_t *dag_find_node(dag_t *g, uint32_t id);
 
 /* Recalculate scheduling parameters after changes */
 int dag_recalculate(dag_t *g);

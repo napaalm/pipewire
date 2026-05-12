@@ -224,6 +224,7 @@ void dag_destroy(dag_t *g)
 		free(n);
 	}
 
+	free(g->nodes_by_id);
 	free(g);
 }
 
@@ -248,14 +249,102 @@ int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 	return 0;
 }
 
+/* nodes_by_id starts at this capacity; doubles on overflow.
+ * Sized so that the typical audio graph (a few dozen nodes per
+ * driver) never reallocates after the first round. */
+#define DAG_NODES_BY_ID_INITIAL_CAP 16u
+
+/* Binary search for `id` in g->nodes_by_id. Returns the index of
+ * the matching slot if found, or the index where `id` would be
+ * inserted to keep the array sorted (caller checks the slot's id
+ * to distinguish). */
+static uint32_t dag_nodes_by_id_bsearch(dag_t *g, uint32_t id)
+{
+	uint32_t lo = 0;
+	uint32_t hi = g->nodes_by_id_count;
+
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (g->nodes_by_id[mid]->id < id)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* Insert `n` into g->nodes_by_id, keeping the array sorted by id.
+ * Geometric realloc: starts at 16, doubles on overflow. On
+ * allocation failure leaves the array untouched and returns -1
+ * with errno=ENOMEM. */
+static int dag_nodes_by_id_insert(dag_t *g, dag_node_t *n)
+{
+	uint32_t pos;
+
+	if (g->nodes_by_id_count == g->nodes_by_id_cap) {
+		uint32_t new_cap = g->nodes_by_id_cap ?
+				g->nodes_by_id_cap * 2 :
+				DAG_NODES_BY_ID_INITIAL_CAP;
+		dag_node_t **resized = realloc(g->nodes_by_id,
+				(size_t)new_cap * sizeof(*resized));
+
+		if (!resized) {
+			errno = ENOMEM;
+			return -1;
+		}
+		g->nodes_by_id = resized;
+		g->nodes_by_id_cap = new_cap;
+	}
+
+	pos = dag_nodes_by_id_bsearch(g, n->id);
+	if (pos < g->nodes_by_id_count) {
+		memmove(&g->nodes_by_id[pos + 1], &g->nodes_by_id[pos],
+				(g->nodes_by_id_count - pos) *
+				sizeof(*g->nodes_by_id));
+	}
+	g->nodes_by_id[pos] = n;
+	g->nodes_by_id_count++;
+	return 0;
+}
+
+/* Remove n's slot from g->nodes_by_id. The slot is found by
+ * bsearch and a pointer-equality check. Returns 0 on success
+ * (also when the entry was absent), preserves sort order. */
+static void dag_nodes_by_id_remove(dag_t *g, dag_node_t *n)
+{
+	uint32_t pos;
+
+	if (g->nodes_by_id_count == 0)
+		return;
+	pos = dag_nodes_by_id_bsearch(g, n->id);
+	if (pos >= g->nodes_by_id_count || g->nodes_by_id[pos] != n)
+		return;
+	if (pos < g->nodes_by_id_count - 1) {
+		memmove(&g->nodes_by_id[pos], &g->nodes_by_id[pos + 1],
+				(g->nodes_by_id_count - pos - 1) *
+				sizeof(*g->nodes_by_id));
+	}
+	g->nodes_by_id_count--;
+}
+
+dag_node_t *dag_find_node(dag_t *g, uint32_t id)
+{
+	uint32_t pos;
+
+	if (!g || g->nodes_by_id_count == 0)
+		return NULL;
+	pos = dag_nodes_by_id_bsearch(g, id);
+	if (pos >= g->nodes_by_id_count)
+		return NULL;
+	return g->nodes_by_id[pos]->id == id ? g->nodes_by_id[pos] : NULL;
+}
+
+/* Internal alias kept for readability of the rest of the file --
+ * the public name lives in dag.h. */
 static dag_node_t *find_node(dag_t *g, uint32_t id)
 {
-	dag_node_t *n;
-	spa_list_for_each(n, &g->nodes, link) {
-		if (n->id == id)
-			return n;
-	}
-	return NULL;
+	return dag_find_node(g, id);
 }
 
 static dag_node_t *dag_find_fictitious_source(dag_t *g)
@@ -318,6 +407,15 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	spa_list_init(&n->incoming);
 	spa_list_append(&g->nodes, &n->link);
 
+	/* Maintain the persistent id-index. On ENOMEM, roll back the
+	 * list insertion so the graph is left exactly as the caller
+	 * found it. */
+	if (dag_nodes_by_id_insert(g, n) < 0) {
+		spa_list_remove(&n->link);
+		free(n);
+		return -1;
+	}
+
 	dag_invalidate_analysis(g);
 	dag_mark_dirty(g);
 	return 0;
@@ -345,6 +443,7 @@ static int dag_remove_node_ptr(dag_t *g, dag_node_t *n)
 		free(e);
 	}
 
+	dag_nodes_by_id_remove(g, n);
 	spa_list_remove(&n->link);
 	free(n->successors);
 	free(n);

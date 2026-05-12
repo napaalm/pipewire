@@ -483,9 +483,18 @@ struct impl {
 	cpu_set_t             worker_affinity; /* online CPUs - cpus.available */
 
 	struct spa_list node_list;
+
+	/* O(log N) id -> struct node * index. Sorted by node_id
+	 * ascending; maintained by node_register / node_unregister so
+	 * every alloc/free site stays in sync. Geometric realloc
+	 * (start 16, double on overflow). */
+	struct node **nodes_by_id;
+	uint32_t      nodes_by_id_count;
+	uint32_t      nodes_by_id_cap;
 };
 
 static void hist_dump(const char *who, struct node *drv);
+static void node_unregister(struct impl *impl, struct node *n);
 
 static void module_destroy(void *data)
 {
@@ -529,12 +538,14 @@ static void module_destroy(void *data)
 		free(n->ring_slots);
 		free(n->topo.nodes);
 		free(n->topo.edges);
+		node_unregister(impl, n);
 		spa_list_remove(&n->link);
 		free(n);
 	}
 
 	spa_hook_remove(&impl->module_listener);
 
+	free(impl->nodes_by_id);
 	free(impl);
 }
 
@@ -641,6 +652,70 @@ static void sched_cb(void *data, pid_t tid, uint64_t runtime, uint64_t deadline,
 	set_cpu_affinity(tid, impl->cpus[cpu]);
 }
 
+/* Bsearch over impl->nodes_by_id for `id`; returns the array slot
+ * where `id` lives or would be inserted to keep order. */
+#define MODULE_NODES_BY_ID_INITIAL_CAP 16u
+
+static uint32_t nodes_by_id_bsearch(struct impl *impl, uint32_t id)
+{
+	uint32_t lo = 0, hi = impl->nodes_by_id_count;
+
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+
+		if (impl->nodes_by_id[mid]->node_id < id)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static int node_register(struct impl *impl, struct node *n)
+{
+	uint32_t pos;
+
+	if (impl->nodes_by_id_count == impl->nodes_by_id_cap) {
+		uint32_t new_cap = impl->nodes_by_id_cap ?
+				impl->nodes_by_id_cap * 2 :
+				MODULE_NODES_BY_ID_INITIAL_CAP;
+		struct node **resized = realloc(impl->nodes_by_id,
+				(size_t)new_cap * sizeof(*resized));
+
+		if (!resized)
+			return -ENOMEM;
+		impl->nodes_by_id = resized;
+		impl->nodes_by_id_cap = new_cap;
+	}
+
+	pos = nodes_by_id_bsearch(impl, n->node_id);
+	if (pos < impl->nodes_by_id_count) {
+		memmove(&impl->nodes_by_id[pos + 1], &impl->nodes_by_id[pos],
+				(impl->nodes_by_id_count - pos) *
+				sizeof(*impl->nodes_by_id));
+	}
+	impl->nodes_by_id[pos] = n;
+	impl->nodes_by_id_count++;
+	return 0;
+}
+
+static void node_unregister(struct impl *impl, struct node *n)
+{
+	uint32_t pos;
+
+	if (impl->nodes_by_id_count == 0)
+		return;
+	pos = nodes_by_id_bsearch(impl, n->node_id);
+	if (pos >= impl->nodes_by_id_count || impl->nodes_by_id[pos] != n)
+		return;
+	if (pos < impl->nodes_by_id_count - 1) {
+		memmove(&impl->nodes_by_id[pos], &impl->nodes_by_id[pos + 1],
+				(impl->nodes_by_id_count - pos - 1) *
+				sizeof(*impl->nodes_by_id));
+	}
+	impl->nodes_by_id_count--;
+}
+
 static struct node *find_node(struct impl *impl, struct pw_impl_node *node)
 {
 	struct node *n;
@@ -651,14 +726,25 @@ static struct node *find_node(struct impl *impl, struct pw_impl_node *node)
 	return NULL;
 }
 
+/* O(log N) follower lookup. The shared index holds both drivers
+ * and followers (the PipeWire id space is unique per context, so
+ * two distinct struct nodes never share node_id); we filter out
+ * drivers here so behaviour matches the previous linear-scan
+ * version exactly. */
 static struct node *find_node_by_id(struct impl *impl, uint32_t id)
 {
+	uint32_t pos;
 	struct node *n;
-	spa_list_for_each(n, &impl->node_list, link) {
-		if (!n->is_driver && n->node_id == id)
-			return n;
-	}
-	return NULL;
+
+	if (impl->nodes_by_id_count == 0)
+		return NULL;
+	pos = nodes_by_id_bsearch(impl, id);
+	if (pos >= impl->nodes_by_id_count)
+		return NULL;
+	n = impl->nodes_by_id[pos];
+	if (n->node_id != id || n->is_driver)
+		return NULL;
+	return n;
 }
 
 /* Log2 bucket of x. Used to bin RT-hook timings cheaply (no log call,
@@ -862,6 +948,11 @@ static void recalc_params_sync(struct node *drv)
 			n->node_id = tnode->info.id;
 			n->enabled = true;
 			spa_list_insert(&impl->node_list, &n->link);
+			if (node_register(impl, n) < 0) {
+				spa_list_remove(&n->link);
+				free(n);
+				continue;
+			}
 		}
 
 		na = t->activation;
@@ -987,6 +1078,11 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 				 * topology snapshot carries the id+tid
 				 * we need to apply DEADLINE. */
 				spa_list_insert(&impl->node_list, &n->link);
+				if (node_register(impl, n) < 0) {
+					spa_list_remove(&n->link);
+					free(n);
+					n = NULL;
+				}
 			}
 		}
 		if (n)
@@ -1343,6 +1439,14 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 	spa_ringbuffer_init(&n->ring);
 
 	spa_list_append(&impl->node_list, &n->link);
+	if (node_register(impl, n) < 0) {
+		pw_log_warn("driver %d: failed to register in id index; module disabled for this driver",
+			    node->info.id);
+		spa_list_remove(&n->link);
+		free(n->ring_slots);
+		free(n);
+		return;
+	}
 	set_driver_hook_state(n, true);
 
 	/* Async mode: prime the first topology snapshot so the very
@@ -1376,6 +1480,7 @@ static void context_driver_removed(void *data, struct pw_impl_node *node)
 	free(n->ring_slots);
 	free(n->topo.nodes);
 	free(n->topo.edges);
+	node_unregister(impl, n);
 	spa_list_remove(&n->link);
 	free(n);
 }
