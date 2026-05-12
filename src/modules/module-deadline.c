@@ -43,6 +43,7 @@
 #include "config.h"
 
 #include "module-deadline/dag.h"
+#include "module-deadline/reconcile.h"
 #include "module-deadline/wcet_sketch.h"
 
 #include <spa/utils/result.h>
@@ -383,6 +384,14 @@ struct topo_snap {
 	uint64_t period;
 	bool     ok;
 	uint32_t pending;  /* atomic, CAS-coalesces async snapshot invokes */
+
+	/* Monotonic generation counter incremented (release store) at
+	 * the end of every successful snapshot_topology_main. Workers
+	 * read it via acquire load and compare against
+	 * drv->topo_gen_applied to decide whether a topology-reconcile
+	 * pass is needed this wake. Wraps at UINT64_MAX which is
+	 * effectively never in any realistic deployment. */
+	uint64_t generation;
 };
 
 struct node {
@@ -423,6 +432,17 @@ struct node {
 	 * this driver. Filled by the main-loop callback; consumed by
 	 * the worker. */
 	struct topo_snap      topo;
+
+	/* Highest topo.generation the worker has already reconciled
+	 * against. Compared by the worker against the snapshot's
+	 * current generation before deciding whether the topology
+	 * reconcile pass is needed; the persistent-DAG path uses this
+	 * to short-circuit no-op cycles. */
+	uint64_t              topo_gen_applied;
+
+	/* Per-driver reconcile state. Owned by this struct node; freed
+	 * at driver_removed / module_destroy via reconcile_fini. */
+	reconcile_state_t    *reconcile;
 
 	/* Per-driver RT-hook timing histogram. Log2-bucket of CPU-time
 	 * nanoseconds spent in the RT hook body. Worker reads at
@@ -533,6 +553,10 @@ static void module_destroy(void *data)
 	 * release driver/follower bookkeeping. */
 	spa_list_for_each_safe(n, tmp, &impl->node_list, link) {
 		hist_dump("destroy", n);
+		if (n->reconcile) {
+			reconcile_fini(n->reconcile);
+			n->reconcile = NULL;
+		}
 		if (n->sketch_ready)
 			wcet_sketch_fini(&n->sketch);
 		free(n->ring_slots);
@@ -1205,6 +1229,12 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 	}
 
 	t->ok = true;
+	/* Release-store the generation bump so the worker (which acquires
+	 * t->generation before reading the nodes/edges arrays) observes
+	 * the freshly-written topology atomically. The pending flag is
+	 * cleared after the release so an early-return path never bumps
+	 * the generation. */
+	SPA_ATOMIC_STORE(t->generation, t->generation + 1);
 	SPA_ATOMIC_STORE(t->pending, 0);
 	return 0;
 }
@@ -1221,65 +1251,65 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
  * everyone else. Drop any edge that referenced the skipped node;
  * the DAG library treats the resulting sub-graph as the workload
  * to schedule. */
+/* Build a reconcile_topo_t snapshot from the driver's per-tick
+ * topology view, then hand off to the reconcile layer. The
+ * follower array carries each follower's current WCET (looked up
+ * via the module-side id-index in O(log N)). */
 static void worker_apply_dag(struct impl *impl, struct node *drv)
 {
 	struct topo_snap *t = &drv->topo;
+	reconcile_follower_t *followers;
+	reconcile_edge_t *edges;
+	reconcile_topo_t rtopo = { 0 };
+	uint32_t i;
+
 	if (!t->ok || t->n_nodes == 0)
 		return;
 
-	dag_t *dag = dag_create(t->period, t->period, impl->cpu_utilization, impl->n_cpus);
+	if (drv->reconcile == NULL) {
+		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
+				impl->cpu_utilization,
+				/* recalc_threshold = 0 in this commit:
+				 * the gate lands with the persistent DAG
+				 * path in the next commit. */
+				0.0);
+		if (drv->reconcile == NULL) {
+			pw_log_warn("reconcile_init failed: %m");
+			return;
+		}
+	}
 
-	/* keep[i] = whether t->nodes[i] made it into the DAG */
-	bool *keep = calloc(t->n_nodes, sizeof(bool));
-	if (keep == NULL) {
-		dag_destroy(dag);
+	followers = calloc(t->n_nodes, sizeof(*followers));
+	edges = t->n_edges ? calloc(t->n_edges, sizeof(*edges)) : NULL;
+	if (!followers || (t->n_edges && !edges)) {
+		free(followers);
+		free(edges);
 		return;
 	}
 
-	uint32_t skipped = 0;
-	for (uint32_t i = 0; i < t->n_nodes; i++) {
+	for (i = 0; i < t->n_nodes; i++) {
 		struct node *n = find_node_by_id(impl, t->nodes[i].id);
-		if (n == NULL || n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
-			pw_log_debug("worker: skipping node %u (wcet=%lu) -- "
-				     "applying DEADLINE to remaining nodes",
-				     t->nodes[i].id, n ? n->wcet : 0);
-			skipped++;
-			continue;
-		}
-		dag_add_node(dag, t->nodes[i].id,
-			     (uint64_t)(n->wcet * 1.05), t->nodes[i].tid, false);
-		keep[i] = true;
+
+		followers[i].id = t->nodes[i].id;
+		followers[i].tid = t->nodes[i].tid;
+		followers[i].wcet = n ? n->wcet : 0;
+	}
+	for (i = 0; i < t->n_edges; i++) {
+		edges[i].src = t->edges[i].src;
+		edges[i].dst = t->edges[i].dst;
 	}
 
-	if (t->n_nodes - skipped == 0) {
-		/* Nothing to schedule yet: every follower is missing
-		 * runtime samples. Try again next tick. */
-		free(keep);
-		dag_destroy(dag);
-		return;
-	}
+	rtopo.followers = followers;
+	rtopo.n_followers = t->n_nodes;
+	rtopo.edges = edges;
+	rtopo.n_edges = t->n_edges;
+	rtopo.period = t->period;
+	rtopo.generation = SPA_ATOMIC_LOAD(t->generation);
 
-	for (uint32_t i = 0; i < t->n_edges; i++) {
-		/* Map src/dst to the keep[] index. Linear scan over a
-		 * handful of nodes; topology is small. */
-		bool src_kept = false, dst_kept = false;
-		for (uint32_t j = 0; j < t->n_nodes; j++) {
-			if (!keep[j])
-				continue;
-			if (t->nodes[j].id == t->edges[i].src)
-				src_kept = true;
-			if (t->nodes[j].id == t->edges[i].dst)
-				dst_kept = true;
-		}
-		if (src_kept && dst_kept)
-			dag_add_edge(dag, t->edges[i].src, t->edges[i].dst);
-	}
+	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
 
-	dag_recalculate(dag);
-	dag_foreach_node(dag, sched_cb, impl);
-
-	free(keep);
-	dag_destroy(dag);
+	free(followers);
+	free(edges);
 }
 
 /* Worker-context: full recalc cycle for one driver. Drains samples,
@@ -1506,6 +1536,10 @@ static void context_driver_removed(void *data, struct pw_impl_node *node)
 	/* After remove_rt_listener returns, no more RT callbacks for
 	 * this driver are in flight. Tear down its async state. */
 	hist_dump("driver-removed", n);
+	if (n->reconcile) {
+		reconcile_fini(n->reconcile);
+		n->reconcile = NULL;
+	}
 	if (n->sketch_ready)
 		wcet_sketch_fini(&n->sketch);
 	free(n->ring_slots);

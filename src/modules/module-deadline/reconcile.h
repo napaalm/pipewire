@@ -1,0 +1,150 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2026 Antonio Napolitano and Francesco Barcherini */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef RECONCILE_H
+#define RECONCILE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/types.h>
+
+#include "dag.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Reconcile helpers for module-deadline.
+ *
+ * The reconcile layer sits between module-deadline's topology
+ * snapshot (taken on the main loop, consumed by the deadline-recalc
+ * worker thread) and the DAG library that produces SCHED_DEADLINE
+ * parameters. It owns the persistent DAG state (in the next commit),
+ * the per-recalc dirty bookkeeping, and the orchestration of the
+ * four reconcile phases:
+ *
+ *   1. period   -- mirror topo->period into the dag_t.
+ *   2. topology -- add/remove nodes and edges to match the snapshot,
+ *                  filtering feedback / async links (already done by
+ *                  the caller before reaching us).
+ *   3. budgets  -- mirror per-follower WCET into the DAG, gated by
+ *                  the recalc-threshold so a sub-threshold drift
+ *                  does not invalidate the cached schedule.
+ *   4. recalc   -- dag_recalculate then dag_foreach_node, calling
+ *                  the caller-provided sched_cb for every follower.
+ *
+ * In this commit the reconcile_state is a thin façade: the destroy-
+ * and-rebuild path that module-deadline.c used to inline as
+ * worker_apply_dag now runs from reconcile_apply, but no DAG state
+ * is yet persisted across calls. The next commit lands the
+ * persistent dag_t and the dirty short-circuit.
+ *
+ * Soft-failure contract: any follower whose WCET is currently 0
+ * (typically a node still bootstrapping, or one whose plugin
+ * failed to start) is excluded from the DAG along with every edge
+ * that touches it. The DAG library schedules the remaining sub-
+ * graph; peers keep their SCHED_DEADLINE attributes. The soft
+ * failure is sticky only as long as the WCET stays at 0; the next
+ * non-zero sample re-incorporates the node on the following
+ * reconcile pass.
+ *
+ * Back-off contract (R16 in the implementation plan): consecutive
+ * reconcile failures (allocation failures, library errors) raise a
+ * per-driver back-off counter; after 16 strikes the worker stops
+ * trying until the topology generation bumps. The state struct
+ * carries this counter so it survives across reconcile_apply calls.
+ *
+ * Feedback-edge filtering rationale: feedback and async links in
+ * the PipeWire graph use spa_io_async_buffers (one-cycle delay) and
+ * therefore introduce no in-period precedence. The caller filters
+ * them out of the topology snapshot before reaching reconcile, so
+ * the DAG library never sees a cycle-creating edge in normal
+ * operation; the library's ELOOP rejection is defense-in-depth.
+ */
+
+/* Opaque reconcile state. Owned by the caller, who must alloc-init
+ * via reconcile_init and finalize via reconcile_fini. The state
+ * caches the eventual persistent DAG so the typical no-op reconcile
+ * cycle costs nothing beyond the freshness check. */
+typedef struct reconcile_state reconcile_state_t;
+
+/* Snapshot of a follower as seen by the reconcile layer. Fed by the
+ * caller (module-deadline.c builds it from struct node). */
+typedef struct {
+	uint32_t id;
+	pid_t    tid;
+	uint64_t wcet;
+} reconcile_follower_t;
+
+/* Directed edge (src -> dst) in the topology view. */
+typedef struct {
+	uint32_t src;
+	uint32_t dst;
+} reconcile_edge_t;
+
+/* Topology view consumed by reconcile_apply. */
+typedef struct {
+	const reconcile_follower_t *followers;
+	uint32_t                    n_followers;
+
+	const reconcile_edge_t     *edges;
+	uint32_t                    n_edges;
+
+	uint64_t period;
+	uint64_t generation;
+} reconcile_topo_t;
+
+/*
+ * Sched callback signature. Identical to dag_foreach_node's
+ * callback. Called once per real follower per reconcile_apply with
+ * the freshly assigned (runtime, deadline, period, cpu) tuple; the
+ * implementation in module-deadline.c is sched_cb, which applies
+ * SCHED_DEADLINE + CPU affinity via syscalls.
+ */
+typedef void (*reconcile_sched_cb_t)(void *data, pid_t tid,
+		uint64_t runtime, uint64_t deadline,
+		uint64_t period, uint32_t cpu);
+
+/* Allocate and initialize a reconcile state. `n_cpus` and
+ * `cpu_utilization` mirror the dag_create arguments; `recalc_threshold`
+ * is the per-WCET fractional change required to mark the DAG dirty
+ * (0 means every change marks dirty, 0.01 = the recommended default).
+ *
+ * Returns NULL on allocation failure (errno set). */
+reconcile_state_t *reconcile_init(uint32_t n_cpus,
+		double cpu_utilization,
+		double recalc_threshold);
+
+/*
+ * Free everything reconcile_init allocated, plus any persistent
+ * DAG state. Safe to call on a NULL pointer. Called by module-
+ * deadline.c at driver_removed and module_destroy; no other
+ * lifecycle hook frees the reconcile state.
+ */
+void reconcile_fini(reconcile_state_t *state);
+
+/*
+ * Drop the persistent DAG (forces a full rebuild on the next
+ * reconcile_apply). Used by the back-off path when the DAG enters
+ * an unrecoverable state. The reconcile_state itself stays alive;
+ * only the cached dag_t is freed.
+ */
+void reconcile_drop(reconcile_state_t *state);
+
+/* Run the full four-phase reconcile against `topo`. Calls
+ * `sched_cb` for every real follower with its updated
+ * (runtime, deadline, period, cpu) tuple. Returns 0 on success
+ * with the DAG clean afterwards; -1 on infeasible input or
+ * allocation failure (errno set), with the persistent state
+ * dropped so the next call retries from scratch. */
+int reconcile_apply(reconcile_state_t *state,
+		const reconcile_topo_t *topo,
+		reconcile_sched_cb_t sched_cb, void *sched_data);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* RECONCILE_H */
