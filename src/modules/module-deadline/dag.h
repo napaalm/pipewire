@@ -101,6 +101,12 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
 /* Recalculate scheduling parameters after changes */
 int dag_recalculate(dag_t *g);
 
+/* Return true if the DAG currently contains a cycle. Walks the
+ * graph independently of the indexed-nodes cache so the caller may
+ * invoke it even before dag_recalculate. Defense-in-depth for the
+ * topology-snapshot filter in module-deadline. */
+bool dag_has_cycle(dag_t *g);
+
 /* Apply a function to all tids with current scheduling parameters */
 typedef void (*dag_node_callback_t)(void *data, pid_t tid, uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);

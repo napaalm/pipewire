@@ -307,8 +307,117 @@ int dag_remove_node(dag_t *g, uint32_t id)
 	return 0;
 }
 
+/* Internal reachability check: returns 1 if `src` can reach `dst`
+ * by following any directed path in the current DAG, 0 otherwise,
+ * -1 on allocation failure (errno set). Independent of the indexed-
+ * nodes cache so the caller may invoke it during graph mutation
+ * (when the cache is invalidated). DFS over an explicit stack to
+ * avoid recursion depth limits for large graphs.
+ *
+ * src == dst returns 1 by convention -- callers use this to detect
+ * self-cycles that would-be edges close. */
+static int dag_node_reaches(dag_t *g, dag_node_t *src, dag_node_t *dst)
+{
+	dag_node_t **stack;
+	dag_node_t **all_nodes;
+	bool *visited;
+	uint32_t n_nodes, stack_len = 0;
+	int result = 0;
+	uint32_t i;
+	dag_node_t *iter;
+
+	if (src == dst)
+		return 1;
+
+	n_nodes = dag_list_len(&g->nodes);
+	if (n_nodes == 0)
+		return 0;
+
+	all_nodes = calloc(n_nodes, sizeof(*all_nodes));
+	visited = calloc(n_nodes, sizeof(*visited));
+	stack = calloc(n_nodes, sizeof(*stack));
+	if (!all_nodes || !visited || !stack) {
+		free(all_nodes);
+		free(visited);
+		free(stack);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	i = 0;
+	spa_list_for_each(iter, &g->nodes, link)
+		all_nodes[i++] = iter;
+
+	for (i = 0; i < n_nodes; i++) {
+		if (all_nodes[i] == src) {
+			visited[i] = true;
+			stack[stack_len++] = src;
+			break;
+		}
+	}
+
+	while (stack_len > 0) {
+		dag_node_t *u = stack[--stack_len];
+		dag_edge_t *e;
+
+		spa_list_for_each(e, &u->outgoing, src_link) {
+			if (e->dst == dst) {
+				result = 1;
+				goto out;
+			}
+			for (i = 0; i < n_nodes; i++) {
+				if (all_nodes[i] == e->dst) {
+					if (!visited[i]) {
+						visited[i] = true;
+						stack[stack_len++] = e->dst;
+					}
+					break;
+				}
+			}
+		}
+	}
+
+out:
+	free(stack);
+	free(visited);
+	free(all_nodes);
+	return result;
+}
+
+bool dag_has_cycle(dag_t *g)
+{
+	dag_node_t *n;
+
+	if (!g)
+		return false;
+
+	/* A graph is cyclic iff some node can reach itself through at
+	 * least one outgoing edge. Walk per node; each walk skips its
+	 * own start so a single self-edge is detected as a cycle too
+	 * (it would already have been rejected at add time, but the
+	 * predicate has to handle a graph populated by a code path that
+	 * bypasses dag_add_edge -- e.g. an internal mutation gone
+	 * wrong). */
+	spa_list_for_each(n, &g->nodes, link) {
+		dag_edge_t *e;
+
+		spa_list_for_each(e, &n->outgoing, src_link) {
+			int r = dag_node_reaches(g, e->dst, n);
+
+			if (r < 0)
+				return false;
+			if (r > 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 {
+	int reaches;
+
 	if (!g) {
 		errno = EINVAL;
 		return -1;
@@ -321,6 +430,13 @@ int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 		return -1;
 	}
 
+	/* Self-loop: a node cannot precede itself within a single
+	 * period. We reject the edge before any mutation. */
+	if (src == dst) {
+		errno = EINVAL;
+		return -1;
+	}
+
 	/* Check if edge already exists */
 	dag_edge_t *e;
 	spa_list_for_each(e, &g->edges, link) {
@@ -328,6 +444,20 @@ int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 			errno = EEXIST;
 			return -1;
 		}
+	}
+
+	/* Cycle check: if dst already reaches src by some path, then
+	 * adding src->dst would close a cycle. Reject with -ELOOP and
+	 * leave the graph untouched. PipeWire feedback links are
+	 * pre-filtered by the topology-snapshot layer, so a cycle
+	 * arriving here means the filter missed a case -- the library
+	 * fails safe rather than producing wrong scheduling. */
+	reaches = dag_node_reaches(g, dst, src);
+	if (reaches < 0)
+		return -1;
+	if (reaches > 0) {
+		errno = ELOOP;
+		return -1;
 	}
 
 	e = calloc(1, sizeof(*e));
@@ -485,14 +615,32 @@ static int topological_sort(dag_t *g, dag_node_t **out)
 	free(indegree);
 	free(arr.nodes);
 
+	/* Partial order out of Kahn's algorithm == cyclic input. The
+	 * library promises this never happens because dag_add_edge
+	 * rejects cycle-creating edges, but a defensive ELOOP here
+	 * still lets dag_recalculate fail safe rather than producing
+	 * a meaningless schedule on a corrupted graph. */
 	if (idx != arr.count) {
-		errno = EINVAL;
+		errno = ELOOP;
 		return -1;
 	}
 
 	return (int)idx;
 }
 
+/* Sources are real nodes with no real incoming edge (a node whose
+ * only incoming edges come from a fictitious endpoint also qualifies);
+ * sinks are real nodes with no real outgoing edge. An isolated real
+ * node has neither and is classified as both source AND sink, so the
+ * fictitious-endpoint pass connects it to both fic_src and fic_sink
+ * and the recalc treats it as its own one-node subproblem.
+ *
+ * The arrays are not partitioned by component. dag_recalculate uses
+ * them only to know which real nodes need a fictitious-source edge
+ * (and a fictitious-sink edge); component partitioning falls out
+ * naturally from the longest-path computation in the per-node
+ * iterative assignment, which traverses only one component at a
+ * time via the longest_next chain. */
 static void find_sources_and_sinks(dag_t *g, dag_node_t ***sources, uint32_t *nsources,
 		dag_node_t ***sinks, uint32_t *nsinks)
 {

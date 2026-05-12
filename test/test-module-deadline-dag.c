@@ -648,6 +648,149 @@ PWTEST(residual_budget_no_double_credit)
 	return PWTEST_PASS;
 }
 
+/* Two disconnected source-to-sink subproblems. The library is
+ * expected to compute scheduling over each, with no real node left
+ * unassigned. The order in which they're processed is internal to
+ * the analyser; we only assert the outcome. */
+PWTEST(disconnect_two_parallel_chains)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_node_t *a1, *a2, *x1, *x2;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a1 = find_node_by_id(g, 1);
+	a2 = find_node_by_id(g, 2);
+	x1 = find_node_by_id(g, 3);
+	x2 = find_node_by_id(g, 4);
+	pwtest_ptr_notnull(a1);
+	pwtest_ptr_notnull(a2);
+	pwtest_ptr_notnull(x1);
+	pwtest_ptr_notnull(x2);
+	pwtest_bool_true(a1->deadline_assigned);
+	pwtest_bool_true(a2->deadline_assigned);
+	pwtest_bool_true(x1->deadline_assigned);
+	pwtest_bool_true(x2->deadline_assigned);
+	pwtest_bool_true(a1->deadline > 0);
+	pwtest_bool_true(a2->deadline > 0);
+	pwtest_bool_true(x1->deadline > 0);
+	pwtest_bool_true(x2->deadline > 0);
+	/* Each chain's deadlines fit within the global budget independently. */
+	pwtest_bool_true(a1->deadline + a2->deadline <= g->deadline);
+	pwtest_bool_true(x1->deadline + x2->deadline <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* A graph that is a chain plus an isolated real node with no edges.
+ * find_sources_and_sinks treats it as both a source and a sink; the
+ * recalc must still assign it a deadline. */
+PWTEST(disconnect_chain_plus_isolated)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_node_t *a, *b, *iso;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 99, 5, 199), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	iso = find_node_by_id(g, 99);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(iso);
+
+	pwtest_bool_true(a->deadline_assigned);
+	pwtest_bool_true(b->deadline_assigned);
+	pwtest_bool_true(iso->deadline_assigned);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(iso->deadline > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(self_loop_rejected_with_einval)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+
+	errno = 0;
+	pwtest_int_eq(dag_add_edge(g, 1, 1), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* The DAG must remain in a sane state -- no phantom edge. */
+	pwtest_bool_true(spa_list_is_empty(&g->edges));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(cycle_creating_edge_rejected_with_eloop)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	/* 3 -> 1 would close a cycle 1->2->3->1. */
+	errno = 0;
+	pwtest_int_eq(dag_add_edge(g, 3, 1), -1);
+	pwtest_int_eq(errno, ELOOP);
+
+	/* The edge must NOT have been added (count stays at 2). */
+	{
+		uint32_t n_edges = 0;
+		dag_edge_t *e;
+		spa_list_for_each(e, &g->edges, link)
+			n_edges++;
+		pwtest_int_eq((int)n_edges, 2);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dag_has_cycle_predicate)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+
+	pwtest_bool_false(dag_has_cycle(g));
+
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_bool_false(dag_has_cycle(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(equal_load_ties_choose_lowest_cpu)
 {
 	dag_t *g = dag_create(300, 300, 0.10f, 2);
@@ -694,6 +837,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(diamond_deadlines, PWTEST_NOARG);
 	pwtest_add(branch_tightening_residual_budget, PWTEST_NOARG);
 	pwtest_add(residual_budget_no_double_credit, PWTEST_NOARG);
+	pwtest_add(self_loop_rejected_with_einval, PWTEST_NOARG);
+	pwtest_add(cycle_creating_edge_rejected_with_eloop, PWTEST_NOARG);
+	pwtest_add(dag_has_cycle_predicate, PWTEST_NOARG);
+	pwtest_add(disconnect_two_parallel_chains, PWTEST_NOARG);
+	pwtest_add(disconnect_chain_plus_isolated, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
