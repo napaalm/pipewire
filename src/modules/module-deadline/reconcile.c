@@ -19,11 +19,10 @@ struct reconcile_state {
 	uint32_t n_cpus;
 	double   cpu_utilization;
 	double   recalc_threshold;
+	bool     persistent;
 
-	/* The persistent DAG lives here from the next commit. In this
-	 * commit we still allocate-and-destroy per reconcile_apply, so
-	 * the field is unused but reserved to make the next commit's
-	 * diff minimal. */
+	/* Persistent DAG. NULL on first apply, on driver reset, and
+	 * after a reconcile_drop. */
 	dag_t   *dag;
 	uint64_t dag_period;
 	uint64_t topo_gen_applied;
@@ -37,7 +36,8 @@ struct reconcile_state {
 
 reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double cpu_utilization,
-		double recalc_threshold)
+		double recalc_threshold,
+		bool persistent)
 {
 	reconcile_state_t *state;
 
@@ -54,7 +54,13 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 	state->n_cpus = n_cpus;
 	state->cpu_utilization = cpu_utilization;
 	state->recalc_threshold = recalc_threshold;
+	state->persistent = persistent;
 	return state;
+}
+
+bool reconcile_state_has_persistent_dag(const reconcile_state_t *state)
+{
+	return state != NULL && state->persistent && state->dag != NULL;
 }
 
 void reconcile_drop(reconcile_state_t *state)
@@ -126,55 +132,26 @@ static int reconcile_add_edges(dag_t *dag,
 	return 0;
 }
 
-int reconcile_apply(reconcile_state_t *state,
-		const reconcile_topo_t *topo,
-		reconcile_sched_cb_t sched_cb, void *sched_data)
+/* Build a brand-new DAG from `topo`. Returns the new dag_t on
+ * success, NULL on failure (the kept_ids buffer is freed in both
+ * paths). On success the caller installs it in state->dag. */
+static dag_t *build_dag_from_topo(reconcile_state_t *state,
+		const reconcile_topo_t *topo)
 {
 	dag_t *dag;
 	uint32_t *kept_ids;
 	uint32_t n_kept = 0;
 	uint32_t i;
-	int rc = -1;
-
-	if (!state || !topo || !sched_cb) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (state->consecutive_failures >= RECONCILE_FAILURE_BACKOFF &&
-			topo->generation == state->topo_gen_applied) {
-		/* Hit the back-off; do nothing until the topology
-		 * generation bumps (which resets the counter below). */
-		errno = EAGAIN;
-		return -1;
-	}
-	if (topo->generation != state->topo_gen_applied)
-		state->consecutive_failures = 0;
-
-	/* The persistent-DAG short-circuit lands in the next commit.
-	 * For now, every reconcile_apply destroys and rebuilds, which
-	 * is exactly what worker_apply_dag was doing inline before this
-	 * refactor. */
-	if (state->dag) {
-		dag_destroy(state->dag);
-		state->dag = NULL;
-	}
-
-	if (topo->n_followers == 0)
-		return 0;
 
 	dag = dag_create(topo->period, topo->period,
 			state->cpu_utilization, state->n_cpus);
-	if (!dag) {
-		state->consecutive_failures++;
-		return -1;
-	}
+	if (!dag)
+		return NULL;
 
 	kept_ids = calloc(topo->n_followers, sizeof(*kept_ids));
 	if (!kept_ids) {
 		dag_destroy(dag);
-		state->consecutive_failures++;
-		return -1;
+		return NULL;
 	}
 
 	for (i = 0; i < topo->n_followers; i++) {
@@ -191,37 +168,142 @@ int reconcile_apply(reconcile_state_t *state,
 				continue;
 			free(kept_ids);
 			dag_destroy(dag);
-			state->consecutive_failures++;
-			return -1;
+			return NULL;
 		}
 		kept_ids[n_kept++] = f->id;
 	}
 
 	if (n_kept == 0) {
-		/* Every follower is bootstrapping; try again later. */
 		free(kept_ids);
 		dag_destroy(dag);
-		return 0;
+		errno = EAGAIN;
+		return NULL;
 	}
 
 	if (reconcile_add_edges(dag, topo, kept_ids, n_kept) < 0) {
 		free(kept_ids);
 		dag_destroy(dag);
+		return NULL;
+	}
+
+	free(kept_ids);
+	return dag;
+}
+
+/* WCET drift check: returns true if |new - cached| / max(new,cached)
+ * exceeds the configured threshold. Threshold == 0 makes every
+ * difference significant (no gating). The arithmetic stays in
+ * double space; the cached and new WCETs are both ns values which
+ * fit comfortably in 53 bits of mantissa. */
+static bool wcet_drift_significant(reconcile_state_t *state,
+		uint64_t cached, uint64_t neww)
+{
+	double maxv;
+	double diff;
+
+	if (cached == neww)
+		return false;
+	if (state->recalc_threshold == 0.0)
+		return true;
+
+	maxv = (double)(cached > neww ? cached : neww);
+	if (maxv == 0.0)
+		return false;
+	diff = (double)(cached > neww ? cached - neww : neww - cached);
+	return (diff / maxv) > state->recalc_threshold;
+}
+
+/* Persistent path: keep state->dag across calls, update only the
+ * deltas. The DAG's own dirty bit (set when a mutation actually
+ * changes the stored value) drives the recalc inside
+ * dag_foreach_node; a fully no-op reconcile (no topology change,
+ * no significant WCET drift) does zero work past the freshness
+ * checks. */
+static int reconcile_apply_persistent(reconcile_state_t *state,
+		const reconcile_topo_t *topo,
+		reconcile_sched_cb_t sched_cb, void *sched_data)
+{
+	uint32_t i;
+	bool topology_changed = topo->generation != state->topo_gen_applied;
+	bool period_changed = topo->period != state->dag_period;
+
+	/* Cold start, period change, or post-failure rebuild. */
+	if (state->dag == NULL || period_changed || topology_changed) {
+		if (state->dag) {
+			dag_destroy(state->dag);
+			state->dag = NULL;
+		}
+		state->dag = build_dag_from_topo(state, topo);
+		if (state->dag == NULL) {
+			if (errno == EAGAIN)
+				return 0;
+			state->consecutive_failures++;
+			return -1;
+		}
+		state->dag_period = topo->period;
+		state->topo_gen_applied = topo->generation;
+	} else {
+		/* No topology / period change: just mirror WCET drift.
+		 * dag_set_node_wcet is gated by the threshold and is
+		 * itself a no-op when the value matches; either way the
+		 * dirty bit fires only when something actually changes. */
+		for (i = 0; i < topo->n_followers; i++) {
+			const reconcile_follower_t *f = &topo->followers[i];
+			dag_node_t *dn;
+			uint64_t budget;
+
+			if (!follower_schedulable(f))
+				continue;
+			budget = (uint64_t)(f->wcet * 1.05);
+			dn = dag_find_node(state->dag, f->id);
+			if (dn == NULL)
+				continue;
+			if (wcet_drift_significant(state, dn->wcet, budget))
+				dag_set_node_wcet(state->dag, f->id, budget);
+		}
+	}
+
+	if (dag_foreach_node(state->dag, sched_cb, sched_data) < 0) {
+		dag_destroy(state->dag);
+		state->dag = NULL;
+		state->dag_period = 0;
+		state->consecutive_failures++;
+		return -1;
+	}
+
+	state->consecutive_failures = 0;
+	return 0;
+}
+
+/* Legacy path: destroy and rebuild every call. Selected when the
+ * caller passed persistent=false to reconcile_init, i.e. the
+ * recalc.persistent=false kill switch. */
+static int reconcile_apply_legacy(reconcile_state_t *state,
+		const reconcile_topo_t *topo,
+		reconcile_sched_cb_t sched_cb, void *sched_data)
+{
+	dag_t *dag;
+
+	if (state->dag) {
+		dag_destroy(state->dag);
+		state->dag = NULL;
+	}
+
+	dag = build_dag_from_topo(state, topo);
+	if (dag == NULL) {
+		if (errno == EAGAIN)
+			return 0;
 		state->consecutive_failures++;
 		return -1;
 	}
 
 	if (dag_recalculate(dag) < 0) {
-		free(kept_ids);
 		dag_destroy(dag);
 		state->consecutive_failures++;
 		return -1;
 	}
 
-	rc = dag_foreach_node(dag, sched_cb, sched_data);
-	free(kept_ids);
-
-	if (rc < 0) {
+	if (dag_foreach_node(dag, sched_cb, sched_data) < 0) {
 		dag_destroy(dag);
 		state->consecutive_failures++;
 		return -1;
@@ -232,4 +314,35 @@ int reconcile_apply(reconcile_state_t *state,
 	state->consecutive_failures = 0;
 	state->dag_period = topo->period;
 	return 0;
+}
+
+int reconcile_apply(reconcile_state_t *state,
+		const reconcile_topo_t *topo,
+		reconcile_sched_cb_t sched_cb, void *sched_data)
+{
+	if (!state || !topo || !sched_cb) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (state->consecutive_failures >= RECONCILE_FAILURE_BACKOFF &&
+			topo->generation == state->topo_gen_applied) {
+		/* Hit the back-off; do nothing until the topology
+		 * generation bumps (which resets the counter below). */
+		errno = EAGAIN;
+		return -1;
+	}
+	if (topo->generation != state->topo_gen_applied)
+		state->consecutive_failures = 0;
+
+	if (topo->n_followers == 0) {
+		/* Empty topology: drop any persistent state so a future
+		 * topology change starts from scratch. */
+		reconcile_drop(state);
+		return 0;
+	}
+
+	return state->persistent ?
+			reconcile_apply_persistent(state, topo, sched_cb, sched_data) :
+			reconcile_apply_legacy(state, topo, sched_cb, sched_data);
 }

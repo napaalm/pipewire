@@ -146,6 +146,24 @@
  *                       callback to simulate a slow analysis stage and
  *                       exercise the CAS-coalesced "many RT cycles per
  *                       worker wake" path. Default 0.
+ * - `recalc.persistent`: If true (default), the worker keeps a
+ *                       persistent DAG across wakes and reconciles
+ *                       it incrementally. A no-op cycle (no
+ *                       topology change, no significant WCET
+ *                       drift) does zero analysis work. If false,
+ *                       the worker falls back to the legacy
+ *                       destroy-and-rebuild path -- a permanent
+ *                       kill switch for the persistent-DAG code,
+ *                       intended only for diagnostic comparisons.
+ * - `wcet.recalc-threshold`: Fractional WCET drift required to
+ *                       update the cached DAG node and trigger a
+ *                       recalc. With the default 0.01 a follower
+ *                       whose reported WCET drifts by less than
+ *                       1 % from the cached value is treated as a
+ *                       no-op (the cached schedule stays valid).
+ *                       Setting to 0 disables the gate (every
+ *                       reported change marks dirty). Must be in
+ *                       [0, 1).
  *
  * ## Example configuration
  *
@@ -440,6 +458,15 @@ struct node {
 	 * to short-circuit no-op cycles. */
 	uint64_t              topo_gen_applied;
 
+	/* FNV-1a-ish fingerprint of the latest topology snapshot
+	 * (period + sorted follower ids/tids + sorted edge src/dst).
+	 * Compared at the end of each snapshot pass against the
+	 * previously recorded value; topo.generation only bumps when
+	 * the fingerprint changes, so the worker's "freshness" check
+	 * fires only on real topology changes -- not on every snapshot
+	 * tick. */
+	uint64_t              topo_fingerprint;
+
 	/* Per-driver reconcile state. Owned by this struct node; freed
 	 * at driver_removed / module_destroy via reconcile_fini. */
 	reconcile_state_t    *reconcile;
@@ -484,6 +511,18 @@ struct impl {
 	double   sketch_quantile;
 	double   sketch_compression;
 	uint32_t sketch_min_samples;
+
+	/* Persistent-DAG path on the worker (default). When false the
+	 * worker still runs but reconcile_apply takes the legacy
+	 * destroy-and-rebuild path -- a permanent kill switch for the
+	 * persistent-DAG code. */
+	bool                  recalc_persistent;
+
+	/* WCET drift threshold: a follower's reported WCET must change
+	 * by more than this fraction of the current value to trigger
+	 * dag_set_node_wcet (and therefore a recalc). Default 0.01;
+	 * 0.0 = always recalc. Must stay strictly below 1.0. */
+	double                wcet_recalc_threshold;
 
 	/* Async worker. Created at init when deadline policy is available;
 	 * NULL when sync_mode is true. */
@@ -1229,12 +1268,41 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 	}
 
 	t->ok = true;
-	/* Release-store the generation bump so the worker (which acquires
-	 * t->generation before reading the nodes/edges arrays) observes
-	 * the freshly-written topology atomically. The pending flag is
-	 * cleared after the release so an early-return path never bumps
-	 * the generation. */
-	SPA_ATOMIC_STORE(t->generation, t->generation + 1);
+
+	/* Compute a fingerprint of the freshly-captured topology. Only
+	 * bump the generation if the fingerprint differs from the
+	 * previous one -- otherwise the worker sees a "topology change"
+	 * every snapshot tick and re-runs dag_build_analysis even when
+	 * nothing structural changed, defeating the persistent-DAG
+	 * optimisation. The fingerprint covers period, follower
+	 * id+tid tuples and edge src/dst pairs (the same shape
+	 * reconcile_apply reads). */
+	{
+		uint64_t h = 0xcbf29ce484222325ULL;
+		uint32_t i;
+		h ^= t->period;
+		h *= 0x100000001b3ULL;
+		for (i = 0; i < t->n_nodes; i++) {
+			h ^= t->nodes[i].id;
+			h *= 0x100000001b3ULL;
+			h ^= (uint64_t)t->nodes[i].tid;
+			h *= 0x100000001b3ULL;
+		}
+		for (i = 0; i < t->n_edges; i++) {
+			h ^= t->edges[i].src;
+			h *= 0x100000001b3ULL;
+			h ^= t->edges[i].dst;
+			h *= 0x100000001b3ULL;
+		}
+		if (h != drv->topo_fingerprint) {
+			drv->topo_fingerprint = h;
+			/* Release-store the generation bump so the worker
+			 * (which acquires t->generation before reading the
+			 * nodes/edges arrays) observes the freshly-written
+			 * topology atomically. */
+			SPA_ATOMIC_STORE(t->generation, t->generation + 1);
+		}
+	}
 	SPA_ATOMIC_STORE(t->pending, 0);
 	return 0;
 }
@@ -1269,10 +1337,8 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	if (drv->reconcile == NULL) {
 		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
 				impl->cpu_utilization,
-				/* recalc_threshold = 0 in this commit:
-				 * the gate lands with the persistent DAG
-				 * path in the next commit. */
-				0.0);
+				impl->wcet_recalc_threshold,
+				impl->recalc_persistent);
 		if (drv->reconcile == NULL) {
 			pw_log_warn("reconcile_init failed: %m");
 			return;
@@ -1644,6 +1710,17 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->sketch_min_samples = (uint32_t)v;
 		else
 			pw_log_warn("wcet.min-samples %s ignored", s);
+	}
+
+	impl->recalc_persistent = pw_properties_get_bool(props, "recalc.persistent", true);
+	impl->wcet_recalc_threshold = 0.01;
+	if ((s = pw_properties_get(props, "wcet.recalc-threshold")) != NULL) {
+		char *end;
+		double v = strtod(s, &end);
+		if (end != s && v >= 0.0 && v < 1.0)
+			impl->wcet_recalc_threshold = v;
+		else
+			pw_log_warn("wcet.recalc-threshold %s ignored", s);
 	}
 
 	impl->sync_mode = pw_properties_get_bool(props, "recalc.sync", false);

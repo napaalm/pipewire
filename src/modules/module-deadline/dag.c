@@ -1877,6 +1877,7 @@ int dag_recalculate(dag_t *g)
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
 
 	int ret;
+	bool analysis_cached;
 
 	if (!g) {
 		errno = EINVAL;
@@ -1891,24 +1892,44 @@ int dag_recalculate(dag_t *g)
 
 	dag_invalidate_schedule(g);
 
-	dag_node_t **sources, **sinks;
-	uint32_t nsources, nsinks;
-	find_sources_and_sinks(g, &sources, &nsources, &sinks, &nsinks);
+	/* Analysis (indexed_nodes, successors, unrelated sets,
+	 * fictitious endpoints) survives across recalcs because
+	 * dag_invalidate_analysis is only called on TOPOLOGY changes
+	 * (add/remove node, add/remove edge), not on WCET changes.
+	 * If the cache is still populated, the topology is the same
+	 * as last successful recalc -- we can skip the heavy build
+	 * step (most expensively, dag_comp_unrelated) and just
+	 * recompute the WCET-dependent state (longest paths) before
+	 * re-running the deadline split and CPU placement. This is
+	 * the main optimisation behind the persistent-DAG worker
+	 * loop's steady-state cost.
+	 */
+	analysis_cached = (g->indexed_nodes != NULL);
 
-	if (nsources == 0 || nsinks == 0) {
+	if (!analysis_cached) {
+		dag_node_t **sources, **sinks;
+		uint32_t nsources, nsinks;
+		find_sources_and_sinks(g, &sources, &nsources, &sinks, &nsinks);
+
+		if (nsources == 0 || nsinks == 0) {
+			free(sources);
+			free(sinks);
+			dag_mark_dirty(g);
+			errno = EINVAL;
+			return -1;
+		}
+
+		ret = dag_build_analysis(g, sources, nsources, sinks, nsinks);
 		free(sources);
 		free(sinks);
-		dag_mark_dirty(g);
-		errno = EINVAL;
-		return -1;
-	}
-
-	ret = dag_build_analysis(g, sources, nsources, sinks, nsinks);
-	if (ret != 0) {
-		free(sources);
-		free(sinks);
-		dag_mark_dirty(g);
-		return ret > 0 ? dag_recalculate(g) : -1;
+		if (ret != 0) {
+			dag_mark_dirty(g);
+			return ret > 0 ? dag_recalculate(g) : -1;
+		}
+	} else {
+		/* Refresh longest paths only -- they depend on WCETs
+		 * and may have shifted even when topology is stable. */
+		dag_populate_longest_paths(g);
 	}
 
 	/* Feasibility gate. A graph whose critical path alone exceeds
@@ -1917,21 +1938,14 @@ int dag_recalculate(dag_t *g)
 	 * assignment runs. The DAG stays dirty so the next caller-side
 	 * recalc retries. */
 	if (dag_check_feasibility(g) < 0) {
-		free(sources);
-		free(sinks);
 		dag_mark_dirty(g);
 		return -1;
 	}
 
 	if (assign_deadlines_iterative(g) < 0) {
-		free(sources);
-		free(sinks);
 		dag_mark_dirty(g);
 		return -1;
 	}
-
-	free(sources);
-	free(sinks);
 
 	if (assign_cpus(g) < 0) {
 		dag_mark_dirty(g);

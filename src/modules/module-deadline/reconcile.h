@@ -50,11 +50,11 @@ extern "C" {
  * non-zero sample re-incorporates the node on the following
  * reconcile pass.
  *
- * Back-off contract (R16 in the implementation plan): consecutive
- * reconcile failures (allocation failures, library errors) raise a
- * per-driver back-off counter; after 16 strikes the worker stops
- * trying until the topology generation bumps. The state struct
- * carries this counter so it survives across reconcile_apply calls.
+ * Back-off contract: consecutive reconcile failures (allocation
+ * failures, library errors) raise a per-driver back-off counter;
+ * after 16 strikes the worker stops trying until the topology
+ * generation bumps. The state struct carries this counter so it
+ * survives across reconcile_apply calls.
  *
  * Feedback-edge filtering rationale: feedback and async links in
  * the PipeWire graph use spa_io_async_buffers (one-cycle delay) and
@@ -111,11 +111,22 @@ typedef void (*reconcile_sched_cb_t)(void *data, pid_t tid,
  * `cpu_utilization` mirror the dag_create arguments; `recalc_threshold`
  * is the per-WCET fractional change required to mark the DAG dirty
  * (0 means every change marks dirty, 0.01 = the recommended default).
+ * `persistent` selects the persistent-DAG path; when false, the
+ * legacy destroy-and-rebuild path runs on every reconcile_apply and
+ * the threshold is ignored (a permanent kill switch for the new
+ * code path).
  *
  * Returns NULL on allocation failure (errno set). */
 reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double cpu_utilization,
-		double recalc_threshold);
+		double recalc_threshold,
+		bool persistent);
+
+/* Has the state carried over a persistent DAG since the last
+ * reconcile_apply? Used by tests / instrumentation to distinguish
+ * the persistent path from the legacy rebuild path. Always false
+ * when reconcile_init was called with persistent=false. */
+bool reconcile_state_has_persistent_dag(const reconcile_state_t *state);
 
 /*
  * Free everything reconcile_init allocated, plus any persistent
