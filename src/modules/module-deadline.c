@@ -775,13 +775,22 @@ static void apply_sample(struct impl *impl, struct node *n, uint64_t runtime, ui
  * thread, inside the RT hook. Kept as a benchmark/escape hatch via
  * the recalc.sync=true option.
  * ------------------------------------------------------------------ */
+/* Helper: is `id` in the kept-set? Tiny linear scan, suitable for the
+ * small follower counts a driver typically sees. */
+static bool id_is_kept(const uint32_t *ids, uint32_t n, uint32_t id)
+{
+	for (uint32_t i = 0; i < n; i++)
+		if (ids[i] == id)
+			return true;
+	return false;
+}
+
 static void recalc_params_sync(struct node *drv)
 {
 	struct pw_impl_node *node = drv->node;
 	struct impl *impl = drv->impl;
 	struct pw_node_target *t;
 	struct pw_impl_node *node2;
-	bool abort = false;
 
 	if (node->target_rate.denom == 0 || node->target_quantum == 0)
 		return;
@@ -789,6 +798,11 @@ static void recalc_params_sync(struct node *drv)
 	uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
 
 	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
+
+	/* Soft-failure: collect the ids of nodes successfully added to
+	 * the DAG so we can drop edges that reference skipped nodes. */
+	uint32_t kept_ids[256];
+	uint32_t n_kept = 0;
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tnode = t->node;
@@ -814,8 +828,7 @@ static void recalc_params_sync(struct node *drv)
 		apply_sample(impl, n, runtime, period);
 
 		if (n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
-			abort = true;
-			pw_log_warn("Abort trying to add node %d (wcet=0)", tnode->info.id);
+			pw_log_debug("sync: skipping node %d (wcet=0)", tnode->info.id);
 			continue;
 		}
 
@@ -823,34 +836,41 @@ static void recalc_params_sync(struct node *drv)
 			tid = pw_properties_get_int32(tnode->properties, PW_KEY_NODE_LOOP_TID, -1);
 			if (tid == -1) {
 				pw_log_error("node %d has no TID", tnode->info.id);
-				dag_destroy(dag);
-				return;
+				continue;
 			}
 		} else {
 			pw_log_error("node %d is not a dynamic loop", tnode->info.id);
-			dag_destroy(dag);
-			return;
+			continue;
 		}
 
 		dag_add_node(dag, tnode->info.id, (uint64_t)(n->wcet * 1.05), tid, false);
+		if (n_kept < SPA_N_ELEMENTS(kept_ids))
+			kept_ids[n_kept++] = tnode->info.id;
+	}
+
+	if (n_kept == 0) {
+		dag_destroy(dag);
+		return;
 	}
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tnode = t->node;
 		struct pw_impl_port *p;
 		struct pw_impl_link *l;
+		if (!id_is_kept(kept_ids, n_kept, tnode->info.id))
+			continue;
 		spa_list_for_each(p, &tnode->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
 				node2 = l->input->node;
+				if (!id_is_kept(kept_ids, n_kept, node2->info.id))
+					continue;
 				dag_add_edge(dag, tnode->info.id, node2->info.id);
 			}
 		}
 	}
 
-	if (!abort) {
-		dag_recalculate(dag);
-		dag_foreach_node(dag, sched_cb, impl);
-	}
+	dag_recalculate(dag);
+	dag_foreach_node(dag, sched_cb, impl);
 
 	dag_destroy(dag);
 }
@@ -1018,7 +1038,17 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 }
 
 /* Worker-context: rebuild and reapply the DAG using the freshest
- * topology snapshot + current per-node sketch budgets. */
+ * topology snapshot + current per-node sketch budgets.
+ *
+ * Soft-failure: a single follower that never produces a non-zero
+ * runtime (e.g. an idle source: a synth client whose plugin failed
+ * to start, a paused stream, a node currently disconnected from any
+ * input) used to abort the whole driver's recalc, leaving every
+ * other follower on the default SCHED_FIFO scheduling. Instead,
+ * skip the broken node from the DAG and apply SCHED_DEADLINE to
+ * everyone else. Drop any edge that referenced the skipped node;
+ * the DAG library treats the resulting sub-graph as the workload
+ * to schedule. */
 static void worker_apply_dag(struct impl *impl, struct node *drv)
 {
 	struct topo_snap *t = &drv->topo;
@@ -1026,27 +1056,57 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 		return;
 
 	dag_t *dag = dag_create(t->period, t->period, impl->cpu_utilization, impl->n_cpus);
-	bool abort = false;
 
+	/* keep[i] = whether t->nodes[i] made it into the DAG */
+	bool *keep = calloc(t->n_nodes, sizeof(bool));
+	if (keep == NULL) {
+		dag_destroy(dag);
+		return;
+	}
+
+	uint32_t skipped = 0;
 	for (uint32_t i = 0; i < t->n_nodes; i++) {
 		struct node *n = find_node_by_id(impl, t->nodes[i].id);
 		if (n == NULL || n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
-			abort = true;
-			pw_log_debug("worker: node %u not ready (wcet=%lu)",
+			pw_log_debug("worker: skipping node %u (wcet=%lu) -- "
+				     "applying DEADLINE to remaining nodes",
 				     t->nodes[i].id, n ? n->wcet : 0);
+			skipped++;
 			continue;
 		}
 		dag_add_node(dag, t->nodes[i].id,
 			     (uint64_t)(n->wcet * 1.05), t->nodes[i].tid, false);
+		keep[i] = true;
 	}
 
-	if (!abort) {
-		for (uint32_t i = 0; i < t->n_edges; i++)
+	if (t->n_nodes - skipped == 0) {
+		/* Nothing to schedule yet: every follower is missing
+		 * runtime samples. Try again next tick. */
+		free(keep);
+		dag_destroy(dag);
+		return;
+	}
+
+	for (uint32_t i = 0; i < t->n_edges; i++) {
+		/* Map src/dst to the keep[] index. Linear scan over a
+		 * handful of nodes; topology is small. */
+		bool src_kept = false, dst_kept = false;
+		for (uint32_t j = 0; j < t->n_nodes; j++) {
+			if (!keep[j])
+				continue;
+			if (t->nodes[j].id == t->edges[i].src)
+				src_kept = true;
+			if (t->nodes[j].id == t->edges[i].dst)
+				dst_kept = true;
+		}
+		if (src_kept && dst_kept)
 			dag_add_edge(dag, t->edges[i].src, t->edges[i].dst);
-		dag_recalculate(dag);
-		dag_foreach_node(dag, sched_cb, impl);
 	}
 
+	dag_recalculate(dag);
+	dag_foreach_node(dag, sched_cb, impl);
+
+	free(keep);
 	dag_destroy(dag);
 }
 
