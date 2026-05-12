@@ -1986,7 +1986,7 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 	spa_list_for_each(n, &g->nodes, link) {
 		if (n->fictitious)
 			continue;
-		cb(data, n->tid, n->wcet, n->deadline, g->period, n->cpu);
+		cb(data, n->id, n->tid, n->wcet, n->deadline, g->period, n->cpu);
 	}
 
 	return 0;

@@ -138,11 +138,12 @@ struct foreach_info {
 	bool saw_internal_tid;
 };
 
-static void foreach_count_cb(void *data, pid_t tid, uint64_t wcet,
+static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct foreach_info *info = data;
 
+	(void)id;
 	(void)deadline;
 	(void)period;
 	(void)cpu;
@@ -667,11 +668,12 @@ struct dirty_test_stats {
 	uint64_t deadline_sum;
 };
 
-static void dirty_test_count_cb(void *data, pid_t tid, uint64_t wcet,
+static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct dirty_test_stats *s = data;
 
+	(void)id;
 	(void)tid;
 	(void)wcet;
 	(void)period;

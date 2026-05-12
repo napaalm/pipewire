@@ -433,6 +433,18 @@ struct node {
 	wcet_sketch_t sketch;
 	bool sketch_ready;
 
+	/* Last-applied SCHED_DEADLINE tuple. Used by sched_cb to skip
+	 * a sched_setattr+sched_setaffinity pair when the four
+	 * components (runtime, deadline, period, cpu) all match the
+	 * previously-applied values. Invalidated on apply failure so
+	 * the next reconcile retries. last_applied=false means "never
+	 * applied; first call must issue the syscalls". */
+	uint64_t last_runtime;
+	uint64_t last_deadline;
+	uint64_t last_period;
+	uint32_t last_cpu;
+	bool     last_applied;
+
 	/* Per-driver async state. Only valid when is_driver=true. */
 	/* SPSC sample ring: producer is this driver's data-loop thread
 	 * (inside the complete/incomplete RT hook), consumer is the
@@ -550,10 +562,17 @@ struct impl {
 	struct node **nodes_by_id;
 	uint32_t      nodes_by_id_count;
 	uint32_t      nodes_by_id_cap;
+
+	/* sched_setattr skip cache telemetry. Bumped by sched_cb on
+	 * every callback; dumped at module_destroy alongside the
+	 * histograms. */
+	uint64_t      sched_calls_total;
+	uint64_t      sched_calls_skipped;
 };
 
 static void hist_dump(const char *who, struct node *drv);
 static void node_unregister(struct impl *impl, struct node *n);
+static struct node *find_node_by_id(struct impl *impl, uint32_t id);
 
 static void module_destroy(void *data)
 {
@@ -708,11 +727,50 @@ static int set_cpu_affinity(pid_t tid, int cpu)
 	return ret;
 }
 
-static void sched_cb(void *data, pid_t tid, uint64_t runtime, uint64_t deadline, uint64_t period, uint32_t cpu)
+/* DAG callback. Looks the follower up by id via the module-side
+ * O(log N) index, compares the incoming (runtime, deadline, period,
+ * cpu) tuple against the cached last-applied value, and skips the
+ * sched_setattr + sched_setaffinity pair when all four components
+ * match. Cache lives on struct node so its lifetime tracks the
+ * follower; no separate prune pass is needed when a follower is
+ * removed.
+ *
+ * On apply failure the cache is invalidated (last_applied=false) so
+ * the next reconcile retries even if inputs are bit-identical. */
+static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
+		uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
-	set_deadline_sched(tid, runtime, deadline, period);
-	set_cpu_affinity(tid, impl->cpus[cpu]);
+	struct node *n;
+	int rc_sched, rc_aff;
+
+	impl->sched_calls_total++;
+
+	n = find_node_by_id(impl, id);
+	if (n != NULL && n->last_applied &&
+			n->last_runtime == runtime &&
+			n->last_deadline == deadline &&
+			n->last_period == period &&
+			n->last_cpu == cpu) {
+		impl->sched_calls_skipped++;
+		return;
+	}
+
+	rc_sched = set_deadline_sched(tid, runtime, deadline, period);
+	rc_aff = set_cpu_affinity(tid, impl->cpus[cpu]);
+
+	if (n == NULL)
+		return;
+
+	if (rc_sched == 0 && rc_aff == 0) {
+		n->last_runtime  = runtime;
+		n->last_deadline = deadline;
+		n->last_period   = period;
+		n->last_cpu      = cpu;
+		n->last_applied  = true;
+	} else {
+		n->last_applied = false;
+	}
 }
 
 /* Bsearch over impl->nodes_by_id for `id`; returns the array slot
@@ -895,6 +953,19 @@ static void hist_dump(const char *who, struct node *drv)
 			pw_log_info("    >=%luns -> %lu", (uint64_t)1 << i,
 				    drv->wk_hist_buckets[i]);
 		}
+	}
+	/* sched_setattr cache telemetry. Reported on every dump (the
+	 * counter is shared across drivers, so re-printing it on each
+	 * driver's dump is fine -- the value monotonically increases). */
+	if (drv->impl->sched_calls_total > 0) {
+		uint64_t total = drv->impl->sched_calls_total;
+		uint64_t skipped = drv->impl->sched_calls_skipped;
+		pw_log_info("deadline sched-cb cache [%s drv-node=%d]:",
+			    who,
+			    drv->node ? drv->node->info.id : (uint32_t)-1);
+		pw_log_info("  total=%lu issued=%lu skipped=%lu (skip rate=%.1f%%)",
+			    total, total - skipped, skipped,
+			    100.0 * (double)skipped / (double)total);
 	}
 }
 

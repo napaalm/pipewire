@@ -101,9 +101,10 @@ typedef struct {
  * callback. Called once per real follower per reconcile_apply with
  * the freshly assigned (runtime, deadline, period, cpu) tuple; the
  * implementation in module-deadline.c is sched_cb, which applies
- * SCHED_DEADLINE + CPU affinity via syscalls.
+ * SCHED_DEADLINE + CPU affinity via syscalls (gated by the per-
+ * follower last-applied tuple cache to skip no-op syscalls).
  */
-typedef void (*reconcile_sched_cb_t)(void *data, pid_t tid,
+typedef void (*reconcile_sched_cb_t)(void *data, uint32_t id, pid_t tid,
 		uint64_t runtime, uint64_t deadline,
 		uint64_t period, uint32_t cpu);
 

@@ -159,8 +159,12 @@ int dag_recalculate(dag_t *g);
  * topology-snapshot filter in module-deadline. */
 bool dag_has_cycle(dag_t *g);
 
-/* Apply a function to all tids with current scheduling parameters */
-typedef void (*dag_node_callback_t)(void *data, pid_t tid, uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
+/* Apply a function to all real nodes with their current scheduling
+ * parameters. The id is passed alongside the tid so the caller can
+ * look up its own per-node state (e.g. the sched_setattr skip
+ * cache) without rebuilding a tid index. */
+typedef void (*dag_node_callback_t)(void *data, uint32_t id, pid_t tid,
+		uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);
 
 void dag_print(dag_t *g);
