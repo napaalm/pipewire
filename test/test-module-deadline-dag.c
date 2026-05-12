@@ -423,6 +423,231 @@ PWTEST(independent_tasks_are_placed_by_descending_density)
 	return PWTEST_PASS;
 }
 
+/* Helper for the canonical deadline-splitter regressions below. Sums
+ * the assigned deadlines along a named id-path; the caller asserts
+ * the bound against the global end-to-end deadline. */
+static uint64_t path_deadline_sum(dag_t *g, const uint32_t *ids, size_t n_ids)
+{
+	uint64_t sum = 0;
+	size_t i;
+
+	for (i = 0; i < n_ids; i++) {
+		dag_node_t *node = find_node_by_id(g, ids[i]);
+
+		pwtest_ptr_notnull(node);
+		sum += node->deadline;
+	}
+
+	return sum;
+}
+
+PWTEST(single_node_deadline)
+{
+	dag_t *g = dag_create(25, 25, 1.0f, 1);
+	dag_node_t *node;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 7, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	node = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(node);
+	pwtest_bool_true(node->deadline_assigned);
+	pwtest_int_eq((int)node->deadline, 25);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(chain_deadlines)
+{
+	static const uint32_t path[] = { 1, 2, 3 };
+	dag_t *g = dag_create(18, 18, 1.0f, 3);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 2, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 3, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 4, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(c->deadline > 0);
+	pwtest_bool_true(path_deadline_sum(g, path, SPA_N_ELEMENTS(path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(diamond_deadlines)
+{
+	static const uint32_t left_path[] = { 1, 2, 4 };
+	static const uint32_t right_path[] = { 1, 3, 4 };
+	dag_t *g = dag_create(12, 12, 1.0f, 4);
+	dag_node_t *a, *b, *c, *d;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	d = find_node_by_id(g, 4);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(d);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(c->deadline > 0);
+	pwtest_bool_true(d->deadline > 0);
+	pwtest_bool_true(path_deadline_sum(g, left_path, SPA_N_ELEMENTS(left_path)) <= g->deadline);
+	pwtest_bool_true(path_deadline_sum(g, right_path, SPA_N_ELEMENTS(right_path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Branch-tightening: a graph where the heavy branch's deadlines are
+ * tight enough that the discount loop in the splitter (commit 2's
+ * subject) runs at least once when the lighter branch is then
+ * processed. The bound to assert is that neither path overflows the
+ * global deadline. The lighter path strictly leaves slack because
+ * the heavy branch consumed the tight budget. */
+PWTEST(branch_tightening_residual_budget)
+{
+	static const uint32_t heavy_path[] = { 1, 2, 5, 6 };
+	static const uint32_t discounted_path[] = { 1, 3, 4, 5, 6 };
+	dag_t *g = dag_create(54, 54, 1.0f, 6);
+	dag_node_t *a, *b, *c, *x, *d, *e;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(add_real_node(g, 5, 5, 105), 0);
+	pwtest_int_eq(add_real_node(g, 6, 1, 106), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 5), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 4, 5), 0);
+	pwtest_int_eq(dag_add_edge(g, 5, 6), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	x = find_node_by_id(g, 4);
+	d = find_node_by_id(g, 5);
+	e = find_node_by_id(g, 6);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(x);
+	pwtest_ptr_notnull(d);
+	pwtest_ptr_notnull(e);
+
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(c->deadline > 0);
+	pwtest_bool_true(x->deadline > 0);
+	pwtest_bool_true(d->deadline > 0);
+	pwtest_bool_true(e->deadline > 0);
+
+	pwtest_bool_true(path_deadline_sum(g, heavy_path, SPA_N_ELEMENTS(heavy_path)) <= g->deadline);
+	pwtest_bool_true(path_deadline_sum(g, discounted_path,
+				SPA_N_ELEMENTS(discounted_path)) <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-resbudget: a fork-join where one side of the fork has a much
+ * tighter critical-path constraint than the other forces the splitter
+ * to assign a sub-proportional deadline to the tight branch before
+ * the wider branch is considered. The wider branch then sees a
+ * residual budget that already excludes the tight branch's
+ * consumption -- a bug in the previous splitter re-introduced that
+ * budget into the recursion and over-allocated the wider subproblem,
+ * which manifested as the wider branch's deadlines summing to more
+ * than the global end-to-end deadline.
+ *
+ * The regression target is: every per-node deadline must be positive,
+ * the join node's deadline must be <= the global deadline, and the
+ * sum of (path 1->2->4) plus (path 1->3->4)'s extra hop must
+ * collectively respect the global budget without crediting the
+ * tight branch twice. */
+PWTEST(residual_budget_no_double_credit)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 4);
+	dag_node_t *n1, *n2, *n3, *n4;
+
+	pwtest_ptr_notnull(g);
+
+	/* Asymmetric fork-join: branch 2 is heavy (path 1->2->4
+	 * dominates), branch 3 is light. */
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 600, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 50, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 100, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n1 = find_node_by_id(g, 1);
+	n2 = find_node_by_id(g, 2);
+	n3 = find_node_by_id(g, 3);
+	n4 = find_node_by_id(g, 4);
+	pwtest_ptr_notnull(n1);
+	pwtest_ptr_notnull(n2);
+	pwtest_ptr_notnull(n3);
+	pwtest_ptr_notnull(n4);
+
+	pwtest_bool_true(n1->deadline_assigned);
+	pwtest_bool_true(n2->deadline_assigned);
+	pwtest_bool_true(n3->deadline_assigned);
+	pwtest_bool_true(n4->deadline_assigned);
+
+	pwtest_bool_true(n1->deadline > 0);
+	pwtest_bool_true(n2->deadline > 0);
+	pwtest_bool_true(n3->deadline > 0);
+	pwtest_bool_true(n4->deadline > 0);
+
+	/* Heavy path 1->2->4 must fit in the global deadline. */
+	pwtest_bool_true(n1->deadline + n2->deadline + n4->deadline <= g->deadline);
+
+	/* Light path 1->3->4 must also fit: the splitter must not have
+	 * given n3 a budget computed against a residual that secretly
+	 * re-included the budget already consumed by n2. */
+	pwtest_bool_true(n1->deadline + n3->deadline + n4->deadline <= g->deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(equal_load_ties_choose_lowest_cpu)
 {
 	dag_t *g = dag_create(300, 300, 0.10f, 2);
@@ -464,6 +689,11 @@ PWTEST_SUITE(module_deadline_dag)
 	
 	pwtest_add(independent_tasks_are_placed_by_descending_density, PWTEST_NOARG);
 	pwtest_add(equal_load_ties_choose_lowest_cpu, PWTEST_NOARG);
+	pwtest_add(single_node_deadline, PWTEST_NOARG);
+	pwtest_add(chain_deadlines, PWTEST_NOARG);
+	pwtest_add(diamond_deadlines, PWTEST_NOARG);
+	pwtest_add(branch_tightening_residual_budget, PWTEST_NOARG);
+	pwtest_add(residual_budget_no_double_credit, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
