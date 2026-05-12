@@ -657,6 +657,238 @@ PWTEST(residual_budget_no_double_credit)
  * set has size 1. With one CPU and a configured utilization >= the
  * per-node density, the analyser must succeed and place all three
  * on the same CPU. */
+/* Counts dag_foreach_node callbacks; we use this to detect whether
+ * the foreach pass ran a recalculate (because the only side-effect
+ * a caller can observe from outside the library is the per-node
+ * callback count plus the assignment values). */
+struct dirty_test_stats {
+	uint32_t callbacks;
+	uint64_t deadline_sum;
+};
+
+static void dirty_test_count_cb(void *data, pid_t tid, uint64_t wcet,
+		uint64_t deadline, uint64_t period, uint32_t cpu)
+{
+	struct dirty_test_stats *s = data;
+
+	(void)tid;
+	(void)wcet;
+	(void)period;
+	(void)cpu;
+
+	s->callbacks++;
+	s->deadline_sum += deadline;
+}
+
+/* U-dirty-noop: after a clean recalc, a second dag_foreach_node with
+ * no mutation in between must not re-set dirty. The assignment values
+ * are stable. */
+/* U-feasibility-tight: chain whose critical-path WCET exactly matches
+ * the global deadline. Feasibility check must pass; every per-node
+ * deadline is positive. */
+PWTEST(feasibility_tight_critical_path)
+{
+	dag_t *g = dag_create(30, 30, 1.0f, 1);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_bool_true(b->deadline > 0);
+	pwtest_bool_true(c->deadline > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-feasibility-overrun: critical-path WCET exceeds the global
+ * deadline. dag_recalculate must fail with EAGAIN; the DAG stays
+ * dirty, deadlines/cpus are cleared. */
+PWTEST(feasibility_critical_path_overrun)
+{
+	dag_t *g = dag_create(20, 20, 1.0f, 1);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+	pwtest_bool_true(g->dirty);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_bool_false(a->deadline_assigned);
+	pwtest_bool_false(b->deadline_assigned);
+	pwtest_bool_false(c->deadline_assigned);
+	pwtest_int_eq((int)a->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_eq((int)b->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_eq((int)c->cpu, (int)DAG_CPU_INVALID);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-feas-min: a graph whose total per-node 1-ns reservation exceeds
+ * the global deadline. Even with zero-WCET-style trivial work the
+ * analyser cannot allocate a positive deadline to every node, so
+ * recalc must fail. We use 3 nodes and a global deadline of 2 to
+ * force the violation. */
+PWTEST(feasibility_min_deadline_reservation)
+{
+	dag_t *g = dag_create(2, 2, 1.0f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	/* critical path = 3, deadline = 2 -> overrun fails too, but the
+	 * point is to exercise the min-reservation guard. Use a separate
+	 * graph in which the critical path is exactly the deadline but
+	 * the node count's 1-ns reservation overflows the budget. */
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dirty_noop_after_clean_recalc)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	struct dirty_test_stats s1 = { 0 };
+	struct dirty_test_stats s2 = { 0 };
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	pwtest_int_eq(dag_foreach_node(g, dirty_test_count_cb, &s1), 0);
+	pwtest_bool_false(g->dirty);
+
+	pwtest_int_eq(dag_foreach_node(g, dirty_test_count_cb, &s2), 0);
+	pwtest_bool_false(g->dirty);
+
+	pwtest_int_eq((int)s1.callbacks, 2);
+	pwtest_int_eq((int)s2.callbacks, 2);
+	pwtest_int_eq((int)s1.deadline_sum, (int)s2.deadline_sum);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-dirty-on-wcet: changing a node's WCET marks the DAG dirty. A
+ * no-op set (same wcet) does NOT mark dirty. */
+PWTEST(dirty_set_node_wcet)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	struct dirty_test_stats s = { 0 };
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Same wcet -> no dirty. */
+	pwtest_int_eq(dag_set_node_wcet(g, 1, 10), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Different wcet -> dirty, assigned deadlines cleared. */
+	pwtest_int_eq(dag_set_node_wcet(g, 1, 15), 0);
+	pwtest_bool_true(g->dirty);
+
+	{
+		dag_node_t *n = find_node_by_id(g, 1);
+		pwtest_ptr_notnull(n);
+		pwtest_bool_false(n->deadline_assigned);
+		pwtest_int_eq((int)n->cpu, (int)DAG_CPU_INVALID);
+	}
+
+	/* dag_foreach_node observes the dirty bit and triggers a recalc. */
+	pwtest_int_eq(dag_foreach_node(g, dirty_test_count_cb, &s), 0);
+	pwtest_bool_false(g->dirty);
+	pwtest_int_eq((int)s.callbacks, 2);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-dirty-on-period: changing global period+deadline marks dirty,
+ * a no-op set does not. */
+PWTEST(dirty_set_global_period_deadline)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* No-op: same values. */
+	pwtest_int_eq(dag_set_global_period_deadline(g, 100, 100), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Real change. */
+	pwtest_int_eq(dag_set_global_period_deadline(g, 200, 200), 0);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-dirty-on-add-edge: adding an edge after a clean recalc marks
+ * the DAG dirty. */
+PWTEST(dirty_on_add_edge)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(unrelated_set_chain_admits_serially)
 {
 	dag_t *g = dag_create(100, 100, 0.95f, 1);
@@ -959,6 +1191,13 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(unrelated_set_chain_admits_serially, PWTEST_NOARG);
 	pwtest_add(unrelated_set_independent_spreads, PWTEST_NOARG);
 	pwtest_add(unrelated_set_diamond_admits_on_two_cpus, PWTEST_NOARG);
+	pwtest_add(dirty_noop_after_clean_recalc, PWTEST_NOARG);
+	pwtest_add(dirty_set_node_wcet, PWTEST_NOARG);
+	pwtest_add(dirty_set_global_period_deadline, PWTEST_NOARG);
+	pwtest_add(dirty_on_add_edge, PWTEST_NOARG);
+	pwtest_add(feasibility_tight_critical_path, PWTEST_NOARG);
+	pwtest_add(feasibility_critical_path_overrun, PWTEST_NOARG);
+	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

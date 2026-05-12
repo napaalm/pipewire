@@ -17,6 +17,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <errno.h>
 
@@ -56,7 +57,22 @@ static void dag_invalidate_schedule(dag_t *g)
 		n->deadline_assigned = false;
 		n->deadline = 0;
 		n->remaining_deadline = 0;
+		n->cpu = DAG_CPU_INVALID;
 	}
+}
+
+/* Single entry point for marking the DAG dirty after a successful
+ * mutation: clears previously-computed schedule (deadlines and CPUs)
+ * and sets g->dirty so the next dag_foreach_node triggers a
+ * recalculation. Callers MUST call this only on actual change so a
+ * no-op set (same wcet, same period) does not invalidate a valid
+ * cached schedule. */
+static void dag_mark_dirty(dag_t *g)
+{
+	if (!g)
+		return;
+	g->dirty = true;
+	dag_invalidate_schedule(g);
 }
 
 static void dag_free_unrelated(dag_t *g)
@@ -116,6 +132,7 @@ dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_
 	g->deadline = deadline;
 	g->utilization = utilization;
 	g->num_cpus = num_cpus;
+	g->dirty = false;
 	spa_list_init(&g->nodes);
 	spa_list_init(&g->edges);
 
@@ -161,9 +178,12 @@ int dag_set_global_period_deadline(dag_t *g, uint64_t period, uint64_t deadline)
 		return -1;
 	}
 
+	if (g->period == period && g->deadline == deadline)
+		return 0;
+
 	g->period = period;
 	g->deadline = deadline;
-	dag_invalidate_schedule(g);
+	dag_mark_dirty(g);
 	return 0;
 }
 
@@ -231,13 +251,14 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->longest_next = -1;
 	n->successors = NULL;
 	n->deadline = 0;
+	n->cpu = DAG_CPU_INVALID;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);
 	spa_list_init(&n->incoming);
 	spa_list_append(&g->nodes, &n->link);
 
 	dag_invalidate_analysis(g);
-	dag_invalidate_schedule(g);
+	dag_mark_dirty(g);
 	return 0;
 }
 
@@ -303,7 +324,7 @@ int dag_remove_node(dag_t *g, uint32_t id)
 		return -1;
 
 	dag_invalidate_analysis(g);
-	dag_invalidate_schedule(g);
+	dag_mark_dirty(g);
 	return 0;
 }
 
@@ -471,7 +492,7 @@ int dag_add_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 	spa_list_append(&dst->incoming, &e->dst_link);
 
 	dag_invalidate_analysis(g);
-	dag_invalidate_schedule(g);
+	dag_mark_dirty(g);
 	return 0;
 }
 
@@ -497,7 +518,7 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id)
 			spa_list_remove(&e->dst_link);
 			free(e);
 			dag_invalidate_analysis(g);
-			dag_invalidate_schedule(g);
+			dag_mark_dirty(g);
 			return 0;
 		}
 	}
@@ -519,8 +540,11 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet)
 		return -1;
 	}
 
+	if (n->wcet == wcet)
+		return 0;
+
 	n->wcet = wcet;
-	dag_invalidate_schedule(g);
+	dag_mark_dirty(g);
 	return 0;
 }
 
@@ -1000,6 +1024,94 @@ static int dag_comp_unrelated(dag_t *g)
 		return -1;
 
 	dag_unrelated_squash(g);
+	return 0;
+}
+
+/* Minimum positive relative-deadline unit reserved per real node.
+ * A successful dag_recalculate must never export a zero relative
+ * deadline (the kernel's SCHED_DEADLINE policy rejects deadline=0
+ * outright), so every node consumes at least this many ns from the
+ * global deadline budget. */
+#define DAG_MIN_RELATIVE_DEADLINE UINT64_C(1)
+
+/* Sum of integer deadline weights across every real node. Used to
+ * bound infeasibility: a graph whose N * 1ns minimum exceeds the
+ * global deadline cannot produce any positive per-node deadline,
+ * however small the WCETs are. Saturates at UINT64_MAX. */
+static uint64_t dag_min_deadline_reservation(dag_t *g)
+{
+	dag_node_t *n;
+	uint64_t total = 0;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		if (n->fictitious)
+			continue;
+		if (UINT64_MAX - total < DAG_MIN_RELATIVE_DEADLINE)
+			return UINT64_MAX;
+		total += DAG_MIN_RELATIVE_DEADLINE;
+	}
+
+	return total;
+}
+
+/* Critical-path WCET across every real source-to-sink path. Reads
+ * longest_len, which dag_populate_longest_paths has already
+ * computed; the analyser's fictitious source has longest_len equal
+ * to (max child longest_len), and every real source has
+ * longest_len = its wcet + best downstream chain, so the max
+ * longest_len across real nodes is the critical-path WCET of the
+ * DAG. */
+static uint64_t dag_critical_path_wcet(dag_t *g)
+{
+	uint64_t crit = 0;
+	uint32_t i;
+
+	for (i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+
+		if (n->fictitious)
+			continue;
+		if (n->longest_len > crit)
+			crit = n->longest_len;
+	}
+
+	return crit;
+}
+
+/* Feasibility test (spec: deadline-stale 866ef4233). Run between
+ * dag_build_analysis and the deadline-splitting step. Two failure
+ * modes:
+ *   1. Critical-path WCET exceeds the global end-to-end deadline.
+ *      No assignment can hide the fact that the heavy chain alone
+ *      already overruns the budget.
+ *   2. N * 1ns minimum reservation exceeds the global deadline.
+ *      Even a graph whose WCETs were all zero needs at least 1ns
+ *      per node to export a positive relative deadline.
+ *
+ * Returns 0 on feasible, -1 on infeasible with errno=EAGAIN. The
+ * caller is responsible for marking the DAG dirty and clearing
+ * assignments on failure (dag_recalculate already does this on any
+ * pre-CPU-assignment failure). */
+static int dag_check_feasibility(dag_t *g)
+{
+	uint64_t critical = dag_critical_path_wcet(g);
+	uint64_t min_reservation = dag_min_deadline_reservation(g);
+
+	if (critical > g->deadline) {
+		pw_log_warn("DAG critical path %" PRIu64
+				" ns exceeds global deadline %" PRIu64 " ns",
+				critical, g->deadline);
+		errno = EAGAIN;
+		return -1;
+	}
+	if (min_reservation > g->deadline) {
+		pw_log_warn("DAG minimum per-node deadline reservation %"
+				PRIu64 " ns exceeds global deadline %" PRIu64 " ns",
+				min_reservation, g->deadline);
+		errno = EAGAIN;
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -1560,6 +1672,7 @@ int dag_recalculate(dag_t *g)
 
 	if (spa_list_is_empty(&g->nodes)) {
 		dag_invalidate_analysis(g);
+		g->dirty = false;
 		return 0;
 	}
 
@@ -1572,6 +1685,7 @@ int dag_recalculate(dag_t *g)
 	if (nsources == 0 || nsinks == 0) {
 		free(sources);
 		free(sinks);
+		dag_mark_dirty(g);
 		errno = EINVAL;
 		return -1;
 	}
@@ -1580,20 +1694,36 @@ int dag_recalculate(dag_t *g)
 	if (ret != 0) {
 		free(sources);
 		free(sinks);
+		dag_mark_dirty(g);
 		return ret > 0 ? dag_recalculate(g) : -1;
+	}
+
+	/* Feasibility gate. A graph whose critical path alone exceeds
+	 * the global deadline, or whose minimum per-node deadline
+	 * reservation does, will fail with EAGAIN before any
+	 * assignment runs. The DAG stays dirty so the next caller-side
+	 * recalc retries. */
+	if (dag_check_feasibility(g) < 0) {
+		free(sources);
+		free(sinks);
+		dag_mark_dirty(g);
+		return -1;
 	}
 
 	if (assign_deadlines_iterative(g) < 0) {
 		free(sources);
 		free(sinks);
+		dag_mark_dirty(g);
 		return -1;
 	}
 
 	free(sources);
 	free(sinks);
 
-	if (assign_cpus(g) < 0)
+	if (assign_cpus(g) < 0) {
+		dag_mark_dirty(g);
 		return -1;
+	}
 
 	dag_print(g); // DEBUG
 	// register end time and log duration
@@ -1602,6 +1732,9 @@ int dag_recalculate(dag_t *g)
 	double duration = (end_time.tv_sec - start_time.tv_sec) +
 		(end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 	pw_log_info("DAG recalculation completed in %.6f seconds", duration);
+
+	/* Success: the cached schedule is now clean. */
+	g->dirty = false;
 	return 0;
 }
 
@@ -1612,15 +1745,17 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 		return -1;
 	}
 
-	dag_node_t *n;
-	spa_list_for_each(n, &g->nodes, link) {
-		if (!n->fictitious && !n->deadline_assigned) {
-			if (dag_recalculate(g) < 0)
-				return -1;
-			break;
-		}
+	/* Single source of truth: if the DAG was mutated since the
+	 * last successful recalc, the dirty bit is set and we run a
+	 * fresh pass before emitting any callbacks. A clean DAG short-
+	 * circuits without any scan: this is what makes the persistent
+	 * DAG path efficient across no-op wakes. */
+	if (g->dirty) {
+		if (dag_recalculate(g) < 0)
+			return -1;
 	}
 
+	dag_node_t *n;
 	spa_list_for_each(n, &g->nodes, link) {
 		if (n->fictitious)
 			continue;

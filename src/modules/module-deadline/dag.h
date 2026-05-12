@@ -35,6 +35,17 @@ typedef struct dag_node dag_node_t;
 typedef struct dag_edge dag_edge_t;
 typedef struct dag dag_t;
 
+/* Sentinel CPU value stamped on every dag_node while its scheduling
+ * assignment is stale (i.e. while the DAG is dirty or fresh out of
+ * dag_add_node). It is distinct from any valid 0..num_cpus-1 index
+ * so a caller can tell "this node has never been placed" from "this
+ * node was placed on CPU 0".
+ *
+ * The library never emits DAG_CPU_INVALID through dag_foreach_node
+ * on a clean DAG: dag_recalculate either fully assigns every real
+ * node or fails with the DAG left dirty. */
+#define DAG_CPU_INVALID UINT32_MAX
+
 struct dag_node {
 	struct spa_list link;        /* link in dag->nodes */
 	struct spa_list outgoing;    /* list of outgoing edges (dag_edge_t) */
@@ -69,6 +80,15 @@ struct dag {
 	uint64_t deadline;  /* global end-to-end deadline */
 	float utilization;  /* max utilization */
 	uint32_t num_cpus;
+
+	/* Set whenever a successful timing or topology mutation
+	 * invalidates the previously-computed scheduling parameters.
+	 * dag_recalculate clears it on success and re-sets it (with
+	 * cleared assignments) on failure. dag_foreach_node triggers
+	 * an internal recalculate only when this is true, so a
+	 * caller-side no-op cycle (no mutations between two foreach
+	 * passes) does not re-run the analyser. */
+	bool dirty;
 
 	struct spa_list nodes; /* list of dag_node_t */
 	struct spa_list edges; /* list of dag_edge_t */
