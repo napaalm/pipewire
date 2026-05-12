@@ -997,6 +997,14 @@ static void recalc_params_sync(struct node *drv)
 			continue;
 		spa_list_for_each(p, &tnode->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
+				/* Same feedback / async filter as the
+				 * snapshot path above. */
+				if (l->feedback)
+					continue;
+				if (l->output->node && l->input->node &&
+						(l->output->node->async ||
+						 l->input->node->async))
+					continue;
 				node2 = l->input->node;
 				if (!id_is_kept(kept_ids, n_kept, node2->info.id))
 					continue;
@@ -1148,7 +1156,24 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 		t->n_nodes++;
 	}
 
-	/* Edges: for each follower, walk output ports -> links -> input node. */
+	/* Edges: for each follower, walk output ports -> links -> input
+	 * node, skipping links that don't introduce an in-period
+	 * precedence constraint.
+	 *
+	 * A PipeWire link is *feedback* when constructing it would close
+	 * a cycle in the graph (pw_impl_node_can_reach hits on the dst);
+	 * the link records PW_KEY_LINK_FEEDBACK in its properties and
+	 * the data plane uses spa_io_async_buffers instead of
+	 * spa_io_buffers so the consumer in cycle N reads the producer's
+	 * data from cycle N-1. There is no within-period dependency
+	 * between the two endpoints, so the scheduling DAG must omit the
+	 * edge entirely.
+	 *
+	 * An *async* link is one whose endpoints opt in to the same
+	 * one-cycle-delay semantics via pw_impl_node.async (set when
+	 * both endpoints' ports declare PW_IMPL_PORT_FLAG_ASYNC). The
+	 * delay rationale is identical, so we filter both kinds with
+	 * the same one-liner. */
 	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
 		if (follower == dnode)
 			continue;
@@ -1157,6 +1182,12 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 		spa_list_for_each(p, &follower->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
 				if (!l->input || !l->input->node)
+					continue;
+				if (l->feedback)
+					continue;
+				if (l->output->node && l->input->node &&
+						(l->output->node->async ||
+						 l->input->node->async))
 					continue;
 				if (t->n_edges >= t->edges_cap) {
 					uint32_t newcap = t->edges_cap ? t->edges_cap * 2 : TOPO_INITIAL_EDGES;
