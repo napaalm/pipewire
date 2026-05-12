@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 
 #include "pwtest.h"
@@ -686,6 +687,160 @@ static void dirty_test_count_cb(void *data, pid_t tid, uint64_t wcet,
 /* U-feasibility-tight: chain whose critical-path WCET exactly matches
  * the global deadline. Feasibility check must pass; every per-node
  * deadline is positive. */
+/* U-place-descending: three independent unrelated nodes with
+ * distinct densities. The CPU loop orders them by descending
+ * density and the placements honour that. The densest goes to CPU
+ * 0 (only choice for the first); the next densest goes to a
+ * different (less-loaded) CPU; etc. */
+/* U-load-reject: dag_create rejects non-finite, zero and >1
+ * utilization caps before any allocation happens. */
+PWTEST(load_reject_non_finite_or_out_of_range)
+{
+	dag_t *g;
+	double nan_v = NAN;
+	double inf_v = INFINITY;
+
+	errno = 0;
+	g = dag_create(100, 100, nan_v, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	errno = 0;
+	g = dag_create(100, 100, inf_v, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	errno = 0;
+	g = dag_create(100, 100, -0.5, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	errno = 0;
+	g = dag_create(100, 100, 0.0, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	errno = 0;
+	g = dag_create(100, 100, 1.1, 1);
+	pwtest_ptr_null(g);
+	pwtest_int_eq(errno, EINVAL);
+
+	return PWTEST_PASS;
+}
+
+/* U-load-ordinary: a normal in-range cap (e.g. 0.95) yields a valid
+ * DAG and the admission test admits an obviously feasible graph. */
+PWTEST(load_ordinary_cap_admits)
+{
+	dag_t *g = dag_create(100, 100, 0.95, 2);
+	dag_node_t *a;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(a);
+	pwtest_bool_true(a->deadline > 0);
+	pwtest_int_eq((int)a->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-load-near-bound: a graph whose summed per-CPU density falls
+ * inside the cap by exactly the floating-point roundoff window
+ * still admits. The unrelated-set placement sum is a chain of
+ * division roundoffs; without an epsilon, the load might project
+ * to (cap + 1ulp) and trigger spurious rejection. We construct a
+ * case that is feasible at the chosen cap. */
+PWTEST(load_near_bound_admits)
+{
+	/* Use a cap precisely equal to a per-node density. The chain
+	 * has max unrelated set size 1, so per-CPU load equals per-node
+	 * density (computed as wcet/min(deadline,period) by the
+	 * analyser). With cap = 0.10 and density = 10/period_clamped,
+	 * the analyser is at the edge -- with deadline tightening
+	 * inside dag_recalculate the per-node density may grow
+	 * marginally above cap; the epsilon absorbs the ULP. */
+	dag_t *g = dag_create(100, 100, 0.10, 1);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_placement_orders_by_descending_density)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 3);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 9, 101), 0);   /* density 0.09 */
+	pwtest_int_eq(add_real_node(g, 2, 7, 102), 0);   /* density 0.07 */
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);   /* density 0.05 */
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* The three CPUs picked must be three distinct values; the
+	 * densest node sits on the lowest-numbered CPU because all are
+	 * empty at that point. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_bool_true(a->cpu != b->cpu);
+	pwtest_bool_true(a->cpu != c->cpu);
+	pwtest_bool_true(b->cpu != c->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* U-place-tie: equal-density nodes placed by worst-fit must produce
+ * the same assignment on every run. With identical inputs, equal
+ * load on every CPU after the first placement, the next densest
+ * also goes to CPU 0 (lowest-index tie-break). And with 2 CPUs,
+ * the third identical node is on CPU 1, etc. This is already
+ * exercised by equal_load_ties_choose_lowest_cpu, but we explicitly
+ * pin the deterministic ordering here too. */
+PWTEST(cpu_placement_equal_density_lowest_cpu)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* First placement goes to CPU 0 (lowest-index tie). The next
+	 * placement sees CPU 0 at u and CPU 1 at 0, so picks CPU 1
+	 * (worst-fit). The third sees both CPUs at u; tied → CPU 0. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(feasibility_tight_critical_path)
 {
 	dag_t *g = dag_create(30, 30, 1.0f, 1);
@@ -1198,6 +1353,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(feasibility_tight_critical_path, PWTEST_NOARG);
 	pwtest_add(feasibility_critical_path_overrun, PWTEST_NOARG);
 	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
+	pwtest_add(cpu_placement_orders_by_descending_density, PWTEST_NOARG);
+	pwtest_add(cpu_placement_equal_density_lowest_cpu, PWTEST_NOARG);
+	pwtest_add(load_reject_non_finite_or_out_of_range, PWTEST_NOARG);
+	pwtest_add(load_ordinary_cap_admits, PWTEST_NOARG);
+	pwtest_add(load_near_bound_admits, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

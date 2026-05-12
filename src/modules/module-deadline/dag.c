@@ -117,9 +117,17 @@ static void dag_invalidate_analysis(dag_t *g)
 	dag_free_indexed_nodes(g);
 }
 
-dag_t *dag_create(uint64_t period, uint64_t deadline, float utilization, uint32_t num_cpus)
+dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
 {
-	if (period == 0 || deadline == 0 || utilization <= 0.0f || utilization > 1.0f || num_cpus == 0) {
+	if (period == 0 || deadline == 0 || num_cpus == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	/* Non-finite (NaN, +/-Inf) utilization values would slip past
+	 * naive < / > comparisons (NaN compares false to everything).
+	 * isfinite() catches those before they corrupt the admission
+	 * arithmetic. */
+	if (!isfinite(utilization) || utilization <= 0.0 || utilization > 1.0) {
 		errno = EINVAL;
 		return NULL;
 	}
@@ -1027,6 +1035,18 @@ static int dag_comp_unrelated(dag_t *g)
 	return 0;
 }
 
+/* Epsilon used when comparing derived per-CPU loads against the
+ * configured utilization cap. The cap is an exact user-provided
+ * value (e.g. 0.95); accumulated cpu_set_util sums combine
+ * (uint64) wcet / (uint64) deadline ratios in IEEE-754 double, so
+ * a sum that should equal the cap exactly may differ by a unit in
+ * the last place. A floor of 1 ULP at scale 1.0 is ~2.2e-16, but
+ * we use a slightly looser epsilon of 1e-12 to absorb the
+ * accumulation of many divisions in graphs with up to a few dozen
+ * nodes -- still tight enough that no genuinely overloaded graph
+ * can sneak past it. */
+#define DAG_LOAD_EPSILON 1e-12
+
 /* Minimum positive relative-deadline unit reserved per real node.
  * A successful dag_recalculate must never export a zero relative
  * deadline (the kernel's SCHED_DEADLINE policy rejects deadline=0
@@ -1493,6 +1513,12 @@ struct cpu_assignment_info {
 	double util;
 };
 
+/* qsort comparator for CPU-assignment-info entries. Primary key:
+ * density (descending). Secondary key: topological index
+ * (ascending) -- a deterministic, ordering-stable tie-breaker that
+ * keeps the worst-fit placement reproducible across runs and across
+ * compilers' qsort implementations (which are not stable in
+ * general). */
 static int compare_density_desc(double a_density, uint32_t a_key,
 		double b_density, uint32_t b_key)
 {
@@ -1517,6 +1543,11 @@ static int compare_cpu_assignment_info_desc(const void *a, const void *b)
 			info_b->util, info_b->index);
 }
 
+/* Per-candidate tie-break used by the worst-fit CPU loop in
+ * assign_cpus. Returns true if (projected, cpu) is the new winner
+ * compared to (best_projected, best_cpu). Lowest projected load
+ * wins; equal-load placements pick the lowest CPU index so the
+ * output is reproducible. */
 static bool prefer_cpu_choice(double projected, uint32_t cpu,
 		double best_projected, int best_cpu)
 {
@@ -1620,7 +1651,7 @@ static int assign_cpus(dag_t *g)
 					projected = candidate;
 			}
 
-			if (projected <= g->utilization &&
+			if (projected <= g->utilization + DAG_LOAD_EPSILON &&
 					prefer_cpu_choice(projected, c,
 						chosen_projected, chosen)) {
 				chosen_projected = projected;
