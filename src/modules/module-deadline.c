@@ -432,6 +432,18 @@ struct node {
 	uint64_t              hist_sum_ns;
 	uint64_t              hist_min_ns;
 	uint64_t              hist_max_ns;
+
+	/* Per-driver worker per-wake timing histogram. Same log2 shape
+	 * as the RT-hook histogram so a live A/B summary can interleave
+	 * the two tables. Sampled around the body of worker_recalc_one;
+	 * the producer is the deadline-recalc worker thread, which is
+	 * also the only reader except at driver_removed / module_destroy.
+	 * Untouched in sync mode (where the worker is not used). */
+	uint64_t              wk_hist_buckets[32];
+	uint64_t              wk_hist_count;
+	uint64_t              wk_hist_sum_ns;
+	uint64_t              wk_hist_min_ns;
+	uint64_t              wk_hist_max_ns;
 };
 
 struct impl {
@@ -682,26 +694,59 @@ static void hist_record(struct node *drv, uint64_t dur_ns)
 		drv->hist_max_ns = dur_ns;
 }
 
+static void worker_hist_record(struct node *drv, uint64_t dur_ns)
+{
+	if (dur_ns == 0)
+		return;
+	drv->wk_hist_buckets[log2_bucket(dur_ns)]++;
+	drv->wk_hist_count++;
+	drv->wk_hist_sum_ns += dur_ns;
+	if (drv->wk_hist_min_ns == 0 || dur_ns < drv->wk_hist_min_ns)
+		drv->wk_hist_min_ns = dur_ns;
+	if (dur_ns > drv->wk_hist_max_ns)
+		drv->wk_hist_max_ns = dur_ns;
+}
+
 static void hist_dump(const char *who, struct node *drv)
 {
-	if (drv->hist_count == 0)
+	if (drv->hist_count == 0 && drv->wk_hist_count == 0)
 		return;
-	pw_log_info("deadline RT-hook timing [%s drv-node=%d mode=%s]:",
-		    who,
-		    drv->node ? drv->node->info.id : (uint32_t)-1,
-		    drv->impl->sync_mode ? "sync" : "async");
-	pw_log_info("  cycles=%lu min=%luns max=%luns avg=%luns",
-		    drv->hist_count, drv->hist_min_ns, drv->hist_max_ns,
-		    drv->hist_sum_ns / drv->hist_count);
-	pw_log_info("  bucket counts (lo bound ns -> count):");
-	for (uint32_t i = 0; i < 32; i++) {
-		if (drv->hist_buckets[i] == 0)
-			continue;
-		pw_log_info("    >=%luns -> %lu", (uint64_t)1 << i, drv->hist_buckets[i]);
+	if (drv->hist_count > 0) {
+		pw_log_info("deadline RT-hook timing [%s drv-node=%d mode=%s]:",
+			    who,
+			    drv->node ? drv->node->info.id : (uint32_t)-1,
+			    drv->impl->sync_mode ? "sync" : "async");
+		pw_log_info("  cycles=%lu min=%luns max=%luns avg=%luns",
+			    drv->hist_count, drv->hist_min_ns, drv->hist_max_ns,
+			    drv->hist_sum_ns / drv->hist_count);
+		pw_log_info("  bucket counts (lo bound ns -> count):");
+		for (uint32_t i = 0; i < 32; i++) {
+			if (drv->hist_buckets[i] == 0)
+				continue;
+			pw_log_info("    >=%luns -> %lu", (uint64_t)1 << i,
+				    drv->hist_buckets[i]);
+		}
+		drv->ring_dropped = SPA_ATOMIC_LOAD(drv->ring_dropped);
+		if (drv->ring_dropped)
+			pw_log_info("  ring-dropped samples (cumulative): %lu",
+				    drv->ring_dropped);
 	}
-	drv->ring_dropped = SPA_ATOMIC_LOAD(drv->ring_dropped);
-	if (drv->ring_dropped)
-		pw_log_info("  ring-dropped samples (cumulative): %lu", drv->ring_dropped);
+	if (drv->wk_hist_count > 0) {
+		pw_log_info("deadline worker per-wake timing [%s drv-node=%d mode=%s]:",
+			    who,
+			    drv->node ? drv->node->info.id : (uint32_t)-1,
+			    drv->impl->sync_mode ? "sync" : "async");
+		pw_log_info("  wakes=%lu min=%luns max=%luns avg=%luns",
+			    drv->wk_hist_count, drv->wk_hist_min_ns, drv->wk_hist_max_ns,
+			    drv->wk_hist_sum_ns / drv->wk_hist_count);
+		pw_log_info("  bucket counts (lo bound ns -> count):");
+		for (uint32_t i = 0; i < 32; i++) {
+			if (drv->wk_hist_buckets[i] == 0)
+				continue;
+			pw_log_info("    >=%luns -> %lu", (uint64_t)1 << i,
+				    drv->wk_hist_buckets[i]);
+		}
+	}
 }
 
 static SPA_UNUSED bool is_audio_source_media_class(const char *media_class)
@@ -1121,6 +1166,8 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
  * by one cycle is acceptable. */
 static void worker_recalc_one(struct impl *impl, struct node *drv)
 {
+	uint64_t t0;
+
 	if (impl->worker_fake_delay_us > 0) {
 		struct timespec ts = {
 			.tv_sec  = impl->worker_fake_delay_us / 1000000u,
@@ -1129,9 +1176,20 @@ static void worker_recalc_one(struct impl *impl, struct node *drv)
 		nanosleep(&ts, NULL);
 	}
 
+	/* Per-wake CPU-time measurement, log2-bucketed alongside the
+	 * RT-hook histogram. fake-delay-us is excluded (nanosleep above
+	 * does not advance CLOCK_THREAD_CPUTIME_ID). */
+	t0 = now_thread_cputime_ns();
+
 	worker_drain_samples(impl, drv);
 
 	worker_apply_dag(impl, drv);
+
+	{
+		uint64_t t1 = now_thread_cputime_ns();
+		if (t1 > t0)
+			worker_hist_record(drv, t1 - t0);
+	}
 
 	/* Coalesce snapshot invokes: only queue a new one if no previous
 	 * one is still pending. The main-loop callback clears the flag
