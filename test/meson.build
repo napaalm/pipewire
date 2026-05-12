@@ -76,19 +76,12 @@ test('test-module-deadline-dag',
                link_with: pwtest_lib)
 )
 
-test('test-module-deadline-wcet-sketch',
-    executable('test-module-deadline-wcet-sketch',
-               'test-module-deadline-wcet-sketch.c',
-               '../src/modules/module-deadline/wcet_sketch.c',
-               include_directories: pwtest_inc,
-               dependencies: [ spa_dep, pipewire_dep, mathlib ],
-               link_with: pwtest_lib)
-)
-
 test('test-module-deadline-reconcile',
     executable('test-module-deadline-reconcile',
                'test-module-deadline-reconcile.c',
+               '../src/modules/module-deadline/contracted.c',
                '../src/modules/module-deadline/dag.c',
+               '../src/modules/module-deadline/fusion_validator.c',
                '../src/modules/module-deadline/reconcile.c',
                include_directories: pwtest_inc,
                dependencies: [ spa_dep, pipewire_dep, mathlib ],
@@ -104,12 +97,76 @@ test('test-module-deadline-sched-groups',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-diag',
+    executable('test-module-deadline-diag',
+               'test-module-deadline-diag.c',
+               '../src/modules/module-deadline/conformal.c',
+               '../src/modules/module-deadline/diag.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-contracted',
+    executable('test-module-deadline-contracted',
+               'test-module-deadline-contracted.c',
+               '../src/modules/module-deadline/contracted.c',
+               '../src/modules/module-deadline/dag.c',
+               '../src/modules/module-deadline/fusion_validator.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-fusion-validator',
+    executable('test-module-deadline-fusion-validator',
+               'test-module-deadline-fusion-validator.c',
+               '../src/modules/module-deadline/fusion_validator.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-module-deadline-conformal',
+    executable('test-module-deadline-conformal',
+               'test-module-deadline-conformal.c',
+               '../src/modules/module-deadline/conformal.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',
                '../src/modules/module-deadline/cpu_topology.c',
                include_directories: pwtest_inc,
                dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
+test('test-fusion-cost',
+    executable('test-fusion-cost',
+               'test-fusion-cost.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-cycle-counter',
+    executable('test-cycle-counter',
+               'test-cycle-counter.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-fusion-graph',
+    executable('test-fusion-graph',
+               'test-fusion-graph.c',
+               '../src/pipewire/fusion-graph.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
                link_with: pwtest_lib)
 )
 
@@ -126,6 +183,19 @@ test('test-loop',
                'test-loop.c',
                include_directories: pwtest_inc,
                dependencies: [ spa_dep, epoll_shim_dep ],
+               link_with: pwtest_lib)
+)
+
+# Same-loop fast path in trigger_target_v1. The test intercepts
+# pw_impl_node_dispatch_inline through ld's --wrap so the dispatch
+# decision inside the static-inline trigger_target_v1 can be observed
+# without spinning up a real pw_impl_node + spa_node graph.
+test('test-trigger-target',
+    executable('test-trigger-target',
+               'test-trigger-target.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_args: [ '-Wl,--wrap=pw_impl_node_dispatch_inline' ],
                link_with: pwtest_lib)
 )
 
