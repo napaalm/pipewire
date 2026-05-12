@@ -1035,48 +1035,76 @@ static void apply_sample(struct impl *impl, struct node *n, uint64_t runtime, ui
 }
 
 /* ------------------------------------------------------------------
- * Sync path: original behaviour. Builds the DAG, runs P-EDF analysis
- * and applies SCHED_DEADLINE/affinity all from the driver's data-loop
- * thread, inside the RT hook. Kept as a benchmark/escape hatch via
- * the recalc.sync=true option.
+ * Sync path: original behaviour, now running on the same reconcile
+ * orchestrator the async worker uses. Builds the topology view from
+ * the driver's rt.target_list and the live pw_impl_node graph (not
+ * from a topo snapshot, because the sync path runs inside the RT
+ * hook and has direct access), then hands it to reconcile_apply.
+ * Selected via recalc.sync=true; recalc.persistent and
+ * wcet.recalc-threshold apply just like in the async case.
  * ------------------------------------------------------------------ */
-/* Helper: is `id` in the kept-set? Tiny linear scan, suitable for the
- * small follower counts a driver typically sees. */
-static bool id_is_kept(const uint32_t *ids, uint32_t n, uint32_t id)
-{
-	for (uint32_t i = 0; i < n; i++)
-		if (ids[i] == id)
-			return true;
-	return false;
-}
-
 static void recalc_params_sync(struct node *drv)
 {
 	struct pw_impl_node *node = drv->node;
 	struct impl *impl = drv->impl;
 	struct pw_node_target *t;
-	struct pw_impl_node *node2;
+	uint64_t period;
+	reconcile_follower_t *followers;
+	reconcile_edge_t *edges;
+	uint32_t followers_cap;
+	uint32_t edges_cap;
+	uint32_t n_followers = 0;
+	uint32_t n_edges = 0;
+	reconcile_topo_t rtopo = { 0 };
 
 	if (node->target_rate.denom == 0 || node->target_quantum == 0)
 		return;
 
-	uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
+	period = SPA_NSEC_PER_SEC * node->target_quantum / node->target_rate.denom;
 
-	dag_t *dag = dag_create(period, period, impl->cpu_utilization, impl->n_cpus);
+	if (drv->reconcile == NULL) {
+		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
+				impl->cpu_utilization,
+				impl->wcet_recalc_threshold,
+				impl->recalc_persistent);
+		if (drv->reconcile == NULL) {
+			pw_log_warn("reconcile_init failed: %m");
+			return;
+		}
+	}
 
-	/* Soft-failure: collect the ids of nodes successfully added to
-	 * the DAG so we can drop edges that reference skipped nodes. */
-	uint32_t kept_ids[256];
-	uint32_t n_kept = 0;
+	/* Pre-size the follower/edge arrays generously; realloc on
+	 * overflow. */
+	followers_cap = 32;
+	edges_cap = 64;
+	followers = calloc(followers_cap, sizeof(*followers));
+	edges = calloc(edges_cap, sizeof(*edges));
+	if (!followers || !edges) {
+		free(followers);
+		free(edges);
+		return;
+	}
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tnode = t->node;
 		struct pw_node_activation *na;
-		pid_t tid = -1;
+		uint64_t runtime;
+		pid_t tid;
+		struct node *n;
 
-		struct node *n = find_node(impl, tnode);
+		if (!pw_properties_get_bool(tnode->properties,
+				PW_KEY_NODE_LOOP_DYNAMIC, false))
+			continue;
+		tid = pw_properties_get_int32(tnode->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		if (tid == -1)
+			continue;
+
+		n = find_node(impl, tnode);
 		if (n == NULL) {
 			n = calloc(1, sizeof(*n));
+			if (!n)
+				continue;
 			n->impl = impl;
 			n->node = tnode;
 			n->node_id = tnode->info.id;
@@ -1090,67 +1118,103 @@ static void recalc_params_sync(struct node *drv)
 		}
 
 		na = t->activation;
-		uint64_t runtime = get_runtime_ns(tnode, na);
+		runtime = get_runtime_ns(tnode, na);
 		if (runtime > period)
 			pw_log_warn("node %d runtime %lu exceeds period %lu",
 				    tnode->info.id, runtime, period);
 
 		apply_sample(impl, n, runtime, period);
 
-		if (n->wcet == 0 || (uint64_t)(n->wcet * 1.05) == 0) {
-			pw_log_debug("sync: skipping node %d (wcet=0)", tnode->info.id);
-			continue;
-		}
-
-		if (pw_properties_get_bool(tnode->properties, PW_KEY_NODE_LOOP_DYNAMIC, false)) {
-			tid = pw_properties_get_int32(tnode->properties, PW_KEY_NODE_LOOP_TID, -1);
-			if (tid == -1) {
-				pw_log_error("node %d has no TID", tnode->info.id);
+		if (n_followers >= followers_cap) {
+			uint32_t new_cap = followers_cap * 2;
+			reconcile_follower_t *r = realloc(followers,
+					new_cap * sizeof(*followers));
+			if (!r)
 				continue;
-			}
-		} else {
-			pw_log_error("node %d is not a dynamic loop", tnode->info.id);
-			continue;
+			followers = r;
+			followers_cap = new_cap;
 		}
-
-		dag_add_node(dag, tnode->info.id, (uint64_t)(n->wcet * 1.05), tid, false);
-		if (n_kept < SPA_N_ELEMENTS(kept_ids))
-			kept_ids[n_kept++] = tnode->info.id;
+		followers[n_followers].id = tnode->info.id;
+		followers[n_followers].tid = tid;
+		followers[n_followers].wcet = n->wcet;
+		n_followers++;
 	}
 
-	if (n_kept == 0) {
-		dag_destroy(dag);
+	if (n_followers == 0) {
+		free(followers);
+		free(edges);
 		return;
 	}
 
+	/* Edges: same feedback/async filter as the snapshot path. */
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tnode = t->node;
 		struct pw_impl_port *p;
 		struct pw_impl_link *l;
-		if (!id_is_kept(kept_ids, n_kept, tnode->info.id))
-			continue;
+
 		spa_list_for_each(p, &tnode->output_ports, link) {
 			spa_list_for_each(l, &p->links, output_link) {
-				/* Same feedback / async filter as the
-				 * snapshot path above. */
+				if (!l->input || !l->input->node)
+					continue;
 				if (l->feedback)
 					continue;
 				if (l->output->node && l->input->node &&
 						(l->output->node->async ||
 						 l->input->node->async))
 					continue;
-				node2 = l->input->node;
-				if (!id_is_kept(kept_ids, n_kept, node2->info.id))
-					continue;
-				dag_add_edge(dag, tnode->info.id, node2->info.id);
+				if (n_edges >= edges_cap) {
+					uint32_t new_cap = edges_cap * 2;
+					reconcile_edge_t *r = realloc(edges,
+							new_cap * sizeof(*edges));
+					if (!r)
+						continue;
+					edges = r;
+					edges_cap = new_cap;
+				}
+				edges[n_edges].src = tnode->info.id;
+				edges[n_edges].dst = l->input->node->info.id;
+				n_edges++;
 			}
 		}
 	}
 
-	dag_recalculate(dag);
-	dag_foreach_node(dag, sched_cb, impl);
+	/* Compute a cheap topology fingerprint (FNV-1a-ish hash over
+	 * the follower-id list and edge-src/dst pairs) so the
+	 * persistent reconcile path can short-circuit when nothing
+	 * structural changed. The sync path runs every audio cycle;
+	 * bumping the generation every call would defeat the
+	 * persistent-DAG optimisation. */
+	{
+		uint64_t h = 0xcbf29ce484222325ULL;
+		uint32_t i;
+		for (i = 0; i < n_followers; i++) {
+			h ^= followers[i].id;
+			h *= 0x100000001b3ULL;
+			h ^= (uint64_t)followers[i].tid;
+			h *= 0x100000001b3ULL;
+		}
+		for (i = 0; i < n_edges; i++) {
+			h ^= edges[i].src;
+			h *= 0x100000001b3ULL;
+			h ^= edges[i].dst;
+			h *= 0x100000001b3ULL;
+		}
+		if (h != drv->topo.generation) {
+			drv->topo.generation = h;
+		}
+	}
 
-	dag_destroy(dag);
+	rtopo.followers = followers;
+	rtopo.n_followers = n_followers;
+	rtopo.edges = edges;
+	rtopo.n_edges = n_edges;
+	rtopo.period = period;
+	rtopo.generation = drv->topo.generation;
+
+	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
+
+	free(followers);
+	free(edges);
 }
 
 /* ------------------------------------------------------------------
