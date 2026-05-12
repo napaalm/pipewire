@@ -72,19 +72,29 @@ typedef	unsigned long bitset_t;
 	((name)[_bitset_word(bit)] &= ~_bitset_mask(bit))
 
 				/* clear bits start ... stop in bitset */
+				/* Helper: a uint64 mask with bits 0..N-1 set
+				 * (low_mask) or N..63 set (high_mask).
+				 * Special-cases N==0 to avoid the UB of a
+				 * shift by the full type width. */
+#define _bitset_low_mask(n) \
+	((n) == 0 ? 0ul : (-1ul >> (64 - (n))))
+#define _bitset_high_mask(n) \
+	((n) >= 64 ? 0ul : (-1ul << (n)))
 #define	bitset_nclear(name, start, stop) do { \
 	register bitset_t *_name = (name); \
 	register int _start = (start), _stop = (stop); \
 	register int _startword = _bitset_word(_start); \
 	register int _stopword = _bitset_word(_stop); \
+	register int _startbit = _start & 0x3f; \
+	register int _stopbit = _stop & 0x3f; \
 	if (_startword == _stopword) { \
-		_name[_startword] &= ((-1ul >> (64 - (_start & 0x3f))) | \
-				      (-1ul << ((_stop & 0x3f) + 1))); \
+		_name[_startword] &= (_bitset_low_mask(_startbit) | \
+				      _bitset_high_mask(_stopbit + 1)); \
 	} else { \
-		_name[_startword] &= -1ul >> (64 - (_start & 0x3f)); \
+		_name[_startword] &= _bitset_low_mask(_startbit); \
 		while (++_startword < _stopword) \
 			_name[_startword] = 0; \
-		_name[_stopword] &= -1ul << ((_stop & 0x3f) + 1); \
+		_name[_stopword] &= _bitset_high_mask(_stopbit + 1); \
 	} \
 } while (0)
 
