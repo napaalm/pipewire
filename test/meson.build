@@ -76,6 +76,15 @@ test('test-module-deadline-dag',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-wcet-sketch',
+    executable('test-module-deadline-wcet-sketch',
+               'test-module-deadline-wcet-sketch.c',
+               '../src/modules/module-deadline/wcet_sketch.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-client',
     executable('test-client',
                'test-client.c',
