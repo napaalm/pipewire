@@ -102,6 +102,18 @@ struct dag {
 	bitset_t **unrelated;
 	uint32_t unrelated_size;
 	uint32_t unrelated_capacity;
+
+	/* Scratch buffers used inside a single dag_recalculate run.
+	 * Allocated once when the indexed-nodes cache is built (so
+	 * they share the same lifetime as indexed_nodes), reused across
+	 * every compute_longest_path / assign_path_head_deadline call
+	 * that runs inside the same recalc. Freed by
+	 * dag_invalidate_analysis. The persistent across-recalc id
+	 * index (nodes_by_id, added in a later commit) is a different,
+	 * complementary cache. */
+	dag_node_t **ws_path;       /* path buffer, length <= indexed_count */
+	bool        *ws_excluded;   /* excluded-from-discount flags */
+	uint32_t     ws_capacity;   /* allocated length of both above */
 };
 
 /* Create and destroy a DAG */

@@ -98,6 +98,48 @@ static void dag_free_indexed_nodes(dag_t *g)
 	g->indexed_count = 0;
 }
 
+/* Per-recalc scratch buffer lifecycle. Allocated to the dense-index
+ * cardinality (which is itself a one-shot allocation per recalc),
+ * so the scratch buffers cost is amortised over the entire recalc
+ * regardless of how many compute_longest_path / discount-loop calls
+ * fire. Both pointers are NULL between recalcs. */
+static int dag_workspace_alloc(dag_t *g, uint32_t capacity)
+{
+	if (g->ws_capacity >= capacity)
+		return 0;
+
+	free(g->ws_path);
+	free(g->ws_excluded);
+	g->ws_path = NULL;
+	g->ws_excluded = NULL;
+	g->ws_capacity = 0;
+
+	if (capacity == 0)
+		return 0;
+
+	g->ws_path = calloc(capacity, sizeof(*g->ws_path));
+	g->ws_excluded = calloc(capacity, sizeof(*g->ws_excluded));
+	if (!g->ws_path || !g->ws_excluded) {
+		free(g->ws_path);
+		free(g->ws_excluded);
+		g->ws_path = NULL;
+		g->ws_excluded = NULL;
+		errno = ENOMEM;
+		return -1;
+	}
+	g->ws_capacity = capacity;
+	return 0;
+}
+
+static void dag_workspace_free(dag_t *g)
+{
+	free(g->ws_path);
+	free(g->ws_excluded);
+	g->ws_path = NULL;
+	g->ws_excluded = NULL;
+	g->ws_capacity = 0;
+}
+
 static void dag_invalidate_analysis(dag_t *g)
 {
 	dag_node_t *n;
@@ -115,6 +157,7 @@ static void dag_invalidate_analysis(dag_t *g)
 
 	dag_free_unrelated(g);
 	dag_free_indexed_nodes(g);
+	dag_workspace_free(g);
 }
 
 dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
@@ -782,28 +825,31 @@ static void dag_populate_longest_paths(dag_t *g)
 	}
 }
 
+/* Materialize the longest path from `src` to `dst` into the
+ * caller-provided buffer `path_out` (which must be at least
+ * indexed_count entries large -- the recalc workspace buffer is
+ * sized this way). Returns the path's cumulative WCET, or 0 on
+ * any failure (no path, NULL inputs). The path length is written
+ * to *path_len_out.
+ *
+ * The buffer is NOT allocated here; the caller owns it. This is
+ * how the per-recalc workspace removes per-call malloc/free churn
+ * across the iterative deadline assignment. */
 static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
-		dag_node_t ***path_out, int *path_len_out)
+		dag_node_t **path_out, int *path_len_out)
 {
 	uint64_t total = 0;
 	dag_node_t *node;
-	dag_node_t **path;
 	uint32_t count = 0;
 
-	*path_out = NULL;
 	*path_len_out = 0;
 
-	if (!g || !src || !dst)
+	if (!g || !src || !dst || !path_out)
 		return 0;
 
 	if (src == dst) {
-		path = malloc(sizeof(*path));
-		if (!path)
-			return 0;
-
-		path[0] = src;
+		path_out[0] = src;
 		*path_len_out = 1;
-		*path_out = path;
 		return src->wcet;
 	}
 
@@ -822,20 +868,15 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	if (node != dst)
 		return 0;
 
-	path = malloc((size_t)count * sizeof(*path));
-	if (!path)
-		return 0;
-
 	node = src;
 	for (uint32_t i = 0; i < count; i++) {
-		path[i] = node;
+		path_out[i] = node;
 		total += node->wcet;
 		if (node == dst)
 			break;
 		node = g->indexed_nodes[node->longest_next];
 	}
 
-	*path_out = path;
 	*path_len_out = (int)count;
 	return total;
 }
@@ -862,6 +903,17 @@ static int dag_build_indexed_nodes(dag_t *g)
 	g->indexed_count = count;
 	for (uint32_t i = 0; i < count; i++)
 		g->indexed_nodes[i]->index = i;
+
+	/* Size the per-recalc workspace once at the same point we size
+	 * the indexed_nodes cache. All subsequent
+	 * compute_longest_path / assign_path_head_deadline calls reuse
+	 * the same buffer, eliminating per-call malloc/free churn for
+	 * graphs that need many longest-path queries (one per real
+	 * node in the iterative deadline assignment). */
+	if (dag_workspace_alloc(g, count) < 0) {
+		dag_free_indexed_nodes(g);
+		return -1;
+	}
 
 	return 0;
 }
@@ -1246,16 +1298,20 @@ static inline void assign_or_tighten_deadline(dag_node_t *node, uint64_t deadlin
  * actual assignment, which may be lower than what a naive
  * proportional split would have produced.
  */
+/* `excluded_buf` is a scratch flag array provided by the caller
+ * (the per-recalc workspace). The function zeroes the prefix it
+ * needs (path_len entries) at entry. The caller does not free it;
+ * the workspace owns the buffer.
+ */
 static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D, uint64_t L,
-		uint64_t *assigned_head)
+		bool *excluded_buf, uint64_t *assigned_head)
 {
 	dag_node_t *n_src;
-	bool *excluded;
 	uint64_t residual_deadline = D;
 	uint64_t residual_wcet = L;
 	bool changed;
 
-	if (!path || path_len <= 0) {
+	if (!path || path_len <= 0 || !excluded_buf) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -1269,9 +1325,7 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 		return 0;
 	}
 
-	excluded = calloc((size_t)path_len, sizeof(*excluded));
-	if (!excluded)
-		return -1;
+	memset(excluded_buf, 0, (size_t)path_len * sizeof(*excluded_buf));
 
 	/* Phase B: discount tighter pre-assigned deadlines. The loop
 	 * restarts after each discount because the proportional share
@@ -1288,7 +1342,7 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 			dag_node_t *ni;
 			uint64_t d_prime;
 
-			if (excluded[i])
+			if (excluded_buf[i])
 				continue;
 
 			ni = path[i];
@@ -1300,7 +1354,7 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 						residual_deadline, ni->deadline);
 				residual_wcet = saturating_sub_u64(
 						residual_wcet, ni->wcet);
-				excluded[i] = true;
+				excluded_buf[i] = true;
 				changed = true;
 				break;
 			}
@@ -1311,7 +1365,6 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 		assign_or_tighten_deadline(n_src, 0);
 		if (assigned_head)
 			*assigned_head = n_src->deadline;
-		free(excluded);
 		return 0;
 	}
 
@@ -1323,7 +1376,6 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 	if (assigned_head)
 		*assigned_head = n_src->deadline;
 
-	free(excluded);
 	return 0;
 }
 
@@ -1334,25 +1386,40 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
  * commit (622bb0019) and is exercised by the U-resbudget regression. */
 static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_node_t *dst, uint64_t D)
 {
-	dag_node_t **P;
 	int path_len;
 	uint64_t L;
 	uint64_t residual_deadline;
 	uint64_t residual_wcet;
 	bool src_discounted = false;
 	uint64_t discounted_src_deadline = 0;
-	bool *excluded;
 	bool changed;
+
+	/* The recursive form uses local malloc'd scratch buffers
+	 * because it nests (multiple subproblems live simultaneously
+	 * on the C stack); the iterative form is the active path and
+	 * uses the per-recalc workspace below. */
+	dag_node_t **P;
+	bool *excluded;
 
 	if (src == dst) {
 		assign_or_tighten_deadline(src, D);
 		return 0;
 	}
 
+	P = calloc(g->indexed_count, sizeof(*P));
+	if (!P)
+		return -1;
+	excluded = calloc(g->indexed_count, sizeof(*excluded));
+	if (!excluded) {
+		free(P);
+		return -1;
+	}
+
 	/* Phase A: longest path of this subproblem. */
-	L = compute_longest_path(g, src, dst, &P, &path_len);
+	L = compute_longest_path(g, src, dst, P, &path_len);
 	if (path_len == 0 || L == 0) {
 		free(P);
+		free(excluded);
 		return -1;
 	}
 
@@ -1360,11 +1427,6 @@ static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_
 	 * residual budget and the residual path length. */
 	residual_deadline = D;
 	residual_wcet = L;
-	excluded = calloc((size_t)path_len, sizeof(*excluded));
-	if (!excluded) {
-		free(P);
-		return -1;
-	}
 
 	changed = true;
 	while (changed) {
@@ -1401,8 +1463,8 @@ static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_
 	}
 
 	if (residual_deadline == 0 || residual_wcet == 0) {
-		free(excluded);
 		free(P);
+		free(excluded);
 		return 0;
 	}
 
@@ -1441,15 +1503,15 @@ static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_
 				continue;
 
 			if (assign_deadlines_recursive(g, e->dst, dst, D_residual) < 0) {
-				free(excluded);
 				free(P);
+				free(excluded);
 				return -1;
 			}
 		}
 	}
 
-	free(excluded);
 	free(P);
+	free(excluded);
 	return 0;
 }
 
@@ -1460,6 +1522,11 @@ static int assign_deadlines_iterative(dag_t *g)
 
 	if (!fictitious_src || !fictitious_sink) {
 		pw_log_error("missing fictitious endpoints for iterative deadline assignment");
+		errno = EFAULT;
+		return -1;
+	}
+	if (!g->ws_path || !g->ws_excluded) {
+		pw_log_error("missing per-recalc workspace for iterative deadline assignment");
 		errno = EFAULT;
 		return -1;
 	}
@@ -1474,7 +1541,6 @@ static int assign_deadlines_iterative(dag_t *g)
 
 	for (uint32_t i = 0; i < g->indexed_count; i++) {
 		dag_node_t *node = g->indexed_nodes[i];
-		dag_node_t **path = NULL;
 		uint64_t available_deadline = 0;
 		uint64_t assigned_deadline = 0;
 		uint64_t path_len;
@@ -1502,24 +1568,23 @@ static int assign_deadlines_iterative(dag_t *g)
 		}
 
 		node->remaining_deadline = available_deadline;
-		path_len = compute_longest_path(g, node, fictitious_sink, &path, &path_nodes);
+		path_len = compute_longest_path(g, node, fictitious_sink,
+				g->ws_path, &path_nodes);
 		if (path_nodes == 0 || (node != fictitious_sink && path_len == 0)) {
 			pw_log_error("failed to compute longest path from node %u to fictitious sink",
 					node->id);
-			free(path);
 			errno = EFAULT;
 			return -1;
 		}
 
-		if (assign_path_head_deadline(path, path_nodes, available_deadline, path_len,
-					&assigned_deadline) < 0) {
-			free(path);
+		if (assign_path_head_deadline(g->ws_path, path_nodes,
+					available_deadline, path_len,
+					g->ws_excluded, &assigned_deadline) < 0) {
 			return -1;
 		}
 
 		node->remaining_deadline = available_deadline > assigned_deadline ?
 			available_deadline - assigned_deadline : 0;
-		free(path);
 	}
 
 	return 0;
