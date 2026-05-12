@@ -59,16 +59,6 @@ static void dag_invalidate_schedule(dag_t *g)
 	}
 }
 
-static void dag_free_relatives(dag_t *g)
-{
-	if (!g || !g->relatives)
-		return;
-
-	free(g->relatives[0]);
-	free(g->relatives);
-	g->relatives = NULL;
-}
-
 static void dag_free_unrelated(dag_t *g)
 {
 	uint32_t i;
@@ -103,9 +93,10 @@ static void dag_invalidate_analysis(dag_t *g)
 		n->index = DAG_NODE_INDEX_INVALID;
 		n->longest_len = 0;
 		n->longest_next = -1;
+		free(n->successors);
+		n->successors = NULL;
 	}
 
-	dag_free_relatives(g);
 	dag_free_unrelated(g);
 	dag_free_indexed_nodes(g);
 }
@@ -196,6 +187,15 @@ static dag_node_t *dag_find_fictitious_sink(dag_t *g)
 	return find_node(g, DAG_FICTITIOUS_SINK_ID);
 }
 
+static bool dag_nodes_are_related(dag_node_t *a, dag_node_t *b)
+{
+	if (!a || !b || !a->successors || !b->successors)
+		return false;
+
+	return bitset_test(a->successors, b->index) ||
+		bitset_test(b->successors, a->index);
+}
+
 int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitious)
 {
 	if (!g) {
@@ -229,6 +229,7 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->remaining_deadline = 0;
 	n->longest_len = 0;
 	n->longest_next = -1;
+	n->successors = NULL;
 	n->deadline = 0;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);
@@ -263,6 +264,7 @@ static int dag_remove_node_ptr(dag_t *g, dag_node_t *n)
 	}
 
 	spa_list_remove(&n->link);
+	free(n->successors);
 	free(n);
 	return 0;
 }
@@ -666,62 +668,28 @@ static int dag_build_indexed_nodes(dag_t *g)
 	return 0;
 }
 
-static int dag_allocate_relatives(dag_t *g)
+static int dag_build_successors(dag_t *g)
 {
-	size_t count = g->indexed_count;
-	int *data;
+	uint32_t count = g->indexed_count;
 
 	if (count == 0)
 		return 0;
 
-	g->relatives = calloc(count, sizeof(*g->relatives));
-	if (!g->relatives)
-		return -1;
-
-	data = calloc(count * count, sizeof(*data));
-	if (!data) {
-		free(g->relatives);
-		g->relatives = NULL;
-		return -1;
-	}
-
-	for (size_t i = 0; i < count; i++)
-		g->relatives[i] = data + (i * count);
-
-	return 0;
-}
-
-static void dag_mark_descendants(dag_t *g, dag_node_t *root, dag_node_t *node, bool *visited)
-{
-	dag_edge_t *e;
-
-	spa_list_for_each(e, &node->outgoing, src_link) {
-		dag_node_t *dst = e->dst;
-
-		if (visited[dst->index])
-			continue;
-
-		visited[dst->index] = true;
-		g->relatives[root->index][dst->index] = 1;
-		g->relatives[dst->index][root->index] = 1;
-		dag_mark_descendants(g, root, dst, visited);
-	}
-}
-
-static int dag_comp_relatives(dag_t *g)
-{
-	if (dag_allocate_relatives(g) < 0)
-		return -1;
-
-	for (uint32_t i = 0; i < g->indexed_count; i++) {
-		bool *visited = calloc(g->indexed_count, sizeof(*visited));
-		if (!visited)
+	for (uint32_t i = 0; i < count; i++) {
+		g->indexed_nodes[i]->successors = bitset_alloc((int)count);
+		if (!g->indexed_nodes[i]->successors)
 			return -1;
+	}
 
-		g->relatives[i][i] = 1;
-		visited[i] = true;
-		dag_mark_descendants(g, g->indexed_nodes[i], g->indexed_nodes[i], visited);
-		free(visited);
+	for (uint32_t i = count; i > 0; i--) {
+		dag_node_t *node = g->indexed_nodes[i - 1];
+		dag_edge_t *e;
+
+		bitset_zero(node->successors, (int)count);
+		bitset_set(node->successors, node->index);
+
+		spa_list_for_each(e, &node->outgoing, src_link)
+			bitset_or(node->successors, e->dst->successors, (int)count);
 	}
 
 	return 0;
@@ -800,89 +768,88 @@ static void dag_unrelated_squash(dag_t *g)
 	}
 }
 
-static bool dag_have_no_relatives(dag_t *g, bitset_t *set)
+static void dag_build_antichain_initial_stack(dag_t *g, bitset_t *stack)
 {
-	for (uint32_t i = 0; i + 1 < g->indexed_count; i++) {
-		if (!bitset_test(set, i))
-			continue;
+	bitset_zero(stack, (int)g->indexed_count);
 
-		for (uint32_t j = i + 1; j < g->indexed_count; j++) {
-			if (bitset_test(set, j) && g->relatives[i][j])
-				return false;
-		}
-	}
-
-	return true;
-}
-
-static void dag_elemset_del_reachable(dag_t *g, bitset_t *set)
-{
-	bitset_decl_cpy(tmp, set, g->indexed_count);
-
-	for (uint32_t i = 0; i + 1 < g->indexed_count; i++) {
-		if (!bitset_test(set, i))
-			continue;
-
-		for (uint32_t j = i + 1; j < g->indexed_count; j++) {
-			if (bitset_test(set, j) && g->relatives[i][j])
-				bitset_clear(tmp, j);
-		}
-	}
-
-	bitset_cpy(set, tmp, g->indexed_count);
-}
-
-static int dag_comp_unrelated_recur(dag_t *g, bitset_t *curr_cut)
-{
 	for (uint32_t i = 0; i < g->indexed_count; i++) {
-		if (!bitset_test(curr_cut, i))
-			continue;
+		if (!g->indexed_nodes[i]->fictitious)
+			bitset_set(stack, i);
+	}
+}
 
-		dag_node_t *node = g->indexed_nodes[i];
-		if (node->fictitious || spa_list_is_empty(&node->outgoing))
-			continue;
+static void dag_build_antichain_next_stack(dag_t *g, bitset_t *dst,
+		bitset_t *src, uint32_t chosen_index)
+{
+	dag_node_t *chosen = g->indexed_nodes[chosen_index];
+	int candidate;
 
-		bitset_decl_cpy(cut, curr_cut, g->indexed_count);
-		bitset_clear(cut, i);
+	bitset_cpy(dst, src, (int)g->indexed_count);
+	bitset_nclear(dst, 0, (int)chosen_index);
+	bitset_andnot(dst, chosen->successors, (int)g->indexed_count);
 
-		dag_edge_t *e;
-		spa_list_for_each(e, &node->outgoing, src_link) {
-			if (e->dst->fictitious)
-				continue;
-			bitset_set(cut, e->dst->index);
-		}
+	for (candidate = bitset_next_set(dst, (int)g->indexed_count, -1);
+			candidate >= 0;
+			candidate = bitset_next_set(dst, (int)g->indexed_count, candidate)) {
+		dag_node_t *node = g->indexed_nodes[candidate];
 
-		dag_elemset_del_reachable(g, cut);
+		if (node->fictitious || bitset_test(node->successors, chosen_index))
+			bitset_clear(dst, candidate);
+	}
+}
 
-		if (!bitset_empty(cut, (int)g->indexed_count)) {
-			if (!dag_have_no_relatives(g, cut)) {
-				errno = EFAULT;
+static bool dag_antichain_is_redundant(dag_t *g, bitset_t *stack,
+		int last_added, uint32_t chosen_index)
+{
+	dag_node_t *chosen = g->indexed_nodes[chosen_index];
+	int candidate = bitset_next_set(stack, (int)g->indexed_count, last_added);
+
+	while (candidate >= 0 && (uint32_t)candidate < chosen_index) {
+		if (!dag_nodes_are_related(g->indexed_nodes[candidate], chosen))
+			return true;
+		candidate = bitset_next_set(stack, (int)g->indexed_count, candidate);
+	}
+
+	return false;
+}
+
+static int dag_comp_unrelated_recur(dag_t *g, bitset_t *curr_cut,
+		bitset_t *stack, int last_added)
+{
+	int candidate = bitset_next_set(stack, (int)g->indexed_count, last_added);
+
+	while (candidate >= 0) {
+		bitset_decl_cpy(new_cut, curr_cut, g->indexed_count);
+		bitset_decl_zero(new_stack, (int)g->indexed_count);
+
+		bitset_set(new_cut, candidate);
+		dag_build_antichain_next_stack(g, new_stack, stack, (uint32_t)candidate);
+
+		if (bitset_empty(new_stack, (int)g->indexed_count)) {
+			if (!dag_antichain_is_redundant(g, stack, last_added, (uint32_t)candidate) &&
+					dag_add_unrelated(g, new_cut) < 0)
 				return -1;
-			}
-			if (dag_add_unrelated(g, cut) < 0)
-				return -1;
-		}
-
-		if (dag_comp_unrelated_recur(g, cut) < 0)
+		} else if (dag_comp_unrelated_recur(g, new_cut, new_stack, candidate) < 0) {
 			return -1;
+		}
+
+		candidate = bitset_next_set(stack, (int)g->indexed_count, candidate);
 	}
 
 	return 0;
 }
 
-static int dag_comp_unrelated(dag_t *g, dag_node_t **sources, uint32_t nsources)
+static int dag_comp_unrelated(dag_t *g)
 {
 	bitset_decl_zero(curr_cut, (int)g->indexed_count);
+	bitset_decl_zero(stack, (int)g->indexed_count);
 
-	for (uint32_t i = 0; i < nsources; i++)
-		bitset_set(curr_cut, sources[i]->index);
+	dag_build_antichain_initial_stack(g, stack);
+	if (bitset_empty(stack, (int)g->indexed_count))
+		return 0;
 
-	if (!bitset_empty(curr_cut, (int)g->indexed_count)) {
-		if (dag_add_unrelated(g, curr_cut) < 0)
-			return -1;
-		if (dag_comp_unrelated_recur(g, curr_cut) < 0)
-			return -1;
-	}
+	if (dag_comp_unrelated_recur(g, curr_cut, stack, -1) < 0)
+		return -1;
 
 	dag_unrelated_squash(g);
 	return 0;
@@ -901,13 +868,18 @@ static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources,
 	if (dag_build_indexed_nodes(g) < 0)
 		goto error;
 
-	if (dag_comp_relatives(g) < 0)
+	if (dag_build_successors(g) < 0)
 		goto error;
 
 	dag_populate_longest_paths(g);
 
-	if (dag_comp_unrelated(g, sources, nsources) < 0)
+	struct timespec start, end;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	if (dag_comp_unrelated(g) < 0)
 		goto error;
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+	pw_log_error("Unrelated set computation took %.6f seconds", elapsed);
 
 	return 0;
 
@@ -1041,7 +1013,7 @@ static SPA_UNUSED int assign_deadlines_recursive(dag_t *g, dag_node_t *src, dag_
 	spa_list_for_each(e, &src->outgoing, src_link) {
 		if (e->dst == dst)
 			continue;
-		if (!g->relatives[e->dst->index][dst->index])
+		if (!bitset_test(e->dst->successors, dst->index))
 			continue;
 
 		uint64_t D_residual = (D_orig > assigned_src) ? (D_orig - assigned_src) : 0;
@@ -1334,7 +1306,7 @@ int dag_recalculate(dag_t *g)
 	if (assign_cpus(g) < 0)
 		return -1;
 
-	//dag_print(g); // DEBUG
+	dag_print(g); // DEBUG
 	// register end time and log duration
 	struct timespec end_time;
 	clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -1391,7 +1363,7 @@ void dag_print(dag_t *g)
 			pw_log_debug("  Edge to node %u|%u", e->dst->id, e->dst->tid);
 		pw_log_debug("  Relatives:");
 		for (uint32_t i = 0; i < g->indexed_count; i++) {
-			if (g->relatives[n->index][i])
+			if (dag_nodes_are_related(n, g->indexed_nodes[i]))
 				pw_log_debug("    Node %u|%u|%u", g->indexed_nodes[i]->id, g->indexed_nodes[i]->index, g->indexed_nodes[i]->tid);
 		}
 	}

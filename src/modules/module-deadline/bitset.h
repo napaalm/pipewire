@@ -146,6 +146,9 @@ typedef	unsigned long bitset_t;
 #define bitset_cpy(a, b, nbits) \
 	memcpy(a, b, bitset_words(nbits) * sizeof(bitset_t))
 
+#define bitset_zero(a, nbits) \
+	memset(a, 0, bitset_words(nbits) * sizeof(bitset_t))
+
 // do NOT use as single body of e.g., if-else, for or while loops
 #define bitset_decl_cpy(name, src, nbits)                \
 	bitset_t bitset_decl(name, nbits);               \
@@ -161,6 +164,18 @@ static inline int bitset_empty(bitset_t *s, int nbits) {
 	int first_set;
 	bitset_ffs(s, nbits, &first_set);
 	return first_set == -1;
+}
+
+static inline void bitset_or(bitset_t *dst, bitset_t *src, int nbits) {
+	register int _stopword = _bitset_word(nbits - 1);
+	for (int _word = 0; _word <= _stopword; _word++)
+		dst[_word] |= src[_word];
+}
+
+static inline void bitset_andnot(bitset_t *dst, bitset_t *src, int nbits) {
+	register int _stopword = _bitset_word(nbits - 1);
+	for (int _word = 0; _word <= _stopword; _word++)
+		dst[_word] &= ~src[_word];
 }
 
 // Check if set a includes set b
@@ -186,6 +201,14 @@ static inline int bitset_subset_next(bitset_t *s, int nbits) {
 		assert(s[0] != 0ul);
 		return 1;
 	}
+}
+
+static inline int bitset_next_set(bitset_t *s, int nbits, int after) {
+	for (int bit = after + 1; bit < nbits; bit++) {
+		if (bitset_test(s, bit))
+			return bit;
+	}
+	return -1;
 }
 
 static inline char *bitset2str(bitset_t *a, int nbits) {

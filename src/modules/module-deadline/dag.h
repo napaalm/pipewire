@@ -51,6 +51,7 @@ struct dag_node {
 	uint64_t remaining_deadline;
 	uint64_t longest_len;
 	int longest_next;
+	bitset_t *successors;
 
 	bool deadline_assigned;
 };
@@ -74,7 +75,6 @@ struct dag {
 
 	dag_node_t **indexed_nodes;
 	uint32_t indexed_count;
-	int **relatives;
 	bitset_t **unrelated;
 	uint32_t unrelated_size;
 	uint32_t unrelated_capacity;
