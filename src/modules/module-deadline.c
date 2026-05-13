@@ -44,6 +44,7 @@
 
 #include "module-deadline/dag.h"
 #include "module-deadline/reconcile.h"
+#include "module-deadline/sched_groups.h"
 #include "module-deadline/wcet_sketch.h"
 
 #include <spa/utils/result.h>
@@ -412,6 +413,9 @@ struct topo_snap {
 	uint64_t generation;
 };
 
+/* struct sched_group is defined in module-deadline/sched_groups.h
+ * (extracted so it can be unit-tested in isolation). */
+
 struct node {
 	struct spa_list link;
 	struct impl *impl;
@@ -568,6 +572,16 @@ struct impl {
 	 * histograms. */
 	uint64_t      sched_calls_total;
 	uint64_t      sched_calls_skipped;
+
+	/* Per-TID accumulator used by the chain-merge path. Each
+	 * dag_foreach_node pass calls sched_cb once per node; when
+	 * libpipewire has consolidated nodes onto a shared thread,
+	 * multiple followers report the same tid. sched_cb sums
+	 * (runtime, deadline) into the entry for that tid; once the
+	 * foreach returns, apply_sched_groups walks the table and
+	 * issues exactly one sched_setattr per distinct tid. Reset at
+	 * the start of each apply pass via sched_groups_reset. */
+	struct sched_groups sched_groups;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -628,6 +642,7 @@ static void module_destroy(void *data)
 	spa_hook_remove(&impl->module_listener);
 
 	free(impl->nodes_by_id);
+	sched_groups_fini(&impl->sched_groups);
 	free(impl);
 }
 
@@ -727,49 +742,83 @@ static int set_cpu_affinity(pid_t tid, int cpu)
 	return ret;
 }
 
-/* DAG callback. Looks the follower up by id via the module-side
- * O(log N) index, compares the incoming (runtime, deadline, period,
- * cpu) tuple against the cached last-applied value, and skips the
- * sched_setattr + sched_setaffinity pair when all four components
- * match. Cache lives on struct node so its lifetime tracks the
- * follower; no separate prune pass is needed when a follower is
- * removed.
+/* DAG callback (collection pass).
  *
- * On apply failure the cache is invalidated (last_applied=false) so
- * the next reconcile retries even if inputs are bit-identical. */
+ * dag_foreach_node fires this once per real node with the per-node
+ * (runtime, deadline, period, cpu) computed by the analysis. We
+ * accumulate those values into per-TID slots via sched_groups_add:
+ * when libpipewire has consolidated several adjacent followers onto
+ * a single thread, multiple callbacks land on the same TID slot and
+ * the runtime / deadline pair is the summed envelope that the
+ * merged thread is supposed to fit into.
+ *
+ * The actual sched_setattr / sched_setaffinity happens in
+ * apply_sched_groups, called by the worker once this collection pass
+ * finishes. Skipping the sched syscalls inside the callback also
+ * keeps dag_foreach_node free of syscall jitter, which matters in
+ * sync mode where the foreach runs on the RT data-loop thread. */
 static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
-	struct node *n;
-	int rc_sched, rc_aff;
+	int res = sched_groups_add(&impl->sched_groups, id, tid,
+			runtime, deadline, period, cpu);
+	if (res == -ENOMEM)
+		pw_log_warn("sched: out of memory accumulating tid=%d", (int)tid);
+	/* -EINVAL (tid <= 0) is silently ignored: a follower with no
+	 * published thread can't be scheduled, same as before the
+	 * extraction. */
+}
 
-	impl->sched_calls_total++;
+/* Per-group apply pass.
+ *
+ * Iterates the accumulator and issues at most one sched_setattr +
+ * one sched_setaffinity per distinct TID. Reuses the leader follower
+ * node's last_applied cache so a stable graph re-applies nothing:
+ * the cache lives on the lowest-id member of each group and is
+ * invalidated automatically when the group composition changes
+ * (leader becomes a different follower, sums change, period or CPU
+ * change).
+ *
+ * Singleton TIDs (n_members == 1) take exactly the same code path
+ * as multi-member groups -- the original one-node-one-thread case
+ * is just the degenerate single-member group. */
+static void apply_sched_groups(struct impl *impl)
+{
+	uint32_t i;
+	for (i = 0; i < impl->sched_groups.count; i++) {
+		struct sched_group *g = &impl->sched_groups.entries[i];
+		struct node *anchor;
+		int rc_sched, rc_aff;
 
-	n = find_node_by_id(impl, id);
-	if (n != NULL && n->last_applied &&
-			n->last_runtime == runtime &&
-			n->last_deadline == deadline &&
-			n->last_period == period &&
-			n->last_cpu == cpu) {
-		impl->sched_calls_skipped++;
-		return;
-	}
+		impl->sched_calls_total++;
 
-	rc_sched = set_deadline_sched(tid, runtime, deadline, period);
-	rc_aff = set_cpu_affinity(tid, impl->cpus[cpu]);
+		anchor = find_node_by_id(impl, g->leader_id);
+		if (anchor != NULL && anchor->last_applied &&
+				anchor->last_runtime == g->sum_runtime &&
+				anchor->last_deadline == g->sum_deadline &&
+				anchor->last_period == g->period &&
+				anchor->last_cpu == g->cpu) {
+			impl->sched_calls_skipped++;
+			continue;
+		}
 
-	if (n == NULL)
-		return;
+		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
+				g->sum_deadline, g->period);
+		rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
 
-	if (rc_sched == 0 && rc_aff == 0) {
-		n->last_runtime  = runtime;
-		n->last_deadline = deadline;
-		n->last_period   = period;
-		n->last_cpu      = cpu;
-		n->last_applied  = true;
-	} else {
-		n->last_applied = false;
+		if (anchor == NULL)
+			continue;
+
+		if (rc_sched == 0 && rc_aff == 0) {
+			anchor->last_runtime  = g->sum_runtime;
+			anchor->last_deadline = g->sum_deadline;
+			anchor->last_period   = g->period;
+			anchor->last_cpu      = g->cpu;
+			anchor->last_applied  = true;
+		} else {
+			anchor->last_applied = false;
+		}
 	}
 }
 
@@ -1211,7 +1260,9 @@ static void recalc_params_sync(struct node *drv)
 	rtopo.period = period;
 	rtopo.generation = drv->topo.generation;
 
+	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
+	apply_sched_groups(impl);
 
 	free(followers);
 	free(edges);
@@ -1507,7 +1558,9 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	rtopo.period = t->period;
 	rtopo.generation = SPA_ATOMIC_LOAD(t->generation);
 
+	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
+	apply_sched_groups(impl);
 
 	free(followers);
 	free(edges);

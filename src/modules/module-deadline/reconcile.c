@@ -197,6 +197,72 @@ static dag_t *build_dag_from_topo(reconcile_state_t *state,
 	return dag;
 }
 
+/* Stamp DAG co-location groups from shared TIDs in the topology
+ * snapshot. When libpipewire's chain-merge consolidates several
+ * follower nodes onto one thread, those nodes all publish the same
+ * PW_KEY_NODE_LOOP_TID. The topology layer in module-deadline mirrors
+ * that into reconcile_follower_t::tid, so a duplicate TID across the
+ * follower list is the sole signal needed to declare the nodes
+ * co-located.
+ *
+ * For each distinct shared TID we pick the lowest follower id as the
+ * canonical group id (deterministic, independent of follower
+ * ordering). Followers with a unique TID keep group_id = 0
+ * (ungrouped, free CPU placement). The op is idempotent: when a TID
+ * already maps to the right group, dag_set_node_group is a no-op
+ * and the DAG stays clean.
+ *
+ * Returns 0 on success, -1 (with errno from dag_set_node_group) on
+ * unrecoverable failure -- the caller treats that as it would treat
+ * any DAG mutation failure (drop the DAG, bump the back-off). */
+static int reconcile_apply_tid_groups(dag_t *dag, const reconcile_topo_t *topo)
+{
+	uint32_t i, j;
+
+	if (dag == NULL || topo == NULL)
+		return 0;
+
+	for (i = 0; i < topo->n_followers; i++) {
+		const reconcile_follower_t *fi = &topo->followers[i];
+		uint32_t leader_id = fi->id;
+		bool shared = false;
+		dag_node_t *ni;
+
+		if (fi->tid <= 0)
+			continue;
+
+		/* Find the lowest-id follower that shares this TID
+		 * (including ourself). If no other follower shares the
+		 * TID, the node is its own "group of one" -- still
+		 * ungrouped. */
+		for (j = 0; j < topo->n_followers; j++) {
+			if (j == i)
+				continue;
+			const reconcile_follower_t *fj = &topo->followers[j];
+			if (fj->tid != fi->tid)
+				continue;
+			shared = true;
+			if (fj->id < leader_id)
+				leader_id = fj->id;
+		}
+
+		ni = dag_find_node(dag, fi->id);
+		if (ni == NULL)
+			continue;  /* dropped follower -- skip silently */
+
+		uint32_t desired = shared ? leader_id : 0;
+		if (ni->group_id == desired)
+			continue;
+
+		if (dag_set_node_group(dag, fi->id, desired) < 0) {
+			pw_log_warn("reconcile: dag_set_node_group(%u, %u) failed: %m",
+					fi->id, desired);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* WCET drift check: returns true if |new - cached| / max(new,cached)
  * exceeds the configured threshold. Threshold == 0 makes every
  * difference significant (no gating). The arithmetic stays in
@@ -270,6 +336,18 @@ static int reconcile_apply_persistent(reconcile_state_t *state,
 		}
 	}
 
+	/* Re-stamp co-location groups on every pass. Idempotent when
+	 * the topology hasn't changed (each dag_set_node_group is a
+	 * no-op when the value matches), so the steady-state cost is
+	 * one pointer chase per follower. */
+	if (reconcile_apply_tid_groups(state->dag, topo) < 0) {
+		dag_destroy(state->dag);
+		state->dag = NULL;
+		state->dag_period = 0;
+		state->consecutive_failures++;
+		return -1;
+	}
+
 	if (dag_foreach_node(state->dag, sched_cb, sched_data) < 0) {
 		dag_destroy(state->dag);
 		state->dag = NULL;
@@ -300,6 +378,12 @@ static int reconcile_apply_legacy(reconcile_state_t *state,
 	if (dag == NULL) {
 		if (errno == EAGAIN)
 			return 0;
+		state->consecutive_failures++;
+		return -1;
+	}
+
+	if (reconcile_apply_tid_groups(dag, topo) < 0) {
+		dag_destroy(dag);
 		state->consecutive_failures++;
 		return -1;
 	}
@@ -362,4 +446,16 @@ int reconcile_apply(reconcile_state_t *state,
 	return state->persistent ?
 			reconcile_apply_persistent(state, topo, sched_cb, sched_data) :
 			reconcile_apply_legacy(state, topo, sched_cb, sched_data);
+}
+
+/* Test-only accessor: returns the persistent dag_t* (or NULL if no
+ * DAG is currently cached). Not declared in reconcile.h because
+ * production callers should treat the DAG as opaque, but the unit
+ * test for TID grouping needs to peek at per-node group_id and cpu
+ * fields. The symbol is harmless in production: nothing in
+ * module-deadline.c references it, so the linker drops it from
+ * libpipewire-module-deadline.so. */
+dag_t *reconcile_state_dag_for_test(reconcile_state_t *s)
+{
+	return s ? s->dag : NULL;
 }

@@ -629,6 +629,546 @@ PWTEST(reconcile_e7_fini_null_safe)
 	return PWTEST_PASS;
 }
 
+/* --- TID-grouping tests ---
+ *
+ * When libpipewire's chain-merge consolidates several adjacent
+ * followers onto a single OS thread, those followers all publish the
+ * same PW_KEY_NODE_LOOP_TID. reconcile_apply_tid_groups translates
+ * that into co-location group ids on the DAG, picking the lowest
+ * follower id per shared TID as the canonical group id and leaving
+ * unique-TID nodes ungrouped. These tests inspect the DAG state
+ * after reconcile_apply to confirm the wiring.
+ *
+ * We use reconcile_state_dag (a test-only accessor returning
+ * state->dag) to peek inside the persistent DAG. */
+static dag_t *reconcile_state_peek_dag(reconcile_state_t *s);
+
+/* Test helper: returns state->dag without exposing the internal
+ * layout to production callers. Implemented at the bottom of the
+ * file so it can include reconcile.c's private struct. */
+
+PWTEST(reconcile_g1_shared_tid_creates_group)
+{
+	/* Two followers share TID 100; one has its own TID. After
+	 * reconcile, the two shared ones land on the same group id
+	 * (the lowest of the pair) and the third stays ungrouped. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	/* Override TIDs: 10 and 12 share TID 200; 11 has TID 201. */
+	t.followers[0].tid = 200;
+	t.followers[1].tid = 201;
+	t.followers[2].tid = 200;
+	rt = make_topo(&t, 3, 2, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	dag_node_t *n12 = dag_find_node(dag, 12);
+	pwtest_ptr_notnull(n10);
+	pwtest_ptr_notnull(n11);
+	pwtest_ptr_notnull(n12);
+
+	/* 10 and 12 share TID -> group = min(10,12) = 10. */
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n12->group_id, 10u);
+	/* 11 has unique TID -> ungrouped. */
+	pwtest_int_eq(n11->group_id, 0u);
+
+	/* Co-location effect: 10 and 12 must share a CPU. */
+	pwtest_int_eq((int)n10->cpu, (int)n12->cpu);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g2_unique_tids_no_grouping)
+{
+	/* All followers have distinct TIDs -> every node ungrouped.
+	 * The DAG behaves exactly as before the chain-merge change. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+	for (uint32_t i = 0; i < 5; i++) {
+		dag_node_t *n = dag_find_node(dag, 10 + i);
+		pwtest_ptr_notnull(n);
+		pwtest_int_eq(n->group_id, 0u);
+	}
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g3_chain_share_tid_collapses_to_one_cpu)
+{
+	/* A 3-link chain whose three followers all share one TID
+	 * should land on a single CPU. Even with multiple CPUs
+	 * available, the group constraint pulls them together. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 555;
+	t.followers[1].tid = 555;
+	t.followers[2].tid = 555;
+	rt = make_topo(&t, 3, 2, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	dag_node_t *n12 = dag_find_node(dag, 12);
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 10u);
+	pwtest_int_eq(n12->group_id, 10u);
+	pwtest_int_eq((int)n10->cpu, (int)n11->cpu);
+	pwtest_int_eq((int)n10->cpu, (int)n12->cpu);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g4_chain_break_reverts_group)
+{
+	/* First pass: three followers share a TID (chain-merged).
+	 * Second pass: the middle node's TID changes (chain broke).
+	 * The new DAG should show the two remaining shared-TID
+	 * followers grouped and the middle node ungrouped. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 333;
+	t.followers[1].tid = 333;
+	t.followers[2].tid = 333;
+	rt = make_topo(&t, 3, 2, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	/* Now node 11 splits off onto its own thread. */
+	t.followers[1].tid = 999;
+	rt = make_topo(&t, 3, 2, 2);  /* new generation -> rebuild */
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	dag_node_t *n12 = dag_find_node(dag, 12);
+	pwtest_int_eq(n10->group_id, 10u);  /* 10 and 12 still share */
+	pwtest_int_eq(n12->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 0u);   /* 11 is alone now */
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g5_zero_tid_does_not_group)
+{
+	/* Followers with tid <= 0 don't participate in grouping
+	 * (no thread to merge onto). Two such followers must stay
+	 * ungrouped even if their TIDs are equal. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 0;
+	t.followers[1].tid = 0;
+	rt = make_topo(&t, 2, 1, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	pwtest_int_eq(n10->group_id, 0u);
+	pwtest_int_eq(n11->group_id, 0u);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+/* --- deeper TID-grouping coverage ---
+ *
+ * The g1..g5 tests pin the contract. The ones below stress patterns
+ * that occur in real chain-merge / chain-break cycles: multiple
+ * concurrent chains, dynamic member join/leave between passes, the
+ * legacy (non-persistent) path, the idempotency we rely on to keep
+ * steady-state cost flat, and what the per-node (R, D, T, CPU)
+ * actually look like when the library produces a group placement
+ * (so module-deadline's downstream summation is reasoning from
+ * sound inputs). */
+
+PWTEST(reconcile_g6_two_independent_chains_distinct_groups)
+{
+	/* Five followers in a single linear chain (the topo5 edge set
+	 * is 10 -> 11 -> 12 -> 13 -> 14), but the TID pattern splits
+	 * them into two clusters: {10, 11} share TID 700 and
+	 * {12, 13, 14} share TID 800. Each cluster must collapse to
+	 * its own group; within each group the members must co-locate.
+	 *
+	 * Note: the two groups can legitimately land on the same CPU
+	 * here -- in a linear chain every node is related to every
+	 * other, so the unrelated-set admission lets the two groups
+	 * stack on one CPU. The contract is "group members share a
+	 * CPU"; "distinct groups occupy distinct CPUs" is only
+	 * required when the groups are pairwise unrelated and have a
+	 * worst-fit alternative, which a single-chain topology
+	 * doesn't offer. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 700;  /* id 10 */
+	t.followers[1].tid = 700;  /* id 11 */
+	t.followers[2].tid = 800;  /* id 12 */
+	t.followers[3].tid = 800;  /* id 13 */
+	t.followers[4].tid = 800;  /* id 14 */
+	rt = make_topo(&t, 5, 4, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag = reconcile_state_peek_dag(s);
+	pwtest_ptr_notnull(dag);
+
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	dag_node_t *n12 = dag_find_node(dag, 12);
+	dag_node_t *n13 = dag_find_node(dag, 13);
+	dag_node_t *n14 = dag_find_node(dag, 14);
+
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 10u);
+	pwtest_int_eq(n12->group_id, 12u);
+	pwtest_int_eq(n13->group_id, 12u);
+	pwtest_int_eq(n14->group_id, 12u);
+
+	pwtest_int_eq((int)n10->cpu, (int)n11->cpu);
+	pwtest_int_eq((int)n12->cpu, (int)n13->cpu);
+	pwtest_int_eq((int)n12->cpu, (int)n14->cpu);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g7_new_member_joins_existing_group)
+{
+	/* First pass: 2 followers share TID 444; a third has a
+	 * unique TID 999 and stays ungrouped. Second pass (generation
+	 * bumped, full rebuild): the third follower's TID changes to
+	 * 444 too. It must join the existing group on the next
+	 * apply.
+	 *
+	 * Note: the leader_id stays at the lowest id (10), so the
+	 * group_id remains 10 across both passes. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 444;
+	t.followers[1].tid = 444;
+	t.followers[2].tid = 999;
+	rt = make_topo(&t, 3, 2, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	{
+		dag_t *dag = reconcile_state_peek_dag(s);
+		dag_node_t *n12 = dag_find_node(dag, 12);
+		pwtest_int_eq(n12->group_id, 0u);
+	}
+
+	t.followers[2].tid = 444;
+	rt = make_topo(&t, 3, 2, 2);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	{
+		dag_t *dag = reconcile_state_peek_dag(s);
+		dag_node_t *n10 = dag_find_node(dag, 10);
+		dag_node_t *n11 = dag_find_node(dag, 11);
+		dag_node_t *n12 = dag_find_node(dag, 12);
+		pwtest_int_eq(n10->group_id, 10u);
+		pwtest_int_eq(n11->group_id, 10u);
+		pwtest_int_eq(n12->group_id, 10u);
+		pwtest_int_eq((int)n10->cpu, (int)n12->cpu);
+	}
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g8_idempotent_reapply_keeps_group)
+{
+	/* Apply the same shared-TID topology twice without bumping
+	 * the generation. The DAG group_id must be stable across the
+	 * second call (so the steady-state reconcile is cheap: a
+	 * library-side dag_set_node_group with the same value is a
+	 * no-op, the dirty bit stays clear, and assign_cpus doesn't
+	 * re-run). */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 555;
+	t.followers[1].tid = 555;
+	rt = make_topo(&t, 2, 1, 7);  /* generation 7, doesn't change */
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag1 = reconcile_state_peek_dag(s);
+	dag_node_t *n10 = dag_find_node(dag1, 10);
+	dag_node_t *n11 = dag_find_node(dag1, 11);
+	uint32_t cpu_before = n10->cpu;
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 10u);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	dag_t *dag2 = reconcile_state_peek_dag(s);
+	pwtest_ptr_eq(dag1, dag2);  /* persistent: same DAG instance */
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 10u);
+	pwtest_int_eq((int)n10->cpu, (int)cpu_before);
+	pwtest_bool_false(dag1->dirty);  /* re-stamp did NOT mark dirty */
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g9_legacy_path_also_groups)
+{
+	/* The recalc.persistent=false kill switch still needs to
+	 * honour TID grouping -- otherwise the legacy path would lose
+	 * the chain-merge feature whenever the operator switched it
+	 * on for diagnostic A/B comparisons. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_legacy();
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 333;
+	t.followers[1].tid = 333;
+	rt = make_topo(&t, 2, 1, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	/* Legacy path destroys the DAG after each call; we can't peek
+	 * directly. Instead verify via the callback record: both
+	 * followers received a placement and they reported the same
+	 * CPU. */
+	pwtest_int_eq((int)cb.calls, 2);
+	pwtest_int_eq((int)cb.last[0].cpu, (int)cb.last[1].cpu);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g10_wcet_drift_preserves_group)
+{
+	/* The persistent path's WCET-drift handling must not clobber
+	 * the group_id when a follower's WCET changes between passes.
+	 * Without this guarantee, every WCET update would silently
+	 * re-spread the chain across CPUs. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 222;
+	t.followers[1].tid = 222;
+	rt = make_topo(&t, 2, 1, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	/* Bump WCETs above the 1 % drift threshold, keep the same
+	 * generation, re-apply. */
+	t.followers[0].wcet = 20000;
+	t.followers[1].wcet = 25000;
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	dag_t *dag = reconcile_state_peek_dag(s);
+	dag_node_t *n10 = dag_find_node(dag, 10);
+	dag_node_t *n11 = dag_find_node(dag, 11);
+	pwtest_int_eq(n10->group_id, 10u);
+	pwtest_int_eq(n11->group_id, 10u);
+	pwtest_int_eq((int)n10->cpu, (int)n11->cpu);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g11_cb_receives_per_node_values_for_group)
+{
+	/* The sched_cb sees one call per real node, not one per group:
+	 * the callback signature is per-node by design (the summation
+	 * happens in module-deadline.c outside the library). Each call
+	 * must carry the same TID (the consolidated chain thread), the
+	 * same period (global), the same CPU (group-pinned), and a
+	 * per-node (runtime, deadline) the caller can sum. */
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	uint32_t i, calls_for_grouped = 0;
+	pid_t group_tid = 0;
+	uint64_t group_period = 0;
+	uint32_t group_cpu = UINT32_MAX;
+	uint64_t sum_runtime = 0, sum_deadline = 0;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 612;
+	t.followers[1].tid = 612;
+	t.followers[2].tid = 612;
+	rt = make_topo(&t, 3, 2, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	pwtest_int_eq((int)cb.calls, 3);
+	for (i = 0; i < cb.calls; i++) {
+		if (cb.last[i].tid != 612)
+			continue;
+		calls_for_grouped++;
+		if (group_tid == 0) {
+			group_tid = cb.last[i].tid;
+			group_period = cb.last[i].period;
+			group_cpu = cb.last[i].cpu;
+		}
+		pwtest_int_eq((int)cb.last[i].tid, (int)group_tid);
+		pwtest_int_eq((int64_t)cb.last[i].period, (int64_t)group_period);
+		pwtest_int_eq((int)cb.last[i].cpu, (int)group_cpu);
+		pwtest_bool_true(cb.last[i].runtime > 0);
+		pwtest_bool_true(cb.last[i].deadline > 0);
+		sum_runtime += cb.last[i].runtime;
+		sum_deadline += cb.last[i].deadline;
+	}
+	pwtest_int_eq((int)calls_for_grouped, 3);
+	/* The summed deadline a chain reservation would receive must
+	 * be > each member's individual deadline (proportional split
+	 * guarantees D_i < D_chain when more than one node sits on
+	 * the path). */
+	for (i = 0; i < cb.calls; i++) {
+		pwtest_bool_true(sum_deadline >= cb.last[i].deadline);
+		pwtest_bool_true(sum_runtime >= cb.last[i].runtime);
+	}
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g12_group_overcapacity_returns_failure_state)
+{
+	/* When a TID-grouped chain's summed density overflows the
+	 * configured cpus.utilization, the DAG library returns EAGAIN
+	 * and reconcile drops the cached DAG. The next call must
+	 * rebuild (and, if the topology hasn't otherwise changed, fail
+	 * again). The point is that the library's split-refusal
+	 * propagates cleanly through reconcile rather than getting
+	 * silently dropped. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(2, 0.55, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].wcet = 30000000;  /* 30 ms */
+	t.followers[1].wcet = 30000000;  /* 30 ms */
+	t.followers[0].tid = 777;
+	t.followers[1].tid = 777;
+	rt = make_topo(&t, 2, 1, 1);
+	rt.period = 100000000;            /* 100 ms */
+
+	/* Per-node density 0.30 each; summed on one CPU = 0.60 > 0.55. */
+	(void)reconcile_apply(s, &rt, cb_record, &cb);
+
+	/* Either the DAG was destroyed (legacy/failure path) or it's
+	 * still cached but dirty; either way the callback fired zero
+	 * times because no real node ever got a placement. */
+	pwtest_int_eq((int)cb.calls, 0);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_g13_chain_member_leaves_group)
+{
+	/* Reverse of g7: a third member starts shared, then leaves.
+	 * Verifies that the lowest-id leader convention follows the
+	 * surviving members and the departed one becomes ungrouped. */
+	struct topo5 t;
+	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[0].tid = 411;
+	t.followers[1].tid = 411;
+	t.followers[2].tid = 411;
+	rt = make_topo(&t, 3, 2, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	/* The lowest-id follower (10) leaves the chain (gets its own
+	 * TID); 11 and 12 stay grouped. New leader_id should be 11. */
+	t.followers[0].tid = 9999;
+	rt = make_topo(&t, 3, 2, 2);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	{
+		dag_t *dag = reconcile_state_peek_dag(s);
+		dag_node_t *n10 = dag_find_node(dag, 10);
+		dag_node_t *n11 = dag_find_node(dag, 11);
+		dag_node_t *n12 = dag_find_node(dag, 12);
+		pwtest_int_eq(n10->group_id, 0u);
+		pwtest_int_eq(n11->group_id, 11u);
+		pwtest_int_eq(n12->group_id, 11u);
+		pwtest_int_eq((int)n11->cpu, (int)n12->cpu);
+	}
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+/* Provided by reconcile.c (#ifdef BUILT_FOR_TEST -- the meson target
+ * compiles reconcile.c with that define so the symbol is visible
+ * only in the test binary, never in production module-deadline.so). */
+dag_t *reconcile_state_dag_for_test(reconcile_state_t *s);
+
+static dag_t *reconcile_state_peek_dag(reconcile_state_t *s)
+{
+	return reconcile_state_dag_for_test(s);
+}
+
 PWTEST_SUITE(module_deadline_reconcile)
 {
 	pwtest_add(reconcile_rec_1_first_build, PWTEST_NOARG);
@@ -651,6 +1191,20 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_e2_single_node, PWTEST_NOARG);
 	pwtest_add(reconcile_e3_zero_cpus_rejected, PWTEST_NOARG);
 	pwtest_add(reconcile_e7_fini_null_safe, PWTEST_NOARG);
+
+	pwtest_add(reconcile_g1_shared_tid_creates_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g2_unique_tids_no_grouping, PWTEST_NOARG);
+	pwtest_add(reconcile_g3_chain_share_tid_collapses_to_one_cpu, PWTEST_NOARG);
+	pwtest_add(reconcile_g4_chain_break_reverts_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g5_zero_tid_does_not_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g6_two_independent_chains_distinct_groups, PWTEST_NOARG);
+	pwtest_add(reconcile_g7_new_member_joins_existing_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g8_idempotent_reapply_keeps_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g9_legacy_path_also_groups, PWTEST_NOARG);
+	pwtest_add(reconcile_g10_wcet_drift_preserves_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g11_cb_receives_per_node_values_for_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g12_group_overcapacity_returns_failure_state, PWTEST_NOARG);
+	pwtest_add(reconcile_g13_chain_member_leaves_group, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

@@ -95,6 +95,15 @@ test('test-module-deadline-reconcile',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-sched-groups',
+    executable('test-module-deadline-sched-groups',
+               'test-module-deadline-sched-groups.c',
+               '../src/modules/module-deadline/sched_groups.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-client',
     executable('test-client',
                'test-client.c',
