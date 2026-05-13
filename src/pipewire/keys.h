@@ -210,6 +210,14 @@ extern "C" {
 #define PW_KEY_NODE_LOOP_CLASS		"node.loop.class"	/**< the loop class fnmatch pattern to run in */
 #define PW_KEY_NODE_LOOP_TID		"node.loop.tid"		/**< the tid of the loop it's running in */
 #define PW_KEY_NODE_LOOP_DYNAMIC	"node.loop.dynamic"	/**< "true" if the node has a dynamic data loop */
+#define PW_KEY_NODE_LOOP_GROUP		"node.loop.group"	/**< co-location group name. Nodes sharing this
+									  *  string within the same context share a dynamic
+									  *  data loop (and therefore a thread). Set explicitly
+									  *  by a node creator that knows it is building a chain,
+									  *  or set automatically by the context.merge-adjacent-chains
+									  *  feature when it relocates a 1-in-1-out chain onto
+									  *  a single loop. Only honoured when the context has
+									  *  context.dynamic-data-loops enabled. */
 #define PW_KEY_NODE_STREAM		"node.stream"		/**< node is a stream, the server side should
 								  *  add a converter */
 #define PW_KEY_NODE_VIRTUAL		"node.virtual"		/**< the node is some sort of virtual

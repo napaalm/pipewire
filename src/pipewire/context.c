@@ -53,6 +53,13 @@ struct data_loop {
 	uint64_t last_used;
 	int ref;
 	struct spa_list link;
+	/* Co-location group name for dynamic data loops. When non-NULL,
+	 * acquire_dynamic_data_loop looks up an existing dynamic loop
+	 * tagged with the same group string before creating a new one,
+	 * so a set of nodes that share PW_KEY_NODE_LOOP_GROUP land on
+	 * the same thread. Always NULL on the static impl->data_loops[]
+	 * entries; owned (strdup'd) by this struct on dynamic loops. */
+	char *group;
 };
 
 /** \cond */
@@ -70,6 +77,14 @@ struct impl {
 
 	bool dynamic_data_loops;
 	struct spa_list dynamic_data_loop_list;
+
+	/* Chain-merging knob. When true and dynamic_data_loops is also
+	 * true, the context scans its own node graph after every recalc
+	 * and consolidates 1-in-1-out chains of in-process nodes onto a
+	 * single dynamic data loop (one thread per chain). Off by default
+	 * so the existing one-node-one-thread invariant relied on by
+	 * module-deadline keeps holding until the operator opts in. */
+	bool merge_adjacent_chains;
 };
 
 
@@ -210,6 +225,12 @@ static int setup_data_loops(struct impl *impl)
 	if (pw_properties_get_bool(this->properties, "context.dynamic-data-loops", true)) {
 		spa_list_init(&impl->dynamic_data_loop_list);
 		impl->dynamic_data_loops = true;
+	}
+
+	if (impl->dynamic_data_loops &&
+	    pw_properties_get_bool(this->properties, "context.merge-adjacent-chains", false)) {
+		impl->merge_adjacent_chains = true;
+		pw_log_info("%p: context.merge-adjacent-chains enabled", this);
 	}
 
 	lib_name = pw_properties_get(this->properties, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM);
@@ -681,6 +702,7 @@ void pw_context_destroy(struct pw_context *context)
 			if (dl->impl)
 				pw_data_loop_destroy(dl->impl);
 			spa_list_remove(&dl->link);
+			free(dl->group);
 			free(dl);
 		}
 	}
@@ -810,11 +832,43 @@ static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *nam
 	return best_loop->impl;
 }
 
-static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const char *name, const char *klass)
+/* Look up an existing dynamic data loop tagged with the given group
+ * name. Returns NULL if no loop with this group is currently allocated
+ * (the caller will then create a new one). Linear scan, but the
+ * dynamic_data_loop_list is short in every realistic deployment
+ * (bounded by the number of distinct groups + ungrouped nodes), so
+ * not worth an index. */
+static struct data_loop *find_dynamic_loop_by_group(struct impl *impl, const char *group)
+{
+	struct data_loop *dl;
+	if (group == NULL)
+		return NULL;
+	spa_list_for_each(dl, &impl->dynamic_data_loop_list, link) {
+		if (dl->group && spa_streq(dl->group, group))
+			return dl;
+	}
+	return NULL;
+}
+
+static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const char *name,
+		const char *klass, const char *group)
 {
 	struct pw_properties *pr;
 	struct data_loop *dl = NULL;
 	int res;
+
+	/* Co-location: if this group already has a loop, reuse it.
+	 * Bumps the ref count so the loop survives until every member
+	 * has been released via pw_context_release_node_loop. */
+	if (group != NULL) {
+		dl = find_dynamic_loop_by_group(impl, group);
+		if (dl != NULL) {
+			dl->ref++;
+			pw_log_info("%p: joining dynamic group:'%s' loop:'%s' ref:%d",
+					impl, group, dl->impl->loop->name, dl->ref);
+			return dl->impl;
+		}
+	}
 
 	pr = pw_properties_copy(impl->this.properties);
 
@@ -835,8 +889,12 @@ static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const c
 
 	pw_data_loop_set_thread_utils(dl->impl, impl->this.thread_utils);
 
+	if (group != NULL)
+		dl->group = strdup(group);
+
 	spa_list_append(&impl->dynamic_data_loop_list, &dl->link);
-	pw_log_info("created dynamic data loop '%s'", dl->impl->loop->name);
+	pw_log_info("created dynamic data loop '%s' group:'%s'",
+			dl->impl->loop->name, group ? group : "<none>");
 
 	dl->ref = 1;
 	if ((res = data_loop_start(impl, dl)) < 0) {
@@ -844,9 +902,9 @@ static struct pw_data_loop *acquire_dynamic_data_loop(struct impl *impl, const c
 		return NULL;
 	}
 
-	pw_log_info("%p: using name:'%s' class:'%s' ref:%d", impl,
+	pw_log_info("%p: using name:'%s' class:'%s' group:'%s' ref:%d", impl,
 			dl->impl->loop->name,
-			dl->impl->class, dl->ref);
+			dl->impl->class, group ? group : "<none>", dl->ref);
 
 	return dl->impl;
 }
@@ -885,7 +943,7 @@ SPA_EXPORT
 struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct pw_properties *props, bool remote)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
-	const char *name, *klass;
+	const char *name, *klass, *group;
 	struct pw_data_loop *loop;
 	bool request_dynamic = props ? pw_properties_get_bool(props, PW_KEY_NODE_LOOP_DYNAMIC, false) : false;
 
@@ -894,8 +952,9 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 
 	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
 	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
+	group = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_GROUP) : NULL;
 
-	loop = acquire_dynamic_data_loop(impl, name, klass);
+	loop = acquire_dynamic_data_loop(impl, name, klass, group);
 	if (loop) {
 		pw_properties_set(props, PW_KEY_NODE_LOOP_DYNAMIC, "true");
 		return loop->loop;
@@ -932,18 +991,28 @@ void pw_context_release_node_loop(struct pw_context *context, struct pw_loop *lo
 		if (dl->impl->loop == loop) {
 			dl->ref--;
 
-			pw_log_info("release dynamic name:'%s' class:'%s' ref:%d",
-					dl->impl->loop->name, dl->impl->class, dl->ref);
+			pw_log_info("release dynamic name:'%s' class:'%s' group:'%s' ref:%d",
+					dl->impl->loop->name, dl->impl->class,
+					dl->group ? dl->group : "<none>", dl->ref);
 
-			if (dl->ref != 0) {
-				pw_log_warn("dynamic data loop '%s' has still ref > 0",
-						dl->impl->loop->name);
+			/* Group members hold a ref each; ref > 0 just means
+			 * another chain member is still using the loop. The
+			 * old log line shouted "still ref > 0" as if it was a
+			 * leak, which it isn't in the group case. Drop the
+			 * warning, keep the early return. */
+			if (dl->ref > 0)
+				return;
+
+			if (dl->ref < 0) {
+				pw_log_warn("dynamic data loop '%s' ref dropped below 0 (%d)",
+						dl->impl->loop->name, dl->ref);
 				return;
 			}
 
 			pw_data_loop_stop(dl->impl);
 			pw_data_loop_destroy(dl->impl);
 			spa_list_remove(&dl->link);
+			free(dl->group);
 			free(dl);
 
 			return;
@@ -1537,6 +1606,275 @@ static uint32_t find_best_rate(const uint32_t *rates, uint32_t n_rates, uint32_t
 	return def;
 }
 
+/* ---------------------------------------------------------------------
+ * Adjacent-chain merging
+ *
+ * When context.merge-adjacent-chains is enabled, the context scans
+ * the graph after every recalc and consolidates 1-in-1-out chains of
+ * in-process nodes onto a single dynamic data loop, so each chain
+ * runs on a single OS thread. The semantics from the user's spec
+ * (todo.md, "Unire catene di nodi adiacenti nello stesso thread"):
+ *
+ *   - Eligible link: not feedback, not async (matches the filter
+ *     module-deadline uses to build its scheduling DAG).
+ *   - Eligible node: not remote, not exported, not a driver, has a
+ *     dynamic data loop (i.e. not on the main loop or a static loop).
+ *   - Chain edge: a directed edge A -> B is "chainable" when A has
+ *     exactly one outbound eligible neighbor (B) and B has exactly
+ *     one inbound eligible neighbor (A). Both endpoints must be
+ *     eligible nodes.
+ *   - Chain head: a node whose inbound side has no chainable
+ *     predecessor.
+ *   - Chain group name: "chain.<head_id>", unique per chain.
+ *
+ * Each node's "desired" loop group is computed bottom-up: walk
+ * upstream while edges stay chainable, capped at MAX_HOPS so a
+ * pathological cycle never spins. If a node's current loop group
+ * doesn't match its desired one, we re-acquire (which either creates
+ * the group loop or joins an existing one with the same name) and
+ * relocate the node via pw_impl_node_set_data_loop.
+ *
+ * The detection is intentionally idempotent: running it twice in a
+ * row on a stable graph performs zero relocations on the second pass.
+ * Singletons (heads with no chainable follower) get no group, so a
+ * graph with no chains pays nothing beyond the scan.
+ *
+ * Lives in this file because it has to call back into the
+ * acquire/release-node-loop helpers (which see the dynamic_data_loop
+ * list directly, kept private to impl) and consume the same
+ * dynamic_data_loops + merge_adjacent_chains gates. The relocation
+ * itself is in impl-node.c (pw_impl_node_set_data_loop) so the I/O
+ * plumbing stays adjacent to do_node_prepare / do_node_unprepare.
+ * --------------------------------------------------------------------- */
+
+/* True when the link is eligible for chain analysis: same filter
+ * module-deadline uses, so chains the module sees as scheduling
+ * dependencies are the same ones we co-locate on threads. */
+static inline bool chain_link_eligible(struct pw_impl_link *l)
+{
+	if (l == NULL || !l->prepared || l->feedback)
+		return false;
+	if (l->output == NULL || l->input == NULL ||
+	    l->output->node == NULL || l->input->node == NULL)
+		return false;
+	if (l->output->node->async || l->input->node->async)
+		return false;
+	return true;
+}
+
+/* True when the node is a candidate for chain co-location. Drivers
+ * own a position/IO area separate from the chain runtime, and we
+ * leave them on their original loop so the existing
+ * one-driver-one-thread invariant the rest of pw_context_recalc_graph
+ * relies on stays intact. Exported and remote nodes belong to other
+ * processes; merging across process boundaries is out of scope here.
+ * The main-loop case happens when dynamic-data-loops is off or the
+ * node opted out, and there is no thread to migrate. */
+static inline bool chain_node_eligible(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	if (node == NULL)
+		return false;
+	if (node->remote || node->exported || node->driver)
+		return false;
+	if (node->data_loop == NULL || node->data_loop == context->main_loop)
+		return false;
+	return true;
+}
+
+/* Return the unique chainable upstream neighbor of `node` over
+ * eligible links, or NULL if there is zero or more than one distinct
+ * upstream node. Multi-link edges between the same pair (e.g. stereo
+ * left+right between the same two nodes) collapse to a single
+ * neighbor. */
+static struct pw_impl_node *chain_unique_in(struct pw_impl_node *node)
+{
+	struct pw_impl_port *port;
+	struct pw_impl_link *l;
+	struct pw_impl_node *only = NULL;
+
+	spa_list_for_each(port, &node->input_ports, link) {
+		spa_list_for_each(l, &port->links, input_link) {
+			if (!chain_link_eligible(l))
+				continue;
+			struct pw_impl_node *up = l->output->node;
+			if (only == NULL) {
+				only = up;
+			} else if (only != up) {
+				return NULL;
+			}
+		}
+	}
+	return only;
+}
+
+/* Mirror of chain_unique_in for the outbound side. */
+static struct pw_impl_node *chain_unique_out(struct pw_impl_node *node)
+{
+	struct pw_impl_port *port;
+	struct pw_impl_link *l;
+	struct pw_impl_node *only = NULL;
+
+	spa_list_for_each(port, &node->output_ports, link) {
+		spa_list_for_each(l, &port->links, output_link) {
+			if (!chain_link_eligible(l))
+				continue;
+			struct pw_impl_node *dn = l->input->node;
+			if (only == NULL) {
+				only = dn;
+			} else if (only != dn) {
+				return NULL;
+			}
+		}
+	}
+	return only;
+}
+
+/* Walk upstream while each edge stays chainable. Returns the chain's
+ * head (the topmost node), bounded by MAX_HOPS so a malformed graph
+ * with a cycle short-circuits cleanly. */
+static struct pw_impl_node *chain_head(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	int hops = 0;
+	while (hops++ < MAX_HOPS) {
+		struct pw_impl_node *up = chain_unique_in(node);
+		if (up == NULL || !chain_node_eligible(context, up))
+			break;
+		/* The upstream node must also see us as its unique
+		 * outbound for the edge up->node to be chainable. */
+		if (chain_unique_out(up) != node)
+			break;
+		node = up;
+	}
+	return node;
+}
+
+/* Returns true if `head` has at least one chainable follower (i.e.
+ * the chain it heads has length >= 2 and is therefore worth merging).
+ * We only assign a group when there is something to merge with;
+ * isolated singletons keep their own loop. */
+static bool chain_has_follower(struct pw_context *context,
+		struct pw_impl_node *head)
+{
+	struct pw_impl_node *down = chain_unique_out(head);
+	if (down == NULL || !chain_node_eligible(context, down))
+		return false;
+	return chain_unique_in(down) == head;
+}
+
+/* Compute the loop group name a node *should* be on. Returns NULL
+ * for singletons (no merging required). The caller frees the returned
+ * string. */
+static char *chain_desired_group(struct pw_context *context,
+		struct pw_impl_node *node)
+{
+	struct pw_impl_node *head = chain_head(context, node);
+	if (head == node) {
+		if (!chain_has_follower(context, head))
+			return NULL;
+	}
+	char buf[64];
+	snprintf(buf, sizeof(buf), "chain.%u", head->info.id);
+	return strdup(buf);
+}
+
+/* Pull the dl->group string for a given pw_loop, or NULL if the loop
+ * isn't in the dynamic-loop list (static loop, main loop, or freed).
+ * Read-only; safe to call from the main loop without locking. */
+static const char *chain_loop_group(struct impl *impl, struct pw_loop *loop)
+{
+	struct data_loop *dl;
+	if (loop == NULL)
+		return NULL;
+	spa_list_for_each(dl, &impl->dynamic_data_loop_list, link) {
+		if (dl->impl->loop == loop)
+			return dl->group;
+	}
+	return NULL;
+}
+
+static void detect_and_merge_chains(struct pw_context *context)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	struct pw_impl_node *node, *tmp;
+
+	if (!impl->merge_adjacent_chains || !impl->dynamic_data_loops)
+		return;
+
+	pw_log_debug("%p: chain-merge scan start", context);
+
+	/* The node_list iteration is safe across relocations: we never
+	 * add/remove nodes here, only swap their data_loop pointer. The
+	 * _safe variant guards against the (defensive) possibility of a
+	 * destroy callback firing during pw_loop_invoke from inside
+	 * set_data_loop. */
+	spa_list_for_each_safe(node, tmp, &context->node_list, link) {
+		if (!chain_node_eligible(context, node)) {
+			pw_log_debug("%p: chain-merge skip node %u (%s): ineligible (remote:%d exported:%d driver:%d loop:%p main:%p)",
+					context, node->info.id, node->name ? node->name : "?",
+					node->remote, node->exported, node->driver,
+					node->data_loop, context->main_loop);
+			continue;
+		}
+
+		char *desired = chain_desired_group(context, node);
+		const char *current = chain_loop_group(impl, node->data_loop);
+
+		pw_log_debug("%p: chain-merge node %u (%s) current_group:'%s' desired_group:'%s'",
+				context, node->info.id, node->name ? node->name : "?",
+				current ? current : "<none>",
+				desired ? desired : "<none>");
+
+		bool same = (desired == NULL && current == NULL) ||
+			    (desired != NULL && current != NULL &&
+			     spa_streq(desired, current));
+		if (same) {
+			free(desired);
+			continue;
+		}
+
+		/* Need to relocate. Update the node's properties so
+		 * acquire_node_loop honours the new (or absent) group,
+		 * then ask the context for the resolved loop. */
+		pw_properties_set(node->properties, PW_KEY_NODE_LOOP_GROUP, desired);
+
+		struct pw_loop *new_loop = pw_context_acquire_node_loop(context,
+				node->properties, node->remote);
+		if (new_loop == NULL) {
+			pw_log_warn("%p: chain-merge acquire_node_loop failed for node %u",
+					context, node->info.id);
+			free(desired);
+			continue;
+		}
+
+		if (new_loop == node->data_loop) {
+			/* The reacquire returned the same loop -- this
+			 * happens when we ask for a group that already
+			 * lives on our loop, but we still bumped the
+			 * ref. Drop the extra ref and move on. */
+			pw_context_release_node_loop(context, new_loop);
+			free(desired);
+			continue;
+		}
+
+		struct pw_loop *old_loop = node->data_loop;
+		int res = pw_impl_node_set_data_loop(node, new_loop);
+		if (res < 0) {
+			pw_log_warn("%p: chain-merge relocate failed for node %u: %s",
+					context, node->info.id, spa_strerror(res));
+			/* Roll back the ref we acquired. */
+			pw_context_release_node_loop(context, new_loop);
+		} else {
+			pw_log_info("%p: node %u moved to loop:'%s' group:'%s'",
+					context, node->info.id, new_loop->name,
+					desired ? desired : "<none>");
+			pw_context_release_node_loop(context, old_loop);
+		}
+		free(desired);
+	}
+}
+
 /* here we evaluate the complete state of the graph.
  *
  * It roughly operates in 3 stages:
@@ -1960,6 +2298,13 @@ again:
 		impl->recalc_pending = false;
 		goto again;
 	}
+
+	/* After every recalc, consolidate any newly-formed (or newly-
+	 * broken) 1-in-1-out chains onto a single dynamic data loop.
+	 * Gated on context.merge-adjacent-chains, off by default; on a
+	 * graph with no chains or a steady-state graph the pass is
+	 * effectively a no-op (one linear scan, no syscalls). */
+	detect_and_merge_chains(context);
 
 	return 0;
 }

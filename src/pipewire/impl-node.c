@@ -1799,6 +1799,180 @@ error_exit:
 	return NULL;
 }
 
+/* ---------------------------------------------------------------------
+ * Runtime relocation of a node onto a different data loop. See
+ * pw_impl_node_set_data_loop() below for the API contract and the
+ * sequencing reasoning. The helpers here are private to this file
+ * because they are tightly coupled to do_node_prepare /
+ * do_node_unprepare and to the layout of struct pw_node_peer.
+ * ---------------------------------------------------------------------
+ *
+ * Brief sequencing argument:
+ *
+ *   1. allocate new_fd on new_loop->system
+ *   2. unprepare on old_loop (synchronous via pw_loop_invoke)
+ *        -> after this, no more dispatches on old_loop for this node
+ *   3. for each peer P that has cached our old (system, fd),
+ *      pw_loop_invoke on P's owning loop to update P->target to the
+ *      new (system, fd) -- runs on P's loop so no trigger is in flight
+ *   4. update node->source.fd / node->rt.target.{system,fd} /
+ *      node->data_loop atomically from the main loop
+ *   5. close old_fd on old_loop->system
+ *   6. prepare on new_loop (synchronous)
+ *        -> drains any peer writes that landed on new_fd between
+ *           step 3 and step 6 (those triggers are LOST -- the affected
+ *           cycles are late but the graph recovers on the next driver
+ *           wake)
+ *   7. refresh PW_KEY_NODE_LOOP_TID by running do_gettid on new_loop
+ *
+ * Lost-triggers detail: PipeWire's trigger_target_v1 writes to a
+ * shared eventfd; the consumer is expected to be in spa_loop. During
+ * the migration window the consumer is absent. eventfd counters
+ * accumulate; do_node_prepare reads the eventfd once at re-arm time,
+ * draining the counter. The driver's next cycle re-triggers everyone
+ * cleanly, so steady-state continues. The user should expect at most
+ * a few late cycles per relocated node, never a stuck graph.
+ */
+
+/* Payload of the peer fd-update invoke. Lives on the caller's stack;
+ * pw_loop_invoke with block=true copies it into the invoke ringbuffer
+ * before returning, so a stack lifetime is safe. */
+struct peer_target_update {
+	struct spa_system *system;
+	int fd;
+};
+
+static int do_update_peer_target(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+	struct pw_node_peer *peer = user_data;
+	const struct peer_target_update *u = data;
+
+	pw_log_debug("peer %p: target.fd %d -> %d, system %p -> %p",
+			peer, peer->target.fd, u->fd, peer->target.system, u->system);
+
+	peer->target.system = u->system;
+	peer->target.fd = u->fd;
+	return 0;
+}
+
+/* Walk every node in the context. For each candidate node X, scan
+ * X->peer_list and, when a peer's target points at our `node`, push
+ * the update through X's data loop. This covers:
+ *
+ *   - peers created by regular links from X to node
+ *     (X = link->output->node)
+ *   - peers created by the driver-follower glue
+ *     (from_driver_peer / to_driver_peer, which sit on the driver
+ *     even when there is no explicit link)
+ *
+ * We deliberately scan all nodes rather than walking input_ports,
+ * because in PipeWire a peer can exist without an in-port link (the
+ * driver case above) and we want a single code path that catches
+ * every cached fd.
+ */
+static int update_inbound_peers(struct pw_impl_node *node,
+		struct spa_system *new_system, int new_fd)
+{
+	struct pw_context *context = node->context;
+	struct pw_impl_node *other;
+	struct peer_target_update upd = {
+		.system = new_system,
+		.fd = new_fd,
+	};
+
+	spa_list_for_each(other, &context->node_list, link) {
+		struct pw_node_peer *peer;
+		spa_list_for_each(peer, &other->peer_list, link) {
+			if (peer->target.id != node->info.id)
+				continue;
+			pw_loop_invoke(other->data_loop, do_update_peer_target,
+					SPA_ID_INVALID, &upd, sizeof(upd),
+					true, peer);
+		}
+	}
+	return 0;
+}
+
+SPA_EXPORT
+int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_loop)
+{
+	struct pw_loop *old_loop;
+	struct spa_system *old_system, *new_system;
+	int old_fd, new_fd;
+	int res;
+
+	if (node == NULL || new_loop == NULL)
+		return -EINVAL;
+
+	/* Relocating a remote stand-in is meaningless: the real
+	 * data-loop thread is in another process. The caller should
+	 * route the request to that process via the existing protocol
+	 * if it ever needs to. */
+	if (node->remote)
+		return -EINVAL;
+
+	old_loop = node->data_loop;
+	if (old_loop == new_loop)
+		return 0;
+
+	/* Refusing to move a node attached to the main loop keeps the
+	 * relocation surface limited to the dynamic-data-loop case.
+	 * Main-loop-bound nodes have no separate data-loop thread to
+	 * receive sched parameters anyway. */
+	if (old_loop == node->context->main_loop ||
+	    new_loop == node->context->main_loop)
+		return -EINVAL;
+
+	old_system = node->rt.target.system;
+	old_fd = node->source.fd;
+	new_system = new_loop->system;
+
+	new_fd = spa_system_eventfd_create(new_system,
+			SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if (new_fd < 0) {
+		res = -errno;
+		pw_log_warn("%p: eventfd_create failed on new loop: %m", node);
+		return res;
+	}
+
+	pw_log_info("%p: relocating from loop:'%s' to loop:'%s' (fd %d -> %d)",
+			node, old_loop->name, new_loop->name, old_fd, new_fd);
+
+	/* 2. quiesce the source on the old loop */
+	pw_loop_invoke(old_loop, do_node_unprepare, 1, NULL, 0, true, node);
+
+	/* 3. point every inbound peer at the new fd before we
+	 *    invalidate the old fd. */
+	update_inbound_peers(node, new_system, new_fd);
+
+	/* 4. flip the node's own bookkeeping */
+	node->source.fd = new_fd;
+	node->rt.target.system = new_system;
+	node->rt.target.fd = new_fd;
+	node->data_loop = new_loop;
+
+	/* 5. close the now-orphaned old fd */
+	spa_system_close(old_system, old_fd);
+
+	/* 6. re-arm the source on the new loop. Note: do_node_prepare
+	 *    only adds the source when !rt.prepared, but we just
+	 *    cleared rt.prepared via do_node_unprepare in step 2, so
+	 *    this always re-adds. */
+	pw_loop_invoke(new_loop, do_node_prepare, 1, NULL, 0, true, node);
+
+	/* 7. refresh the published TID. */
+	pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
+			node->properties);
+	pw_impl_node_emit_info_changed(node, &node->info);
+
+	pw_log_info("%p: relocation complete, new loop:'%s' new tid:%s",
+			node, new_loop->name,
+			pw_properties_get(node->properties, PW_KEY_NODE_LOOP_TID));
+
+	return 0;
+}
+
 SPA_EXPORT
 const struct pw_node_info *pw_impl_node_get_info(struct pw_impl_node *node)
 {
