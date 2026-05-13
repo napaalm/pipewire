@@ -716,6 +716,33 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet)
 	return 0;
 }
 
+int dag_set_node_group(dag_t *g, uint32_t id, uint32_t group_id)
+{
+	if (!g) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	dag_node_t *n = find_node(g, id);
+	if (!n) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (n->group_id == group_id)
+		return 0;
+
+	n->group_id = group_id;
+	/* Group changes only affect CPU placement, not deadlines or
+	 * topology -- but the existing dirty bit is the simplest way
+	 * to force the next dag_foreach_node to re-run assign_cpus.
+	 * The cost of redoing the deadline split is negligible relative
+	 * to a fresh recomputation; the alternative (a finer-grained
+	 * "cpu-dirty" flag) would not pay back the bookkeeping. */
+	dag_mark_dirty(g);
+	return 0;
+}
+
 /***********************************************************************
  * Scheduling Parameter Computation
  ***********************************************************************/
@@ -1812,15 +1839,53 @@ static int assign_cpus(dag_t *g)
 		return -1;
 	}
 
+	/* Co-location bookkeeping: group_cpu[group_id] holds the CPU
+	 * picked by the first (highest-utilisation) member of the
+	 * group, or -1 while the group is still unplaced. Group id 0
+	 * means "ungrouped" and never participates; we waste slot 0
+	 * for an unbranched index. The array is sized to the max
+	 * group id observed in this DAG, which is small in any
+	 * realistic workload (one group per merged chain). */
+	uint32_t max_group_id = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		if (info[i].node->fictitious)
+			continue;
+		if (info[i].node->group_id > max_group_id)
+			max_group_id = info[i].node->group_id;
+	}
+
+	int *group_cpu = NULL;
+	if (max_group_id > 0) {
+		group_cpu = malloc((size_t)(max_group_id + 1) * sizeof(int));
+		if (!group_cpu) {
+			free(cpu_set_util);
+			free(cpu_peak);
+			free(info);
+			return -1;
+		}
+		for (uint32_t i = 0; i <= max_group_id; i++)
+			group_cpu[i] = -1;
+	}
+
 	for (uint32_t i = 0; i < count; i++) {
 		if (info[i].node->fictitious)
 			continue;
 
 		double u = info[i].util;
+		uint32_t gid = info[i].node->group_id;
+		int forced_cpu = (gid != 0 && group_cpu != NULL) ? group_cpu[gid] : -1;
 		int chosen = -1;
 		double chosen_projected = DBL_MAX;
 
-		for (uint32_t c = 0; c < num_cpus; c++) {
+		if (forced_cpu >= 0) {
+			/* A previously placed group member already picked
+			 * a CPU; we must use it. Check admission on that
+			 * single CPU only; if it doesn't fit, the group's
+			 * placement is infeasible and the whole DAG fails
+			 * EAGAIN -- splitting a group across CPUs is not
+			 * allowed because it would invalidate the
+			 * thread-merge done by libpipewire. */
+			uint32_t c = (uint32_t)forced_cpu;
 			double projected = cpu_peak[c] > u ? cpu_peak[c] : u;
 
 			for (uint32_t s = 0; s < unrelated_size; s++) {
@@ -1832,15 +1897,34 @@ static int assign_cpus(dag_t *g)
 					projected = candidate;
 			}
 
-			if (projected <= g->utilization + DAG_LOAD_EPSILON &&
-					prefer_cpu_choice(projected, c,
-						chosen_projected, chosen)) {
-				chosen_projected = projected;
+			if (projected <= g->utilization + DAG_LOAD_EPSILON) {
 				chosen = (int)c;
+				chosen_projected = projected;
+			}
+		} else {
+			for (uint32_t c = 0; c < num_cpus; c++) {
+				double projected = cpu_peak[c] > u ? cpu_peak[c] : u;
+
+				for (uint32_t s = 0; s < unrelated_size; s++) {
+					if (!bitset_test(g->unrelated[s], info[i].node->index))
+						continue;
+
+					double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u;
+					if (candidate > projected)
+						projected = candidate;
+				}
+
+				if (projected <= g->utilization + DAG_LOAD_EPSILON &&
+						prefer_cpu_choice(projected, c,
+							chosen_projected, chosen)) {
+					chosen_projected = projected;
+					chosen = (int)c;
+				}
 			}
 		}
 
 		if (chosen < 0) {
+			free(group_cpu);
 			free(cpu_set_util);
 			free(cpu_peak);
 			free(info);
@@ -1849,6 +1933,8 @@ static int assign_cpus(dag_t *g)
 		}
 
 		info[i].node->cpu = (uint32_t)chosen;
+		if (gid != 0 && group_cpu != NULL && group_cpu[gid] < 0)
+			group_cpu[gid] = chosen;
 		double projected = cpu_peak[chosen] > u ? cpu_peak[chosen] : u;
 
 		for (uint32_t s = 0; s < unrelated_size; s++) {
@@ -1863,6 +1949,7 @@ static int assign_cpus(dag_t *g)
 		cpu_peak[chosen] = projected;
 	}
 
+	free(group_cpu);
 	free(cpu_set_util);
 	free(cpu_peak);
 	free(info);

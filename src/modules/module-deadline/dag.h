@@ -58,6 +58,16 @@ struct dag_node {
 	uint32_t cpu;        /* assigned CPU */
 	pid_t tid;           /* associated thread id */
 
+	/* Co-location group: all nodes sharing this non-zero id must
+	 * land on the same CPU in the worst-fit pass. Zero (the
+	 * default) means "ungrouped" -- the placement is free to pick
+	 * any feasible CPU. Used by the chain-merge feature: nodes
+	 * that libpipewire has consolidated onto a single thread are
+	 * stamped with the same group_id so the scheduling DAG places
+	 * them together. Per-node deadlines, periods, and WCETs are
+	 * unaffected -- the group only constrains CPU assignment. */
+	uint32_t group_id;
+
 	bool fictitious;
 	uint64_t remaining_deadline;
 	uint64_t longest_len;
@@ -144,6 +154,18 @@ int dag_remove_edge(dag_t *g, uint32_t src_id, uint32_t dst_id);
 
 /* Update the WCET of a node */
 int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
+
+/* Stamp a node with a co-location group id. Nodes sharing a non-zero
+ * group_id are constrained to land on the same CPU during the
+ * worst-fit assignment pass: the highest-utilisation member of the
+ * group (in the existing util-descending iteration order) picks the
+ * CPU, and every subsequent member is forced onto that same CPU,
+ * with admission still checked. Passing group_id=0 clears the
+ * grouping. Returns 0 on success, -1 with errno set on ENOENT
+ * (unknown id) or EINVAL (null dag). The dirty bit is set only when
+ * the assignment actually changes, so calling this with the current
+ * value is a no-op. */
+int dag_set_node_group(dag_t *g, uint32_t id, uint32_t group_id);
 
 /* O(log N) lookup of a real or fictitious node by id. Returns
  * NULL if the id is not in the graph. The returned pointer is

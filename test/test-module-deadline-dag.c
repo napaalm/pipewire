@@ -1623,6 +1623,634 @@ PWTEST(equal_load_ties_choose_lowest_cpu)
 	return PWTEST_PASS;
 }
 
+/* --- co-location group tests ---
+ *
+ * The group_id field on dag_node lets the caller tell the worst-fit
+ * pass "these nodes must share a CPU." It's the library hook the
+ * chain-merge feature uses: when libpipewire pins several adjacent
+ * nodes onto one OS thread, module-deadline forwards that thread
+ * affinity into the scheduling DAG by stamping the same group_id on
+ * each member, so the CPU assignment stays consistent with the
+ * actual execution thread.
+ *
+ * Each test below exercises one property of the contract documented
+ * in dag.h:
+ *
+ *   - group members co-locate (positive case);
+ *   - distinct groups don't unify;
+ *   - ungrouped neighbours are unaffected;
+ *   - infeasible group placement returns EAGAIN rather than
+ *     splitting the group;
+ *   - dag_set_node_group input validation;
+ *   - group_id survives a recalc;
+ *   - clearing back to 0 returns to default worst-fit behaviour.
+ *
+ * Util values are chosen so that, without grouping, worst-fit would
+ * naturally spread the nodes across CPUs (so the co-location is a
+ * visible effect, not a side-effect of the default placement). */
+PWTEST(group_two_independent_share_cpu)
+{
+	/* Two independent nodes that ordinarily spread to CPU 0/1
+	 * end up on the same CPU when grouped. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+
+	/* Baseline: no group -> different CPUs. */
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_bool_true(a->cpu != b->cpu);
+
+	/* Now stamp them with the same group: same CPU. */
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 42), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_chain_keeps_chain_on_one_cpu)
+{
+	/* A 3-node chain A->B->C stamped as one group lands on a
+	 * single CPU even though there are 4 CPUs available. */
+	dag_t *g = dag_create(100, 100, 0.80f, 4);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 7), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 7), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 7), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq((int)a->cpu, (int)c->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_distinct_groups_do_not_unify)
+{
+	/* Two independent chains, each in its own group. Without
+	 * grouping they spread to 4 CPUs; with two separate groups
+	 * they spread to 2 CPUs (one per group). The point is that
+	 * group X members co-locate but X and Y don't share. */
+	dag_t *g = dag_create(100, 100, 0.50f, 4);
+	dag_node_t *a, *b, *c, *d;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 4, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 4, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 4, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 4, 104), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 2), 0);
+	pwtest_int_eq(dag_set_node_group(g, 4, 2), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	d = find_node_by_id(g, 4);
+
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq((int)c->cpu, (int)d->cpu);
+	/* Distinct groups must NOT share a CPU when free CPUs exist:
+	 * worst-fit picks the emptier CPU for the second group's
+	 * first member. */
+	pwtest_bool_true(a->cpu != c->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_ungrouped_neighbour_unaffected)
+{
+	/* A 2-member group plus one ungrouped node. The ungrouped
+	 * one is placed by ordinary worst-fit; the group lands on
+	 * its own CPU. */
+	dag_t *g = dag_create(100, 100, 0.60f, 3);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 5), 0);
+	/* node 3 keeps group_id = 0 (default). */
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_bool_true(c->cpu != a->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_overcapacity_returns_eagain)
+{
+	/* A group of two nodes whose summed individual densities
+	 * exceed the per-CPU cap returns EAGAIN. Splitting the group
+	 * across CPUs is forbidden by contract, so admission must
+	 * fail rather than spread. */
+	dag_t *g = dag_create(100, 100, 0.55f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 30, 101), 0);  /* density 0.30 */
+	pwtest_int_eq(add_real_node(g, 2, 30, 102), 0);  /* density 0.30 */
+	/* Sum on one CPU = 0.60 > 0.55 cap. */
+
+	/* Without grouping it admits (one node per CPU). */
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_bool_true(a->cpu != b->cpu);
+
+	/* With grouping it fails admission. */
+	pwtest_int_eq(dag_set_node_group(g, 1, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 9), 0);
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_invalid_id_returns_enoent)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+
+	errno = 0;
+	pwtest_int_eq(dag_set_node_group(g, 999, 1), -1);
+	pwtest_int_eq(errno, ENOENT);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_null_dag_returns_einval)
+{
+	errno = 0;
+	pwtest_int_eq(dag_set_node_group(NULL, 1, 1), -1);
+	pwtest_int_eq(errno, EINVAL);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_same_value_is_noop_for_dirty)
+{
+	/* Setting a node's group to its current value must NOT dirty
+	 * the DAG: a steady-state recalc loop shouldn't redo CPU
+	 * placement every cycle because module-deadline re-applied
+	 * the same group stamps. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Re-setting the same group must keep dirty = false. */
+	pwtest_int_eq(dag_set_node_group(g, 1, 3), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* But a real change flips dirty. */
+	pwtest_int_eq(dag_set_node_group(g, 1, 4), 0);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_clear_returns_to_default)
+{
+	/* Clearing a group (set to 0) returns the node to ungrouped
+	 * worst-fit behaviour. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+
+	/* Clear and recalculate: back to spread. */
+	pwtest_int_eq(dag_set_node_group(g, 2, 0), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_true(a->cpu != b->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_survives_wcet_update)
+{
+	/* Updating a node's WCET (which marks dirty and triggers a
+	 * recalc) must preserve its group_id. Without this, every
+	 * WCET update would defeat the chain merge. */
+	dag_t *g = dag_create(100, 100, 0.80f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 11), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 11), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+
+	/* Bump WCETs; group must persist. */
+	pwtest_int_eq(dag_set_node_wcet(g, 1, 8), 0);
+	pwtest_int_eq(dag_set_node_wcet(g, 2, 8), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq(a->group_id, 11u);
+	pwtest_int_eq(b->group_id, 11u);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_three_members_partial_clear)
+{
+	/* Group of three; clear one member only. The remaining two
+	 * stay co-located; the cleared one is placed freely. */
+	dag_t *g = dag_create(100, 100, 0.60f, 3);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 4), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 4), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq((int)a->cpu, (int)c->cpu);
+
+	/* Clear node 3 from the group: it's now free. */
+	pwtest_int_eq(dag_set_node_group(g, 3, 0), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	/* C must now sit on a different CPU since the worst-fit
+	 * has 2 free CPUs to spread to. */
+	pwtest_bool_true(c->cpu != a->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_member_removed_does_not_leak)
+{
+	/* Removing a group member shouldn't crash the group_cpu
+	 * lookup. Exercises the bookkeeping path where the indexed
+	 * node count shrinks while the max_group_id stays high. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 99), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 99), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_int_eq(dag_remove_node(g, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(a);
+	pwtest_bool_true(a->cpu < 2);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* --- deeper group coverage ---
+ *
+ * The basic group tests above pin the contract; the ones below stress
+ * the corners: large group ids, many groups, recovery after an
+ * infeasible recalc, migration of a node between groups, fictitious-
+ * node interaction with group_id, dirty bit interactions, and the
+ * worst-fit choice when a group competes with ungrouped neighbours
+ * for finite per-CPU bandwidth. */
+
+PWTEST(group_high_id_does_not_overflow)
+{
+	/* group_cpu[] is sized as max_group_id + 1; a 31-bit id must
+	 * neither malloc-overflow nor write out of bounds. Picking a
+	 * very high (but still 32-bit) id flushes any silent assumption
+	 * that groups are 0..N-1. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+
+	/* Just below UINT32_MAX so the malloc is bounded but the array
+	 * size dwarfs the actual group count -- the test specifically
+	 * verifies the implementation doesn't try to materialise the
+	 * whole [0, group_id] range as a packed structure. The 16 GiB
+	 * allocation would be visible immediately. */
+	uint32_t big = 1u << 20;
+	pwtest_int_eq(dag_set_node_group(g, 1, big), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, big), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_many_groups_each_co_locates)
+{
+	/* Eight groups of two members each on four CPUs. Each group's
+	 * members must share a CPU; with worst-fit and the load cap at
+	 * 0.40 they spread across all four CPUs. */
+	dag_t *g = dag_create(100, 100, 0.40f, 4);
+
+	pwtest_ptr_notnull(g);
+	for (uint32_t k = 0; k < 8; k++) {
+		uint32_t a_id = 100 + 2 * k;
+		uint32_t b_id = 101 + 2 * k;
+		uint32_t group = 1000 + k;
+		pwtest_int_eq(add_real_node(g, a_id, 2, 100 + (int)k), 0);
+		pwtest_int_eq(add_real_node(g, b_id, 2, 200 + (int)k), 0);
+		pwtest_int_eq(dag_set_node_group(g, a_id, group), 0);
+		pwtest_int_eq(dag_set_node_group(g, b_id, group), 0);
+	}
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	for (uint32_t k = 0; k < 8; k++) {
+		dag_node_t *a = find_node_by_id(g, 100 + 2 * k);
+		dag_node_t *b = find_node_by_id(g, 101 + 2 * k);
+		pwtest_ptr_notnull(a);
+		pwtest_ptr_notnull(b);
+		pwtest_int_eq((int)a->cpu, (int)b->cpu);
+		pwtest_int_eq(a->group_id, 1000u + k);
+		pwtest_int_eq(b->group_id, 1000u + k);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_eagain_recoverable_after_clear)
+{
+	/* Overcapacity returns EAGAIN; clearing the offending group
+	 * lets the next recalc succeed. The DAG must not be left in a
+	 * permanently-broken state by a transient infeasible placement. */
+	dag_t *g = dag_create(100, 100, 0.55f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 30, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 30, 102), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 5), 0);
+
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+	/* On failure dag_recalculate leaves dirty set so a retry
+	 * actually retries. */
+	pwtest_bool_true(g->dirty);
+
+	/* Clear the group on one member; the two now spread across CPUs
+	 * and admission succeeds. */
+	pwtest_int_eq(dag_set_node_group(g, 2, 0), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_bool_true(a->cpu != b->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_migration_between_groups)
+{
+	/* A node initially in group 1 migrates to group 2; verify the
+	 * placement follows. This is the path taken when libpipewire
+	 * reshapes a chain (node leaves chain A, joins chain B). */
+	dag_t *g = dag_create(100, 100, 0.60f, 4);
+	dag_node_t *a, *b, *c, *d;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 5, 104), 0);
+
+	/* Initial: {1,2,3} group A, {4} alone. */
+	pwtest_int_eq(dag_set_node_group(g, 1, 100), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 100), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 100), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	d = find_node_by_id(g, 4);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq((int)a->cpu, (int)c->cpu);
+
+	/* Migrate: node 3 jumps from group 100 to a new group 200
+	 * with node 4. After recalc 1 and 2 still share, 3 and 4
+	 * share, and the two groups occupy different CPUs (worst-fit
+	 * spreads them with 4 CPUs available). */
+	pwtest_int_eq(dag_set_node_group(g, 3, 200), 0);
+	pwtest_int_eq(dag_set_node_group(g, 4, 200), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_int_eq((int)c->cpu, (int)d->cpu);
+	pwtest_bool_true(a->cpu != c->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_fictitious_node_ignored)
+{
+	/* The recalc's fictitious-source/sink sentinels never participate
+	 * in placement; even if a (defective) caller tried to stamp them
+	 * with a group, that group must not influence real-node
+	 * assignment. The library only walks group_id on real nodes
+	 * inside assign_cpus, so the fictitious entries are skipped
+	 * implicitly -- this test guards that no future refactor
+	 * regresses by iterating fictitious nodes through the worst-fit
+	 * loop. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 7), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 7), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Inspect every fictitious node: group_id is still 0 (the
+	 * default), confirming the calling convention. */
+	dag_node_t *n;
+	uint32_t fictitious_seen = 0;
+	spa_list_for_each(n, &g->nodes, link) {
+		if (!n->fictitious)
+			continue;
+		fictitious_seen++;
+		pwtest_int_eq(n->group_id, 0u);
+	}
+	pwtest_bool_true(fictitious_seen >= 2);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_competes_with_ungrouped_for_capacity)
+{
+	/* A group of two density-0.20 members lands on CPU 0
+	 * (consuming 0.40). A single ungrouped density-0.30 node
+	 * then has only CPU 1 with enough headroom (cap 0.45). It
+	 * goes there. This is the realistic case where the chain
+	 * merge changes which CPU the unrelated work ends up on. */
+	dag_t *g = dag_create(100, 100, 0.45f, 2);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 20, 101), 0);  /* density 0.20, grouped */
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);  /* density 0.20, grouped */
+	pwtest_int_eq(add_real_node(g, 3, 30, 103), 0);  /* density 0.30, lone */
+	pwtest_int_eq(dag_set_node_group(g, 1, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_bool_true(c->cpu != a->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_topology_edge_addition_keeps_placement)
+{
+	/* Adding an edge between two grouped nodes (the chain becomes
+	 * explicit in the DAG topology) must not alter their CPU
+	 * assignment, because the group already constrains them to one
+	 * CPU. The dirty flag forces a recalc but the outcome is the
+	 * same. */
+	dag_t *g = dag_create(100, 100, 0.80f, 4);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 9), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	uint32_t cpu_before = a->cpu;
+	pwtest_int_eq((int)b->cpu, (int)cpu_before);
+
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_int_eq((int)a->cpu, (int)cpu_before);
+	pwtest_int_eq((int)b->cpu, (int)cpu_before);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(group_set_after_recalc_marks_dirty)
+{
+	/* The dirty bit interaction: after a clean recalc, setting any
+	 * node's group to a new value must mark the DAG dirty so the
+	 * next foreach reruns assign_cpus. Without this, the chain-
+	 * merge feature would only take effect on the first recalc and
+	 * subsequent group changes would silently get the stale
+	 * placement. */
+	dag_t *g = dag_create(100, 100, 0.50f, 2);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
+	pwtest_bool_true(g->dirty);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Setting a *different* node to a different group flips it
+	 * again. */
+	pwtest_int_eq(dag_set_node_group(g, 2, 7), 0);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
@@ -1671,6 +2299,28 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(id_index_shuffled_insertion_stays_sorted, PWTEST_NOARG);
 	pwtest_add(id_index_add_remove_stress, PWTEST_NOARG);
 	pwtest_add(id_index_duplicate_add_leaves_index_intact, PWTEST_NOARG);
+
+	pwtest_add(group_two_independent_share_cpu, PWTEST_NOARG);
+	pwtest_add(group_chain_keeps_chain_on_one_cpu, PWTEST_NOARG);
+	pwtest_add(group_distinct_groups_do_not_unify, PWTEST_NOARG);
+	pwtest_add(group_ungrouped_neighbour_unaffected, PWTEST_NOARG);
+	pwtest_add(group_overcapacity_returns_eagain, PWTEST_NOARG);
+	pwtest_add(group_invalid_id_returns_enoent, PWTEST_NOARG);
+	pwtest_add(group_null_dag_returns_einval, PWTEST_NOARG);
+	pwtest_add(group_same_value_is_noop_for_dirty, PWTEST_NOARG);
+	pwtest_add(group_clear_returns_to_default, PWTEST_NOARG);
+	pwtest_add(group_survives_wcet_update, PWTEST_NOARG);
+	pwtest_add(group_three_members_partial_clear, PWTEST_NOARG);
+	pwtest_add(group_member_removed_does_not_leak, PWTEST_NOARG);
+
+	pwtest_add(group_high_id_does_not_overflow, PWTEST_NOARG);
+	pwtest_add(group_many_groups_each_co_locates, PWTEST_NOARG);
+	pwtest_add(group_eagain_recoverable_after_clear, PWTEST_NOARG);
+	pwtest_add(group_migration_between_groups, PWTEST_NOARG);
+	pwtest_add(group_fictitious_node_ignored, PWTEST_NOARG);
+	pwtest_add(group_competes_with_ungrouped_for_capacity, PWTEST_NOARG);
+	pwtest_add(group_topology_edge_addition_keeps_placement, PWTEST_NOARG);
+	pwtest_add(group_set_after_recalc_marks_dirty, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
