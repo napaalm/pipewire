@@ -475,6 +475,73 @@ PWTEST(sketch_tracks_tail_beyond_median)
 }
 
 
+/* ============== WCET round-trip normalisation ==============
+ *
+ * module-deadline normalises every runtime sample by the
+ * relative_capacity of the CPU it was collected on before feeding the
+ * sketch, so the digest always holds "WCET as if measured on the
+ * fastest (reference) CPU". The emit step (sched_cb in
+ * module-deadline.c) does the inverse division by
+ * relative_capacity[placement_cpu] before sched_setattr. The tests
+ * below verify that two-step pipeline at the sketch level:
+ *
+ *   feed:   normalised = runtime * rel_cap[collected_cpu]
+ *   emit:   runtime_for_kernel = quantile / rel_cap[placement_cpu]
+ *
+ * On a homogeneous host both factors are 1.0 and the kernel sees the
+ * raw runtime back. On a heterogeneous host with collected_cpu slower
+ * than placement_cpu, the kernel budget shrinks proportionally;
+ * conversely the budget grows when placing on a slower CPU than the
+ * one the sample came from. */
+PWTEST(wcet_normalize_roundtrip_homogeneous)
+{
+	const double rel_cap = 1.0;
+	const uint64_t raw_runtime = 1234567;
+	wcet_sketch_t s;
+
+	pwtest_int_eq(wcet_sketch_init(&s, 512, 100.0, 0.999), 0);
+	for (int i = 0; i < 5000; i++)
+		wcet_sketch_add(&s, (double)raw_runtime * rel_cap);
+
+	double q = wcet_sketch_quantile(&s);
+	pwtest_double_eq(q, (double)raw_runtime);
+
+	uint64_t runtime_kernel = (uint64_t)(q / rel_cap);
+	pwtest_int_eq((int)runtime_kernel, (int)raw_runtime);
+
+	wcet_sketch_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(wcet_normalize_roundtrip_heterogeneous)
+{
+	/* Samples collected on a 0.5-capacity CPU show up in the sketch
+	 * at half the wall-clock duration (reference-CPU equivalent).
+	 * Placing the result on a 1.0-capacity CPU divides by 1.0, so
+	 * the budget is half the raw measurement. Conversely, placing on
+	 * the same 0.5-capacity CPU as the one the sample came from
+	 * divides by 0.5 and recovers the original wall-clock duration
+	 * (identity within the round-trip). */
+	const double rel_cap_collected = 0.5;
+	const uint64_t raw_runtime = 1000000;
+	wcet_sketch_t s;
+
+	pwtest_int_eq(wcet_sketch_init(&s, 512, 100.0, 0.999), 0);
+	for (int i = 0; i < 5000; i++)
+		wcet_sketch_add(&s, (double)raw_runtime * rel_cap_collected);
+
+	double q = wcet_sketch_quantile(&s);
+	pwtest_double_eq(q, 500000.0);
+
+	uint64_t runtime_fast_cpu = (uint64_t)(q / 1.0);
+	uint64_t runtime_same_cpu = (uint64_t)(q / rel_cap_collected);
+	pwtest_int_eq((int)runtime_fast_cpu, 500000);
+	pwtest_int_eq((int)runtime_same_cpu, (int)raw_runtime);
+
+	wcet_sketch_fini(&s);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_wcet_sketch)
 {
 	pwtest_add(tdigest_empty_returns_zero, PWTEST_NOARG);
@@ -498,6 +565,9 @@ PWTEST_SUITE(module_deadline_wcet_sketch)
 	pwtest_add(sketch_count_grows_until_first_rotation, PWTEST_NOARG);
 	pwtest_add(sketch_reset_clears_both_digests, PWTEST_NOARG);
 	pwtest_add(sketch_tracks_tail_beyond_median, PWTEST_NOARG);
+
+	pwtest_add(wcet_normalize_roundtrip_homogeneous, PWTEST_NOARG);
+	pwtest_add(wcet_normalize_roundtrip_heterogeneous, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

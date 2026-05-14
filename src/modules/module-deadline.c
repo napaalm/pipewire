@@ -374,10 +374,20 @@ static const struct spa_dict_item module_props[] = {
 
 /* A single RT->worker sample. node_id+period_ns are enough for the
  * worker to look up (or lazily create) the node estimator and to
- * detect period changes. The RT thread writes; the worker reads. */
+ * detect period changes. cpu carries the CPU id the follower thread
+ * ran on when the runtime was measured (its current SCHED_DEADLINE
+ * placement, since followers are pinned); the worker uses it to
+ * normalise the sample into reference-CPU units before feeding the
+ * sketch, so the digest always holds WCETs "as if measured on the
+ * fastest CPU". SAMPLE_CPU_UNKNOWN means the follower has not yet
+ * been placed (e.g. very first cycle after registration) and the
+ * worker treats the sample as already reference-CPU normalised. The
+ * RT thread writes; the worker reads. */
+#define SAMPLE_CPU_UNKNOWN UINT32_MAX
+
 struct sample {
 	uint32_t node_id;
-	uint32_t _pad;
+	uint32_t cpu;
 	uint64_t runtime_ns;
 	uint64_t period_ns;
 };
@@ -766,8 +776,28 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		uint64_t deadline, uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
+
+	/* Denormalise runtime from reference-CPU units into kernel
+	 * units for the placement CPU. The sketch holds WCETs as if the
+	 * follower ran on the fastest CPU; on a slower placement the
+	 * thread needs proportionally more wall-clock time, so the
+	 * budget shipped to sched_setattr divides by
+	 * relative_capacity[cpu]. Identity when relative_capacity is
+	 * unset (NULL vector) or the placement CPU is the reference. */
+	uint64_t runtime_kernel = runtime;
+	if (impl->relative_capacity != NULL &&
+			cpu < (uint32_t)impl->n_cpus &&
+			impl->relative_capacity[cpu] > 0.0) {
+		double scaled = (double)runtime / impl->relative_capacity[cpu];
+		if (scaled < 0.0)
+			scaled = 0.0;
+		if (scaled > (double)UINT64_MAX)
+			scaled = (double)UINT64_MAX;
+		runtime_kernel = (uint64_t)scaled;
+	}
+
 	int res = sched_groups_add(&impl->sched_groups, id, tid,
-			runtime, deadline, period, cpu);
+			runtime_kernel, deadline, period, cpu);
 	if (res == -ENOMEM)
 		pw_log_warn("sched: out of memory accumulating tid=%d", (int)tid);
 	/* -EINVAL (tid <= 0) is silently ignored: a follower with no
@@ -1049,9 +1079,36 @@ static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_
 	return runtime;
 }
 
+/* Normalise a raw runtime sample collected on `sample_cpu` into
+ * reference-CPU units so the sketch always holds "WCET as if measured
+ * on the fastest CPU". Multiplying by relative_capacity[sample_cpu]
+ * shrinks slow-CPU samples toward what they would have been on the
+ * reference; the emit step (sched_cb) does the inverse divide before
+ * sched_setattr. Identity on homogeneous hardware (every entry == 1.0
+ * collapses both operations). Returns the raw value untouched when
+ * the topology vector is absent or sample_cpu is out of range / not
+ * yet known. */
+static inline double wcet_sample_to_reference(struct impl *impl,
+		uint64_t runtime, uint32_t sample_cpu)
+{
+	if (impl->relative_capacity == NULL)
+		return (double)runtime;
+	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
+			sample_cpu >= (uint32_t)impl->n_cpus)
+		return (double)runtime;
+	double rc = impl->relative_capacity[sample_cpu];
+	if (!(rc > 0.0))
+		return (double)runtime;
+	return (double)runtime * rc;
+}
+
 /* Apply one sample to a follower's estimator. Worker-thread or RT-
- * thread (in sync mode); never both for a given node. */
-static void apply_sample(struct impl *impl, struct node *n, uint64_t runtime, uint64_t period)
+ * thread (in sync mode); never both for a given node. sample_cpu is
+ * the placement CPU the follower ran on (used to normalise the
+ * sample into reference-CPU units before insertion); pass
+ * SAMPLE_CPU_UNKNOWN to skip the normalisation. */
+static void apply_sample(struct impl *impl, struct node *n,
+		uint64_t runtime, uint32_t sample_cpu, uint64_t period)
 {
 	if (!n->sketch_ready) {
 		if (wcet_sketch_init(&n->sketch,
@@ -1071,12 +1128,19 @@ static void apply_sample(struct impl *impl, struct node *n, uint64_t runtime, ui
 		n->wcet = 0;
 	}
 
+	double sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
+
 	if (runtime > 0 && n->sketch_ready)
-		wcet_sketch_add(&n->sketch, (double)runtime);
+		wcet_sketch_add(&n->sketch, sample_ref);
 
 	if (!n->sketch_ready ||
 	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
-		n->wcet = SPA_MAX(n->wcet, runtime);
+		/* Peak-hold fallback. n->wcet is stored in reference-CPU
+		 * units so it lines up with the sketch's eventual output;
+		 * sched_cb denormalises before sched_setattr. */
+		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
+			(uint64_t)sample_ref : 0;
+		n->wcet = SPA_MAX(n->wcet, sample_ref_u64);
 	} else {
 		double q = wcet_sketch_quantile(&n->sketch);
 		if (q > 0.0 && q < (double)UINT64_MAX)
@@ -1178,7 +1242,9 @@ static void recalc_params_sync(struct node *drv)
 			pw_log_warn("node %d runtime %lu exceeds period %lu",
 				    tnode->info.id, runtime, period);
 
-		apply_sample(impl, n, runtime, period);
+		apply_sample(impl, n, runtime,
+				n->last_applied ? n->last_cpu : SAMPLE_CPU_UNKNOWN,
+				period);
 
 		if (n_followers >= followers_cap) {
 			uint32_t new_cap = followers_cap * 2;
@@ -1306,7 +1372,17 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 		 * size so offset always lands on a slot boundary. */
 		struct sample *s = (struct sample *)((uint8_t *)drv->ring_slots + offset);
 		s->node_id = tnode->info.id;
-		s->_pad = 0;
+		/* Stamp the follower's current placement CPU. The
+		 * follower has been pinned by sched_setaffinity since
+		 * the previous reconcile, so this is the CPU its thread
+		 * actually ran on for this cycle. Falls back to
+		 * SAMPLE_CPU_UNKNOWN before the first placement; the
+		 * worker then skips normalisation and treats the sample
+		 * as already in reference-CPU units. */
+		struct node *n_lookup = find_node_by_id(drv->impl,
+				tnode->info.id);
+		s->cpu = (n_lookup != NULL && n_lookup->last_applied) ?
+				n_lookup->last_cpu : SAMPLE_CPU_UNKNOWN;
 		s->runtime_ns = runtime;
 		s->period_ns = period;
 		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
@@ -1349,7 +1425,7 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 			}
 		}
 		if (n)
-			apply_sample(impl, n, s->runtime_ns, s->period_ns);
+			apply_sample(impl, n, s->runtime_ns, s->cpu, s->period_ns);
 
 		processed += sizeof(struct sample);
 	}
