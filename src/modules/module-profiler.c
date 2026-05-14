@@ -265,7 +265,11 @@ static void context_do_profile(void *data)
 			SPA_POD_Long(a->finish_cputime - a->awake_cputime),
 			SPA_POD_Int(a->status),
 			SPA_POD_Fraction(&node->latency),
-			SPA_POD_Int(a->xrun_count));
+			SPA_POD_Int(a->xrun_count),
+			SPA_POD_Long((a->finish_cycles >= a->awake_cycles &&
+					a->finish_cycles != 0 && a->awake_cycles != 0)
+				? (int64_t)(a->finish_cycles - a->awake_cycles)
+				: (int64_t)0));
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tn = t->node;
@@ -293,6 +297,14 @@ static void context_do_profile(void *data)
 			prev_signal_time = ta->prev_signal_time;
 		}
 
+		uint64_t follower_cycles = 0;
+		if (async) {
+			follower_cycles = ta->prev_run_cycles;
+		} else if (ta->finish_cycles >= ta->awake_cycles &&
+				ta->finish_cycles != 0 && ta->awake_cycles != 0) {
+			follower_cycles = ta->finish_cycles - ta->awake_cycles;
+		}
+
 		spa_pod_builder_prop(&b, SPA_PROFILER_followerBlock, 0);
 		spa_pod_builder_add_struct(&b,
 			SPA_POD_Int(t->id),
@@ -305,7 +317,8 @@ static void context_do_profile(void *data)
 			SPA_POD_Int(ta->status),
 			SPA_POD_Fraction(&latency),
 			SPA_POD_Int(ta->xrun_count),
-			SPA_POD_Bool(async));
+			SPA_POD_Bool(async),
+			SPA_POD_Long((int64_t)follower_cycles));
 
 		if (tn && tn->driver) {
 			struct spa_io_position *tpos = &tn->rt.target.activation->position;
