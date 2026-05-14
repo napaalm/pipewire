@@ -155,7 +155,7 @@ static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 
 PWTEST(chain_uses_peak_not_sum)
 {
-	dag_t *g = dag_create(100, 100, 0.55f, 1);
+	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
 	pwtest_ptr_notnull(g);
 
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -201,7 +201,7 @@ PWTEST(chain_uses_peak_not_sum)
 
 PWTEST(fork_join_fails_on_peak_concurrency)
 {
-	dag_t *g = dag_create(100, 100, 0.55f, 1);
+	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
 	static const uint32_t middle_parallel[] = { 2, 3 };
 	int res;
 
@@ -228,7 +228,7 @@ PWTEST(fork_join_fails_on_peak_concurrency)
 
 PWTEST(multi_source_initial_cut_and_cleanup)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
 	static const uint32_t sources[] = { 1, 2 };
 	static const uint32_t mixed_cut[] = { 2, 3 };
 	static const uint32_t invalid_cut[] = { 1, 4 };
@@ -256,7 +256,7 @@ PWTEST(multi_source_initial_cut_and_cleanup)
 
 PWTEST(topology_change_rebuilds_analysis)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
 	static const uint32_t concurrent_pair[] = { 1, 3 };
 
 	pwtest_ptr_notnull(g);
@@ -291,7 +291,7 @@ PWTEST(topology_change_rebuilds_analysis)
 
 PWTEST(fictitious_nodes_allow_zero_wcet)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 
@@ -308,7 +308,7 @@ PWTEST(fictitious_nodes_allow_zero_wcet)
 
 PWTEST(recalculate_keeps_exactly_two_fictitious_nodes)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 
@@ -342,7 +342,7 @@ PWTEST(recalculate_keeps_exactly_two_fictitious_nodes)
 
 PWTEST(dag_foreach_node_skips_fictitious_nodes)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 1);
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
 	struct foreach_info info = { 0 };
 
 	pwtest_ptr_notnull(g);
@@ -363,7 +363,7 @@ PWTEST(dag_foreach_node_skips_fictitious_nodes)
 
 PWTEST(iterative_deadlines_assign_fork_join)
 {
-	dag_t *g = dag_create(100, 100, 0.90f, 2);
+	dag_t *g = dag_create(100, 100, 0.90f, 2, NULL);
 	dag_node_t *n1, *n2, *n3, *n4;
 
 	pwtest_ptr_notnull(g);
@@ -401,7 +401,7 @@ PWTEST(iterative_deadlines_assign_fork_join)
 
 PWTEST(independent_tasks_are_placed_by_descending_density)
 {
-	dag_t *g = dag_create(100, 100, 0.10f, 2);
+	dag_t *g = dag_create(100, 100, 0.10f, 2, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -445,7 +445,7 @@ static uint64_t path_deadline_sum(dag_t *g, const uint32_t *ids, size_t n_ids)
 
 PWTEST(single_node_deadline)
 {
-	dag_t *g = dag_create(25, 25, 1.0f, 1);
+	dag_t *g = dag_create(25, 25, 1.0f, 1, NULL);
 	dag_node_t *node;
 
 	pwtest_ptr_notnull(g);
@@ -464,7 +464,7 @@ PWTEST(single_node_deadline)
 PWTEST(chain_deadlines)
 {
 	static const uint32_t path[] = { 1, 2, 3 };
-	dag_t *g = dag_create(18, 18, 1.0f, 3);
+	dag_t *g = dag_create(18, 18, 1.0f, 3, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -494,7 +494,7 @@ PWTEST(diamond_deadlines)
 {
 	static const uint32_t left_path[] = { 1, 2, 4 };
 	static const uint32_t right_path[] = { 1, 3, 4 };
-	dag_t *g = dag_create(12, 12, 1.0f, 4);
+	dag_t *g = dag_create(12, 12, 1.0f, 4, NULL);
 	dag_node_t *a, *b, *c, *d;
 
 	pwtest_ptr_notnull(g);
@@ -537,7 +537,7 @@ PWTEST(branch_tightening_residual_budget)
 {
 	static const uint32_t heavy_path[] = { 1, 2, 5, 6 };
 	static const uint32_t discounted_path[] = { 1, 3, 4, 5, 6 };
-	dag_t *g = dag_create(54, 54, 1.0f, 6);
+	dag_t *g = dag_create(54, 54, 1.0f, 6, NULL);
 	dag_node_t *a, *b, *c, *x, *d, *e;
 
 	pwtest_ptr_notnull(g);
@@ -601,7 +601,7 @@ PWTEST(branch_tightening_residual_budget)
  * tight branch twice. */
 PWTEST(residual_budget_no_double_credit)
 {
-	dag_t *g = dag_create(1000, 1000, 0.95f, 4);
+	dag_t *g = dag_create(1000, 1000, 0.95f, 4, NULL);
 	dag_node_t *n1, *n2, *n3, *n4;
 
 	pwtest_ptr_notnull(g);
@@ -705,7 +705,7 @@ static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wce
 /* empty DAG returns NULL from dag_find_node. */
 PWTEST(id_index_empty)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_ptr_null(dag_find_node(g, 42));
@@ -718,7 +718,7 @@ PWTEST(id_index_empty)
 /* a single inserted node is found by dag_find_node. */
 PWTEST(id_index_single)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 	dag_node_t *n;
 
 	pwtest_ptr_notnull(g);
@@ -735,7 +735,7 @@ PWTEST(id_index_single)
 /* dag_find_node after dag_remove_node returns NULL. */
 PWTEST(id_index_remove)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 42, 10, 142), 0);
@@ -753,7 +753,7 @@ PWTEST(id_index_remove)
  * stays sorted. */
 PWTEST(id_index_shuffled_insertion_stays_sorted)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 	static const uint32_t shuffled[] = { 7, 3, 11, 1, 5, 9, 2, 13, 4 };
 	uint32_t i;
 
@@ -783,7 +783,7 @@ PWTEST(id_index_shuffled_insertion_stays_sorted)
  * sync with the list. */
 PWTEST(id_index_add_remove_stress)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 	uint32_t i;
 
 	pwtest_ptr_notnull(g);
@@ -833,7 +833,7 @@ PWTEST(id_index_add_remove_stress)
  * unchanged. */
 PWTEST(id_index_duplicate_add_leaves_index_intact)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 	dag_node_t *original;
 
 	pwtest_ptr_notnull(g);
@@ -854,7 +854,7 @@ PWTEST(id_index_duplicate_add_leaves_index_intact)
 
 PWTEST(workspace_reuse_across_recalcs)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_t *g = dag_create(100, 100, 0.95f, 2, NULL);
 	dag_node_t *a, *b, *c;
 	uint64_t da1, db1, dc1;
 	uint64_t da2, db2, dc2;
@@ -921,23 +921,23 @@ PWTEST(timing_invalid_inputs_rejected)
 	dag_t *g;
 
 	errno = 0;
-	g = dag_create(0, 10, 0.95, 1);
+	g = dag_create(0, 10, 0.95, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	errno = 0;
-	g = dag_create(10, 0, 0.95, 1);
+	g = dag_create(10, 0, 0.95, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	/* deadline > period: reject. */
 	errno = 0;
-	g = dag_create(10, 11, 0.95, 1);
+	g = dag_create(10, 11, 0.95, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	/* Successful create, then bad set. */
-	g = dag_create(100, 100, 0.95, 1);
+	g = dag_create(100, 100, 0.95, 1, NULL);
 	pwtest_ptr_notnull(g);
 	errno = 0;
 	pwtest_int_eq(dag_set_global_period_deadline(g, 100, 0), -1);
@@ -958,7 +958,7 @@ PWTEST(timing_invalid_inputs_rejected)
  * not exposed to public callers). */
 PWTEST(zero_wcet_rejected)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 1);
+	dag_t *g = dag_create(100, 100, 0.95, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 
@@ -987,7 +987,7 @@ PWTEST(zero_wcet_rejected)
  * valid schedule. */
 PWTEST(timing_edge_deadline_equals_period)
 {
-	dag_t *g = dag_create(50, 50, 0.95, 1);
+	dag_t *g = dag_create(50, 50, 0.95, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1004,27 +1004,27 @@ PWTEST(load_reject_non_finite_or_out_of_range)
 	double inf_v = INFINITY;
 
 	errno = 0;
-	g = dag_create(100, 100, nan_v, 1);
+	g = dag_create(100, 100, nan_v, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	errno = 0;
-	g = dag_create(100, 100, inf_v, 1);
+	g = dag_create(100, 100, inf_v, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	errno = 0;
-	g = dag_create(100, 100, -0.5, 1);
+	g = dag_create(100, 100, -0.5, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	errno = 0;
-	g = dag_create(100, 100, 0.0, 1);
+	g = dag_create(100, 100, 0.0, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
 	errno = 0;
-	g = dag_create(100, 100, 1.1, 1);
+	g = dag_create(100, 100, 1.1, 1, NULL);
 	pwtest_ptr_null(g);
 	pwtest_int_eq(errno, EINVAL);
 
@@ -1035,7 +1035,7 @@ PWTEST(load_reject_non_finite_or_out_of_range)
  * DAG and the admission test admits an obviously feasible graph. */
 PWTEST(load_ordinary_cap_admits)
 {
-	dag_t *g = dag_create(100, 100, 0.95, 2);
+	dag_t *g = dag_create(100, 100, 0.95, 2, NULL);
 	dag_node_t *a;
 
 	pwtest_ptr_notnull(g);
@@ -1066,7 +1066,7 @@ PWTEST(load_near_bound_admits)
 	 * the analyser is at the edge -- with deadline tightening
 	 * inside dag_recalculate the per-node density may grow
 	 * marginally above cap; the epsilon absorbs the ULP. */
-	dag_t *g = dag_create(100, 100, 0.10, 1);
+	dag_t *g = dag_create(100, 100, 0.10, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1078,7 +1078,7 @@ PWTEST(load_near_bound_admits)
 
 PWTEST(cpu_placement_orders_by_descending_density)
 {
-	dag_t *g = dag_create(100, 100, 0.10f, 3);
+	dag_t *g = dag_create(100, 100, 0.10f, 3, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1116,7 +1116,7 @@ PWTEST(cpu_placement_orders_by_descending_density)
  * pin the deterministic ordering here too. */
 PWTEST(cpu_placement_equal_density_lowest_cpu)
 {
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1146,7 +1146,7 @@ PWTEST(cpu_placement_equal_density_lowest_cpu)
 
 PWTEST(feasibility_tight_critical_path)
 {
-	dag_t *g = dag_create(30, 30, 1.0f, 1);
+	dag_t *g = dag_create(30, 30, 1.0f, 1, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1177,7 +1177,7 @@ PWTEST(feasibility_tight_critical_path)
  * dirty, deadlines/cpus are cleared. */
 PWTEST(feasibility_critical_path_overrun)
 {
-	dag_t *g = dag_create(20, 20, 1.0f, 1);
+	dag_t *g = dag_create(20, 20, 1.0f, 1, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1216,7 +1216,7 @@ PWTEST(feasibility_critical_path_overrun)
  * force the violation. */
 PWTEST(feasibility_min_deadline_reservation)
 {
-	dag_t *g = dag_create(2, 2, 1.0f, 1);
+	dag_t *g = dag_create(2, 2, 1.0f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
@@ -1240,7 +1240,7 @@ PWTEST(feasibility_min_deadline_reservation)
 
 PWTEST(dirty_noop_after_clean_recalc)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 	struct dirty_test_stats s1 = { 0 };
 	struct dirty_test_stats s2 = { 0 };
 
@@ -1270,7 +1270,7 @@ PWTEST(dirty_noop_after_clean_recalc)
  * no-op set (same wcet) does NOT mark dirty. */
 PWTEST(dirty_set_node_wcet)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 	struct dirty_test_stats s = { 0 };
 
 	pwtest_ptr_notnull(g);
@@ -1309,7 +1309,7 @@ PWTEST(dirty_set_node_wcet)
  * a no-op set does not. */
 PWTEST(dirty_set_global_period_deadline)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1332,7 +1332,7 @@ PWTEST(dirty_set_global_period_deadline)
  * the DAG dirty. */
 PWTEST(dirty_on_add_edge)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1349,7 +1349,7 @@ PWTEST(dirty_on_add_edge)
 
 PWTEST(unrelated_set_chain_admits_serially)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 	dag_node_t *n1, *n2, *n3;
 
 	pwtest_ptr_notnull(g);
@@ -1387,7 +1387,7 @@ PWTEST(unrelated_set_chain_admits_serially)
  * the bound. */
 PWTEST(unrelated_set_independent_spreads)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 3);
+	dag_t *g = dag_create(100, 100, 0.95f, 3, NULL);
 	dag_node_t *a, *b, *c;
 	uint32_t cpus_used;
 
@@ -1424,7 +1424,7 @@ PWTEST(unrelated_set_independent_spreads)
  * the diamond by placing n2 and n3 on different CPUs. */
 PWTEST(unrelated_set_diamond_admits_on_two_cpus)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_t *g = dag_create(100, 100, 0.95f, 2, NULL);
 	dag_node_t *n1, *n2, *n3, *n4;
 	static const uint32_t middle[] = { 2, 3 };
 
@@ -1458,7 +1458,7 @@ PWTEST(unrelated_set_diamond_admits_on_two_cpus)
 
 PWTEST(disconnect_two_parallel_chains)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_t *g = dag_create(100, 100, 0.95f, 2, NULL);
 	dag_node_t *a1, *a2, *x1, *x2;
 
 	pwtest_ptr_notnull(g);
@@ -1500,7 +1500,7 @@ PWTEST(disconnect_two_parallel_chains)
  * recalc must still assign it a deadline. */
 PWTEST(disconnect_chain_plus_isolated)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 2);
+	dag_t *g = dag_create(100, 100, 0.95f, 2, NULL);
 	dag_node_t *a, *b, *iso;
 
 	pwtest_ptr_notnull(g);
@@ -1531,7 +1531,7 @@ PWTEST(disconnect_chain_plus_isolated)
 
 PWTEST(self_loop_rejected_with_einval)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1549,7 +1549,7 @@ PWTEST(self_loop_rejected_with_einval)
 
 PWTEST(cycle_creating_edge_rejected_with_eloop)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1578,7 +1578,7 @@ PWTEST(cycle_creating_edge_rejected_with_eloop)
 
 PWTEST(dag_has_cycle_predicate)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1);
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
@@ -1597,7 +1597,7 @@ PWTEST(dag_has_cycle_predicate)
 
 PWTEST(equal_load_ties_choose_lowest_cpu)
 {
-	dag_t *g = dag_create(300, 300, 0.10f, 2);
+	dag_t *g = dag_create(300, 300, 0.10f, 2, NULL);
 	dag_node_t *n1, *n2, *n3;
 
 	pwtest_ptr_notnull(g);
@@ -1652,7 +1652,7 @@ PWTEST(group_two_independent_share_cpu)
 {
 	/* Two independent nodes that ordinarily spread to CPU 0/1
 	 * end up on the same CPU when grouped. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -1681,7 +1681,7 @@ PWTEST(group_chain_keeps_chain_on_one_cpu)
 {
 	/* A 3-node chain A->B->C stamped as one group lands on a
 	 * single CPU even though there are 4 CPUs available. */
-	dag_t *g = dag_create(100, 100, 0.80f, 4);
+	dag_t *g = dag_create(100, 100, 0.80f, 4, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1712,7 +1712,7 @@ PWTEST(group_distinct_groups_do_not_unify)
 	 * grouping they spread to 4 CPUs; with two separate groups
 	 * they spread to 2 CPUs (one per group). The point is that
 	 * group X members co-locate but X and Y don't share. */
-	dag_t *g = dag_create(100, 100, 0.50f, 4);
+	dag_t *g = dag_create(100, 100, 0.50f, 4, NULL);
 	dag_node_t *a, *b, *c, *d;
 
 	pwtest_ptr_notnull(g);
@@ -1748,7 +1748,7 @@ PWTEST(group_ungrouped_neighbour_unaffected)
 	/* A 2-member group plus one ungrouped node. The ungrouped
 	 * one is placed by ordinary worst-fit; the group lands on
 	 * its own CPU. */
-	dag_t *g = dag_create(100, 100, 0.60f, 3);
+	dag_t *g = dag_create(100, 100, 0.60f, 3, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1778,7 +1778,7 @@ PWTEST(group_overcapacity_returns_eagain)
 	 * exceed the per-CPU cap returns EAGAIN. Splitting the group
 	 * across CPUs is forbidden by contract, so admission must
 	 * fail rather than spread. */
-	dag_t *g = dag_create(100, 100, 0.55f, 2);
+	dag_t *g = dag_create(100, 100, 0.55f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -1805,7 +1805,7 @@ PWTEST(group_overcapacity_returns_eagain)
 
 PWTEST(group_invalid_id_returns_enoent)
 {
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
 
@@ -1831,7 +1831,7 @@ PWTEST(group_same_value_is_noop_for_dirty)
 	 * the DAG: a steady-state recalc loop shouldn't redo CPU
 	 * placement every cycle because module-deadline re-applied
 	 * the same group stamps. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
 
@@ -1855,7 +1855,7 @@ PWTEST(group_clear_returns_to_default)
 {
 	/* Clearing a group (set to 0) returns the node to ungrouped
 	 * worst-fit behaviour. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -1883,7 +1883,7 @@ PWTEST(group_survives_wcet_update)
 	/* Updating a node's WCET (which marks dirty and triggers a
 	 * recalc) must preserve its group_id. Without this, every
 	 * WCET update would defeat the chain merge. */
-	dag_t *g = dag_create(100, 100, 0.80f, 2);
+	dag_t *g = dag_create(100, 100, 0.80f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -1914,7 +1914,7 @@ PWTEST(group_three_members_partial_clear)
 {
 	/* Group of three; clear one member only. The remaining two
 	 * stay co-located; the cleared one is placed freely. */
-	dag_t *g = dag_create(100, 100, 0.60f, 3);
+	dag_t *g = dag_create(100, 100, 0.60f, 3, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -1949,7 +1949,7 @@ PWTEST(group_member_removed_does_not_leak)
 	/* Removing a group member shouldn't crash the group_cpu
 	 * lookup. Exercises the bookkeeping path where the indexed
 	 * node count shrinks while the max_group_id stays high. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a;
 
 	pwtest_ptr_notnull(g);
@@ -1984,7 +1984,7 @@ PWTEST(group_high_id_does_not_overflow)
 	 * neither malloc-overflow nor write out of bounds. Picking a
 	 * very high (but still 32-bit) id flushes any silent assumption
 	 * that groups are 0..N-1. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -2014,7 +2014,7 @@ PWTEST(group_many_groups_each_co_locates)
 	/* Eight groups of two members each on four CPUs. Each group's
 	 * members must share a CPU; with worst-fit and the load cap at
 	 * 0.40 they spread across all four CPUs. */
-	dag_t *g = dag_create(100, 100, 0.40f, 4);
+	dag_t *g = dag_create(100, 100, 0.40f, 4, NULL);
 
 	pwtest_ptr_notnull(g);
 	for (uint32_t k = 0; k < 8; k++) {
@@ -2048,7 +2048,7 @@ PWTEST(group_eagain_recoverable_after_clear)
 	/* Overcapacity returns EAGAIN; clearing the offending group
 	 * lets the next recalc succeed. The DAG must not be left in a
 	 * permanently-broken state by a transient infeasible placement. */
-	dag_t *g = dag_create(100, 100, 0.55f, 2);
+	dag_t *g = dag_create(100, 100, 0.55f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -2081,7 +2081,7 @@ PWTEST(group_migration_between_groups)
 	/* A node initially in group 1 migrates to group 2; verify the
 	 * placement follows. This is the path taken when libpipewire
 	 * reshapes a chain (node leaves chain A, joins chain B). */
-	dag_t *g = dag_create(100, 100, 0.60f, 4);
+	dag_t *g = dag_create(100, 100, 0.60f, 4, NULL);
 	dag_node_t *a, *b, *c, *d;
 
 	pwtest_ptr_notnull(g);
@@ -2127,7 +2127,7 @@ PWTEST(group_fictitious_node_ignored)
 	 * implicitly -- this test guards that no future refactor
 	 * regresses by iterating fictitious nodes through the worst-fit
 	 * loop. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -2165,7 +2165,7 @@ PWTEST(group_competes_with_ungrouped_for_capacity)
 	 * then has only CPU 1 with enough headroom (cap 0.45). It
 	 * goes there. This is the realistic case where the chain
 	 * merge changes which CPU the unrelated work ends up on. */
-	dag_t *g = dag_create(100, 100, 0.45f, 2);
+	dag_t *g = dag_create(100, 100, 0.45f, 2, NULL);
 	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
@@ -2194,7 +2194,7 @@ PWTEST(group_topology_edge_addition_keeps_placement)
 	 * assignment, because the group already constrains them to one
 	 * CPU. The dirty flag forces a recalc but the outcome is the
 	 * same. */
-	dag_t *g = dag_create(100, 100, 0.80f, 4);
+	dag_t *g = dag_create(100, 100, 0.80f, 4, NULL);
 	dag_node_t *a, *b;
 
 	pwtest_ptr_notnull(g);
@@ -2227,7 +2227,7 @@ PWTEST(group_set_after_recalc_marks_dirty)
 	 * merge feature would only take effect on the first recalc and
 	 * subsequent group changes would silently get the stale
 	 * placement. */
-	dag_t *g = dag_create(100, 100, 0.50f, 2);
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
 
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
@@ -2246,6 +2246,124 @@ PWTEST(group_set_after_recalc_marks_dirty)
 	 * again. */
 	pwtest_int_eq(dag_set_node_group(g, 2, 7), 0);
 	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* -------------------------------------------------------------------
+ * Per-CPU relative capacity (heterogeneous / DVFS-conservative cases).
+ *
+ * dag_create now accepts a per-CPU vector of relative_capacity values
+ * in (0, 1]. NULL is shorthand for an all-1.0 vector, the homogeneous
+ * identity that every test above relies on. The new cases below
+ * verify that:
+ *
+ *   - an explicit all-1.0 vector behaves identically to NULL;
+ *   - the worst-fit placer prefers faster CPUs for the densest nodes;
+ *   - admission tightens correctly when half the CPUs are at 0.5
+ *     relative_capacity (a workload that fits homogeneously must be
+ *     rejected); and
+ *   - dag_check_feasibility scales the critical-path budget by the
+ *     slowest CPU, refusing a path that would overrun on the worst
+ *     possible placement even though it would fit on the fastest.
+ * ------------------------------------------------------------------- */
+
+PWTEST(hetero_all_ones_matches_null_vector)
+{
+	double ones[2] = { 1.0, 1.0 };
+
+	dag_t *g_null = dag_create(100, 100, 0.90, 2, NULL);
+	pwtest_ptr_notnull(g_null);
+	pwtest_int_eq(add_real_node(g_null, 1, 30, 101), 0);
+	pwtest_int_eq(add_real_node(g_null, 2, 40, 102), 0);
+	pwtest_int_eq(dag_recalculate(g_null), 0);
+
+	dag_t *g_ones = dag_create(100, 100, 0.90, 2, ones);
+	pwtest_ptr_notnull(g_ones);
+	pwtest_int_eq(add_real_node(g_ones, 1, 30, 101), 0);
+	pwtest_int_eq(add_real_node(g_ones, 2, 40, 102), 0);
+	pwtest_int_eq(dag_recalculate(g_ones), 0);
+
+	pwtest_int_eq((int)find_node_by_id(g_null, 1)->cpu,
+			(int)find_node_by_id(g_ones, 1)->cpu);
+	pwtest_int_eq((int)find_node_by_id(g_null, 2)->cpu,
+			(int)find_node_by_id(g_ones, 2)->cpu);
+
+	dag_destroy(g_null);
+	dag_destroy(g_ones);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_high_density_picks_faster_cpu)
+{
+	/* CPU 0 fast (1.0), CPU 1 slow (0.5). Two independent nodes; the
+	 * denser one must land on the faster CPU under worst-fit. */
+	double rel[2] = { 1.0, 0.5 };
+
+	dag_t *g = dag_create(100, 100, 0.90, 2, rel);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 40, 101), 0);  /* dense  -> CPU 0 */
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);  /* light  -> CPU 1 */
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_int_eq((int)find_node_by_id(g, 1)->cpu, 0);
+	pwtest_int_eq((int)find_node_by_id(g, 2)->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_admission_rejects_workload_that_only_fits_at_full_capacity)
+{
+	/* Two independent nodes, each raw util 0.8. With ceiling 0.9 and
+	 * two CPUs at full capacity, the worst-fit places one per CPU and
+	 * the workload trivially fits. With CPU 1 dropped to 0.5
+	 * relative_capacity, that node's relative util becomes 1.6 > 0.9
+	 * so neither CPU can take the second node and assign_cpus
+	 * returns EAGAIN. */
+	dag_t *g_homo = dag_create(100, 100, 0.90, 2, NULL);
+	pwtest_ptr_notnull(g_homo);
+	pwtest_int_eq(add_real_node(g_homo, 1, 80, 101), 0);
+	pwtest_int_eq(add_real_node(g_homo, 2, 80, 102), 0);
+	pwtest_int_eq(dag_recalculate(g_homo), 0);
+	pwtest_int_eq((int)find_node_by_id(g_homo, 1)->cpu, 0);
+	pwtest_int_eq((int)find_node_by_id(g_homo, 2)->cpu, 1);
+	dag_destroy(g_homo);
+
+	double rel[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(100, 100, 0.90, 2, rel);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 80, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 80, 102), 0);
+
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
+{
+	/* Critical path of 60 ns fits the 100 ns deadline at reference
+	 * capacity (60 <= 100) but not at min capacity 0.5
+	 * (scaled_deadline = 100 * 0.5 = 50; 60 > 50 -> EAGAIN). */
+	double rel_homo[2] = { 1.0, 1.0 };
+	dag_t *g_homo = dag_create(100, 100, 0.90, 2, rel_homo);
+	pwtest_ptr_notnull(g_homo);
+	pwtest_int_eq(add_real_node(g_homo, 1, 60, 101), 0);
+	pwtest_int_eq(dag_recalculate(g_homo), 0);
+	dag_destroy(g_homo);
+
+	double rel_slow[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(100, 100, 0.90, 2, rel_slow);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 60, 101), 0);
+
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -2321,6 +2439,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(group_competes_with_ungrouped_for_capacity, PWTEST_NOARG);
 	pwtest_add(group_topology_edge_addition_keeps_placement, PWTEST_NOARG);
 	pwtest_add(group_set_after_recalc_marks_dirty, PWTEST_NOARG);
+
+	pwtest_add(hetero_all_ones_matches_null_vector, PWTEST_NOARG);
+	pwtest_add(hetero_high_density_picks_faster_cpu, PWTEST_NOARG);
+	pwtest_add(hetero_admission_rejects_workload_that_only_fits_at_full_capacity, PWTEST_NOARG);
+	pwtest_add(hetero_feasibility_scaled_by_slowest_cpu, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

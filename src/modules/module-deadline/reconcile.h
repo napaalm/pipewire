@@ -103,17 +103,20 @@ typedef void (*reconcile_sched_cb_t)(void *data, uint32_t id, pid_t tid,
 		uint64_t period, uint32_t cpu);
 
 /* Allocate and initialize a reconcile state. `n_cpus` and
- * `cpu_utilization` mirror the dag_create arguments; `recalc_threshold`
- * is the per-WCET fractional change required to mark the DAG dirty
- * (0 means every change marks dirty, 0.01 = the recommended default).
- * `persistent` selects the persistent-DAG path; when false, the
- * legacy destroy-and-rebuild path runs on every reconcile_apply and
- * the threshold is ignored (a permanent kill switch for the new
- * code path).
+ * `cpu_utilization` mirror the dag_create arguments;
+ * `relative_capacity` is an optional length-`n_cpus` vector of
+ * per-CPU capacity scalars in (0, 1] (NULL = uniform 1.0, the
+ * homogeneous host); `recalc_threshold` is the per-WCET fractional
+ * change required to mark the DAG dirty (0 means every change marks
+ * dirty, 0.01 = the recommended default). `persistent` selects the
+ * persistent-DAG path; when false, the legacy destroy-and-rebuild
+ * path runs on every reconcile_apply and the threshold is ignored (a
+ * permanent kill switch for the new code path).
  *
  * Returns NULL on allocation failure (errno set). */
 reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double cpu_utilization,
+		const double *relative_capacity,
 		double recalc_threshold,
 		bool persistent);
 

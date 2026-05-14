@@ -88,12 +88,25 @@ struct dag_edge {
 struct dag {
 	uint64_t period;    /* global period */
 	uint64_t deadline;  /* global end-to-end deadline */
-	double utilization; /* max per-CPU DAG load, must be finite
-			     * and in (0, 1]; rejected at create time
-			     * otherwise. Stored as double so the
-			     * admission comparison can use a small
-			     * epsilon without losing precision. */
+	double admission_ceiling; /* max per-CPU DAG load (in relative
+				   * utilisation units), must be finite
+				   * and in (0, 1]; rejected at create
+				   * time otherwise. Compared against the
+				   * worst-case running sum during the
+				   * worst-fit placement pass, with a
+				   * small epsilon so floating-point
+				   * round-off does not exclude exactly
+				   * fitting workloads. */
 	uint32_t num_cpus;
+
+	/* Per-CPU capacity scalar in (0, 1]. relative_capacity[i] = 1.0
+	 * means CPU i is the reference (any CPU with raw_capacity *
+	 * freq equal to the max in the set); slower CPUs come in below
+	 * 1.0. Always non-NULL after dag_create (NULL input is
+	 * promoted to a vector of 1.0s, the homogeneous identity).
+	 * Length is num_cpus; owned by the dag_t, freed in
+	 * dag_destroy. */
+	double  *relative_capacity;
 
 	/* Set whenever a successful timing or topology mutation
 	 * invalidates the previously-computed scheduling parameters.
@@ -137,8 +150,22 @@ struct dag {
 	uint32_t     ws_capacity;   /* allocated length of both above */
 };
 
-/* Create and destroy a DAG */
-dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus);
+/* Create and destroy a DAG.
+ *
+ * `admission_ceiling` is the per-CPU upper bound on total relative
+ * utilisation: every per-CPU running sum produced by the worst-fit
+ * placement is compared against this value. Must be finite and in
+ * (0, 1].
+ *
+ * `relative_capacity` is an optional length-`num_cpus` vector of
+ * per-CPU capacity scalars in (0, 1]; entry i is CPU i's relative
+ * throughput, with the fastest CPU(s) at 1.0. NULL is shorthand for a
+ * uniform 1.0 vector, the homogeneous-host case, which reduces
+ * admission and placement to the original (pre-heterogeneous-CPU)
+ * arithmetic. The vector is copied; the caller keeps ownership of
+ * its input. */
+dag_t *dag_create(uint64_t period, uint64_t deadline, double admission_ceiling,
+		uint32_t num_cpus, const double *relative_capacity);
 void dag_destroy(dag_t *g);
 
 /* Set global period and deadline */

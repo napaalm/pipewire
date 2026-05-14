@@ -18,6 +18,11 @@ struct reconcile_state {
 	/* Cached configuration. */
 	uint32_t n_cpus;
 	double   cpu_utilization;
+	/* Per-CPU relative capacity (length n_cpus). NULL means the
+	 * homogeneous case -- forwarded to dag_create as NULL so the
+	 * library installs its own uniform 1.0 vector. Heap-owned
+	 * copy; freed in reconcile_fini. */
+	double  *relative_capacity;
 	double   recalc_threshold;
 	bool     persistent;
 
@@ -43,6 +48,7 @@ struct reconcile_state {
 
 reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double cpu_utilization,
+		const double *relative_capacity,
 		double recalc_threshold,
 		bool persistent)
 {
@@ -57,6 +63,17 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 	state = calloc(1, sizeof(*state));
 	if (!state)
 		return NULL;
+
+	if (relative_capacity != NULL) {
+		state->relative_capacity = calloc(n_cpus,
+				sizeof(*state->relative_capacity));
+		if (!state->relative_capacity) {
+			free(state);
+			return NULL;
+		}
+		for (uint32_t i = 0; i < n_cpus; i++)
+			state->relative_capacity[i] = relative_capacity[i];
+	}
 
 	state->n_cpus = n_cpus;
 	state->cpu_utilization = cpu_utilization;
@@ -87,6 +104,7 @@ void reconcile_fini(reconcile_state_t *state)
 	if (!state)
 		return;
 	reconcile_drop(state);
+	free(state->relative_capacity);
 	free(state);
 }
 
@@ -151,7 +169,8 @@ static dag_t *build_dag_from_topo(reconcile_state_t *state,
 	uint32_t i;
 
 	dag = dag_create(topo->period, topo->period,
-			state->cpu_utilization, state->n_cpus);
+			state->cpu_utilization, state->n_cpus,
+			state->relative_capacity);
 	if (!dag)
 		return NULL;
 

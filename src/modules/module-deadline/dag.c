@@ -160,7 +160,8 @@ static void dag_invalidate_analysis(dag_t *g)
 	dag_workspace_free(g);
 }
 
-dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32_t num_cpus)
+dag_t *dag_create(uint64_t period, uint64_t deadline, double admission_ceiling,
+		uint32_t num_cpus, const double *relative_capacity)
 {
 	if (period == 0 || num_cpus == 0) {
 		errno = EINVAL;
@@ -175,22 +176,42 @@ dag_t *dag_create(uint64_t period, uint64_t deadline, double utilization, uint32
 		errno = EINVAL;
 		return NULL;
 	}
-	/* Non-finite (NaN, +/-Inf) utilization values would slip past
-	 * naive < / > comparisons (NaN compares false to everything).
-	 * isfinite() catches those before they corrupt the admission
-	 * arithmetic. */
-	if (!isfinite(utilization) || utilization <= 0.0 || utilization > 1.0) {
+	/* Non-finite (NaN, +/-Inf) ceilings would slip past naive < / >
+	 * comparisons (NaN compares false to everything). isfinite()
+	 * catches those before they corrupt the admission arithmetic. */
+	if (!isfinite(admission_ceiling) ||
+			admission_ceiling <= 0.0 || admission_ceiling > 1.0) {
 		errno = EINVAL;
 		return NULL;
+	}
+	if (relative_capacity != NULL) {
+		for (uint32_t i = 0; i < num_cpus; i++) {
+			if (!isfinite(relative_capacity[i]) ||
+					relative_capacity[i] <= 0.0 ||
+					relative_capacity[i] > 1.0) {
+				errno = EINVAL;
+				return NULL;
+			}
+		}
 	}
 
 	dag_t *g = calloc(1, sizeof(*g));
 	if (!g)
 		return NULL;
 
+	g->relative_capacity = calloc(num_cpus, sizeof(*g->relative_capacity));
+	if (!g->relative_capacity) {
+		free(g);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < num_cpus; i++) {
+		g->relative_capacity[i] = relative_capacity != NULL ?
+			relative_capacity[i] : 1.0;
+	}
+
 	g->period = period;
 	g->deadline = deadline;
-	g->utilization = utilization;
+	g->admission_ceiling = admission_ceiling;
 	g->num_cpus = num_cpus;
 	g->dirty = false;
 	spa_list_init(&g->nodes);
@@ -225,6 +246,7 @@ void dag_destroy(dag_t *g)
 	}
 
 	free(g->nodes_by_id);
+	free(g->relative_capacity);
 	free(g);
 }
 
@@ -1312,10 +1334,30 @@ static int dag_check_feasibility(dag_t *g)
 	uint64_t critical = dag_critical_path_wcet(g);
 	uint64_t min_reservation = dag_min_deadline_reservation(g);
 
-	if (critical > g->deadline) {
-		pw_log_warn("DAG critical path %" PRIu64
-				" ns exceeds global deadline %" PRIu64 " ns",
-				critical, g->deadline);
+	/* The critical path's WCET is measured at the reference (fastest)
+	 * CPU. To guarantee schedulability regardless of which CPUs the
+	 * placer ends up using, scale the available deadline budget by
+	 * the slowest CPU in the set: if the path lands on the slowest
+	 * CPU it runs longer by a factor of 1 / min_relative_capacity,
+	 * so its scaled WCET must still fit in the global deadline.
+	 * Strictly conservative: a workload whose critical path actually
+	 * lands on a fast CPU is rejected if it does not also fit on the
+	 * slowest. The trade-off is acceptable because the slowest CPU
+	 * is the only way to bound the worst-case placement without
+	 * solving the full assignment problem at feasibility time. */
+	double min_rel_cap = g->relative_capacity[0];
+	for (uint32_t i = 1; i < g->num_cpus; i++) {
+		if (g->relative_capacity[i] < min_rel_cap)
+			min_rel_cap = g->relative_capacity[i];
+	}
+	double scaled_deadline = (double)g->deadline * min_rel_cap;
+
+	if ((double)critical > scaled_deadline) {
+		pw_log_warn("DAG critical path %" PRIu64 " ns exceeds "
+				"slowest-CPU-scaled deadline %.0f ns "
+				"(global deadline %" PRIu64 " ns, "
+				"min relative capacity %.3f)",
+				critical, scaled_deadline, g->deadline, min_rel_cap);
 		errno = EAGAIN;
 		return -1;
 	}
@@ -1867,6 +1909,11 @@ static int assign_cpus(dag_t *g)
 			group_cpu[i] = -1;
 	}
 
+	/* cpu_peak and cpu_set_util both accumulate *relative*
+	 * utilisation: a node with raw density u placed on CPU c
+	 * contributes u / relative_capacity[c]. On the homogeneous
+	 * case (all relative_capacity entries == 1.0) this collapses
+	 * to the original arithmetic. */
 	for (uint32_t i = 0; i < count; i++) {
 		if (info[i].node->fictitious)
 			continue;
@@ -1886,35 +1933,39 @@ static int assign_cpus(dag_t *g)
 			 * allowed because it would invalidate the
 			 * thread-merge done by libpipewire. */
 			uint32_t c = (uint32_t)forced_cpu;
-			double projected = cpu_peak[c] > u ? cpu_peak[c] : u;
+			double rc = g->relative_capacity[c];
+			double u_rel = u / rc;
+			double projected = cpu_peak[c] > u_rel ? cpu_peak[c] : u_rel;
 
 			for (uint32_t s = 0; s < unrelated_size; s++) {
 				if (!bitset_test(g->unrelated[s], info[i].node->index))
 					continue;
 
-				double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u;
+				double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u_rel;
 				if (candidate > projected)
 					projected = candidate;
 			}
 
-			if (projected <= g->utilization + DAG_LOAD_EPSILON) {
+			if (projected <= g->admission_ceiling + DAG_LOAD_EPSILON) {
 				chosen = (int)c;
 				chosen_projected = projected;
 			}
 		} else {
 			for (uint32_t c = 0; c < num_cpus; c++) {
-				double projected = cpu_peak[c] > u ? cpu_peak[c] : u;
+				double rc = g->relative_capacity[c];
+				double u_rel = u / rc;
+				double projected = cpu_peak[c] > u_rel ? cpu_peak[c] : u_rel;
 
 				for (uint32_t s = 0; s < unrelated_size; s++) {
 					if (!bitset_test(g->unrelated[s], info[i].node->index))
 						continue;
 
-					double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u;
+					double candidate = cpu_set_util[(size_t)c * unrelated_size + s] + u_rel;
 					if (candidate > projected)
 						projected = candidate;
 				}
 
-				if (projected <= g->utilization + DAG_LOAD_EPSILON &&
+				if (projected <= g->admission_ceiling + DAG_LOAD_EPSILON &&
 						prefer_cpu_choice(projected, c,
 							chosen_projected, chosen)) {
 					chosen_projected = projected;
@@ -1935,14 +1986,17 @@ static int assign_cpus(dag_t *g)
 		info[i].node->cpu = (uint32_t)chosen;
 		if (gid != 0 && group_cpu != NULL && group_cpu[gid] < 0)
 			group_cpu[gid] = chosen;
-		double projected = cpu_peak[chosen] > u ? cpu_peak[chosen] : u;
+		double rc_chosen = g->relative_capacity[chosen];
+		double u_rel_chosen = u / rc_chosen;
+		double projected = cpu_peak[chosen] > u_rel_chosen ?
+			cpu_peak[chosen] : u_rel_chosen;
 
 		for (uint32_t s = 0; s < unrelated_size; s++) {
 			size_t offset = (size_t)chosen * unrelated_size + s;
 			if (!bitset_test(g->unrelated[s], info[i].node->index))
 				continue;
 
-			cpu_set_util[offset] += u;
+			cpu_set_util[offset] += u_rel_chosen;
 			if (cpu_set_util[offset] > projected)
 				projected = cpu_set_util[offset];
 		}

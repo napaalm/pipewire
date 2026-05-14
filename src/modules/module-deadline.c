@@ -521,6 +521,11 @@ struct impl {
 	int n_cpus;
 	int cpus[MAX_CPUS];
 	float cpu_utilization;
+	/* Per-CPU relative_capacity vector aligned with cpus[].
+	 * NULL until D4 wires the cpu_topology probe; reconcile_init
+	 * treats NULL as the homogeneous (all-1.0) identity, which is
+	 * the regression-safe default. */
+	double *relative_capacity;
 
 	/* WCET estimator configuration; see module-options doc above. */
 	uint32_t sketch_window_size;
@@ -1114,6 +1119,7 @@ static void recalc_params_sync(struct node *drv)
 	if (drv->reconcile == NULL) {
 		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
 				impl->cpu_utilization,
+				impl->relative_capacity,
 				impl->wcet_recalc_threshold,
 				impl->recalc_persistent);
 		if (drv->reconcile == NULL) {
@@ -1523,6 +1529,7 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	if (drv->reconcile == NULL) {
 		drv->reconcile = reconcile_init((uint32_t)impl->n_cpus,
 				impl->cpu_utilization,
+				impl->relative_capacity,
 				impl->wcet_recalc_threshold,
 				impl->recalc_persistent);
 		if (drv->reconcile == NULL) {

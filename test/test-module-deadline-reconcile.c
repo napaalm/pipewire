@@ -56,12 +56,12 @@ static void cb_record(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 
 static reconcile_state_t *make_state_persistent(double threshold)
 {
-	return reconcile_init(2, 0.95, threshold, true);
+	return reconcile_init(2, 0.95, NULL, threshold, true);
 }
 
 static reconcile_state_t *make_state_legacy(void)
 {
-	return reconcile_init(2, 0.95, 0.01, false);
+	return reconcile_init(2, 0.95, NULL, 0.01, false);
 }
 
 /* Build a small 3-node topo: 1 -> 2 -> 3. WCETs are caller-set. */
@@ -615,7 +615,7 @@ PWTEST(reconcile_e3_zero_cpus_rejected)
 {
 	reconcile_state_t *s;
 	errno = 0;
-	s = reconcile_init(0, 0.95, 0.01, true);
+	s = reconcile_init(0, 0.95, NULL, 0.01, true);
 	pwtest_ptr_null(s);
 	pwtest_int_eq(errno, EINVAL);
 	return PWTEST_PASS;
@@ -722,7 +722,7 @@ PWTEST(reconcile_g3_chain_share_tid_collapses_to_one_cpu)
 	 * should land on a single CPU. Even with multiple CPUs
 	 * available, the group constraint pulls them together. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -757,7 +757,7 @@ PWTEST(reconcile_g4_chain_break_reverts_group)
 	 * The new DAG should show the two remaining shared-TID
 	 * followers grouped and the middle node ungrouped. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -842,7 +842,7 @@ PWTEST(reconcile_g6_two_independent_chains_distinct_groups)
 	 * worst-fit alternative, which a single-chain topology
 	 * doesn't offer. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -890,7 +890,7 @@ PWTEST(reconcile_g7_new_member_joins_existing_group)
 	 * Note: the leader_id stays at the lowest id (10), so the
 	 * group_id remains 10 across both passes. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -934,7 +934,7 @@ PWTEST(reconcile_g8_idempotent_reapply_keeps_group)
 	 * no-op, the dirty bit stays clear, and assign_cpus doesn't
 	 * re-run). */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -1096,7 +1096,7 @@ PWTEST(reconcile_g12_group_overcapacity_returns_failure_state)
 	 * propagates cleanly through reconcile rather than getting
 	 * silently dropped. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(2, 0.55, 0.01, true);
+	reconcile_state_t *s = reconcile_init(2, 0.55, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
@@ -1127,7 +1127,7 @@ PWTEST(reconcile_g13_chain_member_leaves_group)
 	 * Verifies that the lowest-id leader convention follows the
 	 * surviving members and the departed one becomes ungrouped. */
 	struct topo5 t;
-	reconcile_state_t *s = reconcile_init(4, 0.95, 0.01, true);
+	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
 	reconcile_topo_t rt;
 
