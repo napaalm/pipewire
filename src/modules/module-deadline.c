@@ -112,6 +112,17 @@
  *                       a two-class capacity layout on a homogeneous
  *                       host. See cpu_topology_from_json for the
  *                       schema.
+ * - `sched.reclaim`:    Whether to set SCHED_FLAG_RECLAIM (GRUB) on
+ *                       every sched_setattr. Default true.
+ *                       Setting it to false puts the module into a
+ *                       strict-budget mode where any per-job
+ *                       overrun surfaces immediately as a deadline
+ *                       miss instead of being absorbed by reclaimed
+ *                       bandwidth from idle peers. Used by the
+ *                       saturation live test to verify the WCET
+ *                       sketch has not under-bounded the worst
+ *                       case; not recommended for production audio
+ *                       graphs.
  * - `wcet.window-size`: Number of recent driver-completion cycles whose
  *                       runtime samples are retained per node. Counts
  *                       cycles, not time -- the sketch sees exactly one
@@ -569,6 +580,13 @@ struct impl {
 	struct cpu_topology topology;
 	enum cpu_smt_policy  smt_policy;
 	enum cpu_dvfs_policy dvfs_policy;
+	/* When true (the default), set SCHED_FLAG_RECLAIM on every
+	 * sched_setattr so unused bandwidth flows to peers via GRUB.
+	 * Disabled by sched.reclaim=false for the saturation live
+	 * test: a strict-budget mode where deadline misses surface
+	 * instead of being absorbed by reclaim. Fixed for the
+	 * lifetime of the module. */
+	bool sched_reclaim;
 
 	/* WCET estimator configuration; see module-options doc above. */
 	uint32_t sketch_window_size;
@@ -741,7 +759,8 @@ static bool can_use_deadline_policy(void)
 	return false;
 }
 
-static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, uint64_t period)
+static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline,
+		uint64_t period, bool use_reclaim)
 {
 	int ret = 0;
 
@@ -758,7 +777,17 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline, ui
 	attr.sched_deadline = deadline;
 	attr.sched_period = period;
 
-	attr.sched_flags |= SCHED_FLAG_RECLAIM;
+	if (use_reclaim) {
+		/* GRUB (Greedy Reclamation of Unused Bandwidth) reclaim:
+		 * tasks that finish before their budget hand the slack
+		 * back to peers transparently, so the occasional WCET
+		 * overshoot the t-digest sketch admits is absorbed
+		 * silently. Disabled by sched.reclaim=false for the
+		 * bandwidth-saturation live test, where deadline misses
+		 * caused by a too-small budget must surface instead of
+		 * being absorbed. */
+		attr.sched_flags |= SCHED_FLAG_RECLAIM;
+	}
 
 	ret = sched_setattr(tid, &attr, 0);
 
@@ -874,7 +903,8 @@ static void apply_sched_groups(struct impl *impl)
 		}
 
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
-				g->sum_deadline, g->period);
+				g->sum_deadline, g->period,
+				impl->sched_reclaim);
 		rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
 
 		if (anchor == NULL)
@@ -2112,6 +2142,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		pw_log_warn("deadline scheduling disabled (cpu topology probe failed)");
 		goto done;
 	}
+
+	impl->sched_reclaim = pw_properties_get_bool(props,
+			"sched.reclaim", true);
+	pw_log_info("sched.reclaim = %s",
+			impl->sched_reclaim ? "true" : "false");
 
 	impl->sketch_window_size = WCET_DEFAULT_WINDOW_SIZE;
 	impl->sketch_quantile = WCET_DEFAULT_QUANTILE;
