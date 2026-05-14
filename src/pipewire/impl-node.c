@@ -19,6 +19,9 @@
 #if defined(__GNU__)
 #include <hurd.h>
 #endif
+#if defined(__linux__)
+#include <linux/perf_event.h>
+#endif
 
 #include <spa/support/system.h>
 #include <spa/pod/parser.h>
@@ -1506,6 +1509,103 @@ static inline void calculate_stats(struct pw_impl_node *this,  struct pw_node_ac
  *
  * This code runs on the client and the server, depending on where the node is.
  */
+/* Cached check of /proc/sys/kernel/perf_event_paranoid. Returns true
+ * when the kernel allows the unprivileged perf_event_open() this code
+ * uses (user-only, exclude_kernel/exclude_hv, attached to the calling
+ * thread). The threshold "<= 1" matches the documented contract:
+ *
+ *   3   no perf_event_open() at all
+ *   2   user can profile user space but not kernel; per-CPU events refused
+ *   1   user can profile both user and kernel space
+ *   0   per-CPU events allowed
+ *  -1   raw access allowed
+ *
+ * We only need user-space cycle counts on the calling thread, so
+ * paranoid <= 1 is a clear "go". On a host pinned at 2 the open will
+ * usually still succeed for thread-attached events with
+ * exclude_kernel set, but distros and policies vary; gating on
+ * paranoid <= 1 is the safe, explicit contract. The result is cached
+ * for the lifetime of the process; if the operator lowers paranoid
+ * after PipeWire is already running, a restart is needed to pick it
+ * up, but no daemon currently mutates the sysctl while running.
+ */
+static bool node_cycles_supported(void)
+{
+#if defined(__linux__)
+	static int cached = -1;
+	if (SPA_LIKELY(cached != -1))
+		return cached != 0;
+	FILE *f = fopen("/proc/sys/kernel/perf_event_paranoid", "r");
+	if (f == NULL) {
+		cached = 0;
+		return false;
+	}
+	int paranoid = 99;
+	int n = fscanf(f, "%d", &paranoid);
+	fclose(f);
+	cached = (n == 1 && paranoid <= 1) ? 1 : 0;
+	pw_log_info("perf_event_paranoid=%d cycles_supported=%s",
+			paranoid, cached ? "true" : "false");
+	return cached != 0;
+#else
+	return false;
+#endif
+}
+
+/* Open a thread-attached PERF_COUNT_HW_CPU_CYCLES counter excluding
+ * kernel / hypervisor / idle time. Returns the fd on success, -1 on
+ * failure. Must be called from the thread we want to measure (perf
+ * with pid=0 attaches to the caller). exclude_idle keeps the counter
+ * paused when the kernel parks the thread, so a delta read across one
+ * process() cycle is exactly the cycles that thread spent running its
+ * work -- a frequency-invariant work estimate that consumers can pair
+ * with the existing wall-clock prev_run_time. */
+static int node_open_cycle_fd(struct pw_impl_node *this)
+{
+#if defined(__linux__)
+	struct perf_event_attr attr;
+	int fd;
+
+	if (!node_cycles_supported())
+		return -1;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.size = sizeof(attr);
+	attr.type = PERF_TYPE_HARDWARE;
+	attr.config = PERF_COUNT_HW_CPU_CYCLES;
+	attr.disabled = 0;
+	attr.exclude_kernel = 1;
+	attr.exclude_hv = 1;
+	attr.exclude_idle = 1;
+	/* pid=0 means "this thread", cpu=-1 means "any CPU". */
+	fd = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+	if (fd < 0) {
+		pw_log_debug("%p: perf_event_open cycles failed: %m", this);
+		return -1;
+	}
+	return fd;
+#else
+	return -1;
+#endif
+}
+
+/* Read the cumulative cycle count from a perf_event_open() fd. On any
+ * failure return 0; consumers treat zero as "no perf data". The
+ * read() is a syscall (~hundred ns); the existing process_node
+ * already syscalls for clock_gettime() and eventfd ops, so the
+ * marginal cost is comparable. Optimisation candidate: mmap the perf
+ * page and use RDPMC on x86 to drop the syscall, but that is a
+ * follow-up. */
+static inline uint64_t node_read_cycles(int fd)
+{
+	uint64_t v = 0;
+	if (fd < 0)
+		return 0;
+	if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+		return 0;
+	return v;
+}
+
 static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_cpu_nsec)
 {
 	struct pw_impl_node *this = data;
@@ -1514,12 +1614,24 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 	struct spa_system *data_system = this->rt.target.system;
 	int status;
 	uint64_t nsec, cpu_nsec;
+	uint64_t awake_cycles_local = 0, finish_cycles_local = 0;
 	bool was_awake;
 
 	if (!SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_TRIGGERED,
 				PW_NODE_ACTIVATION_AWAKE))
 		return 0;
+
+	/* Lazy-init the per-thread perf cycle counter. process_node
+	 * always runs on the data-loop thread that owns this node, so
+	 * perf_event_open(pid=0) here binds the counter to the right
+	 * thread. -2 is the "do not retry" sentinel after a failed
+	 * open; we never raise it back to -1. */
+	if (SPA_UNLIKELY(this->cycle_fd == -1))
+		this->cycle_fd = node_open_cycle_fd(this);
+	if (this->cycle_fd < 0)
+		this->cycle_fd = -2;
+	awake_cycles_local = node_read_cycles(this->cycle_fd);
 
 	pw_log_trace_fp("%p: %s-%d process remote:%u exported:%u %"PRIu64" %"PRIu64,
 			this, this->name, this->info.id, this->remote, this->exported,
@@ -1553,6 +1665,7 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 
 	nsec = get_time_ns(data_system);
 	cpu_nsec = get_cputime_ns(data_system);
+	finish_cycles_local = node_read_cycles(this->cycle_fd);
 	was_awake = SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_AWAKE,
 				PW_NODE_ACTIVATION_FINISHED);
@@ -1560,6 +1673,12 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 	a->awake_cputime = awake_cpu_nsec;
 	a->finish_time = nsec;
 	a->finish_cputime = cpu_nsec;
+	/* Cycle counts: stamp the awake/finish pair so consumers can
+	 * derive a frequency-invariant WCET from finish_cycles -
+	 * awake_cycles. Both zero means the counter is disabled and
+	 * the consumer must fall back on prev_run_time. */
+	a->awake_cycles = awake_cycles_local;
+	a->finish_cycles = finish_cycles_local;
 
 	pw_log_trace_fp("%p: finished status:%d %"PRIu64" was_awake:%d",
 			this, status, nsec, was_awake);
@@ -1685,6 +1804,7 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 	this->context = context;
 	this->name = strdup("node");
 	this->source.fd = -1;
+	this->cycle_fd = -1;        /* lazy-init in process_node */
 
 	if (properties == NULL)
 		properties = pw_properties_new(NULL, NULL);
@@ -2417,6 +2537,18 @@ retry_status:
 		ta->prev_awake_time = ta->awake_time;
 		ta->prev_finish_time = ta->finish_time;
 		ta->prev_run_time = ta->finish_cputime - ta->awake_cputime;
+		/* Mirror the nanosecond's "previous-cycle" semantics for
+		 * cycles. finish_cycles == 0 means the executor did not
+		 * record cycle counts (perf disabled or unsupported); we
+		 * propagate 0 so the consumer can fall back. The cycle
+		 * counter is monotonic per-thread so finish > awake by
+		 * construction when both reads succeed. */
+		if (ta->finish_cycles != 0 && ta->awake_cycles != 0 &&
+				ta->finish_cycles >= ta->awake_cycles)
+			ta->prev_run_cycles =
+				ta->finish_cycles - ta->awake_cycles;
+		else
+			ta->prev_run_cycles = 0;
 	}
 
 	node->driver_start = nsec;
@@ -2708,6 +2840,11 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 	clear_info(node);
 
 	spa_system_close(node->rt.target.system, node->source.fd);
+
+	if (node->cycle_fd >= 0) {
+		close(node->cycle_fd);
+		node->cycle_fd = -2;
+	}
 
 	if (node->data_loop)
 		pw_context_release_node_loop(context, node->data_loop);
