@@ -477,37 +477,74 @@ PWTEST(sketch_tracks_tail_beyond_median)
 
 /* ============== WCET round-trip normalisation ==============
  *
- * module-deadline normalises every runtime sample by the
- * relative_capacity of the CPU it was collected on before feeding the
- * sketch, so the digest always holds "WCET as if measured on the
- * fastest (reference) CPU". The emit step (sched_cb in
- * module-deadline.c) does the inverse division by
- * relative_capacity[placement_cpu] before sched_setattr. The tests
- * below verify that two-step pipeline at the sketch level:
+ * module-deadline normalises every runtime sample by the *nominal*
+ * relative_capacity of the CPU it was collected on (i.e. the
+ * raw_capacity * max_freq baseline, regardless of dvfs policy), so
+ * the digest always holds "WCET as if measured on the fastest CPU at
+ * its peak frequency". This is the conservative assumption: we don't
+ * know which cpufreq state the CPU was in during measurement, and
+ * max_freq is the smallest wall-clock time the same work could
+ * possibly take.
  *
- *   feed:   normalised = runtime * rel_cap[collected_cpu]
- *   emit:   runtime_for_kernel = quantile / rel_cap[placement_cpu]
+ * The emit step (sched_cb in module-deadline.c) divides by the
+ * *target* relative_capacity of the placement CPU. Under
+ * cpus.dvfs-policy = conservative the target uses min_freq, so the
+ * kernel budget is inflated by approximately max_freq / min_freq --
+ * which is exactly the bandwidth a hypothetical governor-induced
+ * down-shift to min_freq would cost. Under assume-max the target
+ * equals the nominal and the two transforms collapse to identity.
  *
- * On a homogeneous host both factors are 1.0 and the kernel sees the
- * raw runtime back. On a heterogeneous host with collected_cpu slower
- * than placement_cpu, the kernel budget shrinks proportionally;
- * conversely the budget grows when placing on a slower CPU than the
- * one the sample came from. */
-PWTEST(wcet_normalize_roundtrip_homogeneous)
+ *   feed:   normalised      = runtime * nominal_rel[sample_cpu]
+ *   emit:   runtime_kernel  = quantile / target_rel[placement_cpu]
+ */
+PWTEST(wcet_normalize_roundtrip_homogeneous_assume_max)
 {
-	const double rel_cap = 1.0;
+	/* Under assume-max policy on a host where target == nominal,
+	 * the round-trip is identity. */
+	const double rel_cap_nominal = 1.0;
+	const double rel_cap_target  = 1.0;
 	const uint64_t raw_runtime = 1234567;
 	wcet_sketch_t s;
 
 	pwtest_int_eq(wcet_sketch_init(&s, 512, 100.0, 0.999), 0);
 	for (int i = 0; i < 5000; i++)
-		wcet_sketch_add(&s, (double)raw_runtime * rel_cap);
+		wcet_sketch_add(&s, (double)raw_runtime * rel_cap_nominal);
 
 	double q = wcet_sketch_quantile(&s);
 	pwtest_double_eq(q, (double)raw_runtime);
 
-	uint64_t runtime_kernel = (uint64_t)(q / rel_cap);
+	uint64_t runtime_kernel = (uint64_t)(q / rel_cap_target);
 	pwtest_int_eq((int)runtime_kernel, (int)raw_runtime);
+
+	wcet_sketch_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(wcet_normalize_roundtrip_homogeneous_conservative)
+{
+	/* On a host with min_freq = 2.2 GHz and max_freq = 3.8 GHz
+	 * (the dev host's cpuinfo range), nominal = 1.0 and target =
+	 * 2.2 / 3.8 ~ 0.579. A 100 us sample lands in the sketch at
+	 * 100 us (multiplied by nominal=1.0) and is shipped to the
+	 * kernel as 100 us / 0.579 ~ 172.7 us -- 1.73 x larger than
+	 * the raw measurement, which is exactly the conservative
+	 * inflation needed to keep the budget feasible if the
+	 * governor parks the CPU all the way down to min_freq. */
+	const double rel_cap_nominal = 1.0;
+	const double rel_cap_target  = 2200000.0 / 3800000.0;
+	const uint64_t raw_runtime = 100000;
+	wcet_sketch_t s;
+
+	pwtest_int_eq(wcet_sketch_init(&s, 512, 100.0, 0.999), 0);
+	for (int i = 0; i < 5000; i++)
+		wcet_sketch_add(&s, (double)raw_runtime * rel_cap_nominal);
+
+	double q = wcet_sketch_quantile(&s);
+	pwtest_double_eq(q, (double)raw_runtime);
+
+	double runtime_kernel = q / rel_cap_target;
+	double expected = (double)raw_runtime * (3800000.0 / 2200000.0);
+	pwtest_double_eq(runtime_kernel, expected);
 
 	wcet_sketch_fini(&s);
 	return PWTEST_PASS;
@@ -515,26 +552,29 @@ PWTEST(wcet_normalize_roundtrip_homogeneous)
 
 PWTEST(wcet_normalize_roundtrip_heterogeneous)
 {
-	/* Samples collected on a 0.5-capacity CPU show up in the sketch
-	 * at half the wall-clock duration (reference-CPU equivalent).
-	 * Placing the result on a 1.0-capacity CPU divides by 1.0, so
-	 * the budget is half the raw measurement. Conversely, placing on
-	 * the same 0.5-capacity CPU as the one the sample came from
-	 * divides by 0.5 and recovers the original wall-clock duration
-	 * (identity within the round-trip). */
-	const double rel_cap_collected = 0.5;
+	/* Two-class capacity host where the slow class is at half the
+	 * nominal of the fast class (e.g. P-core / E-core asymmetry
+	 * with the same nominal max_freq but half the raw_capacity).
+	 * Samples collected on the slow CPU land in the sketch at half
+	 * the wall-clock time (rel_nominal_slow = 0.5). Under the
+	 * assume-max policy on a host where each CPU's
+	 * target == nominal, placing the result back on the slow CPU
+	 * recovers the raw runtime exactly. */
+	const double rel_nominal_slow = 0.5;
+	const double rel_target_fast  = 1.0;
+	const double rel_target_slow  = 0.5;
 	const uint64_t raw_runtime = 1000000;
 	wcet_sketch_t s;
 
 	pwtest_int_eq(wcet_sketch_init(&s, 512, 100.0, 0.999), 0);
 	for (int i = 0; i < 5000; i++)
-		wcet_sketch_add(&s, (double)raw_runtime * rel_cap_collected);
+		wcet_sketch_add(&s, (double)raw_runtime * rel_nominal_slow);
 
 	double q = wcet_sketch_quantile(&s);
 	pwtest_double_eq(q, 500000.0);
 
-	uint64_t runtime_fast_cpu = (uint64_t)(q / 1.0);
-	uint64_t runtime_same_cpu = (uint64_t)(q / rel_cap_collected);
+	uint64_t runtime_fast_cpu = (uint64_t)(q / rel_target_fast);
+	uint64_t runtime_same_cpu = (uint64_t)(q / rel_target_slow);
 	pwtest_int_eq((int)runtime_fast_cpu, 500000);
 	pwtest_int_eq((int)runtime_same_cpu, (int)raw_runtime);
 
@@ -566,7 +606,8 @@ PWTEST_SUITE(module_deadline_wcet_sketch)
 	pwtest_add(sketch_reset_clears_both_digests, PWTEST_NOARG);
 	pwtest_add(sketch_tracks_tail_beyond_median, PWTEST_NOARG);
 
-	pwtest_add(wcet_normalize_roundtrip_homogeneous, PWTEST_NOARG);
+	pwtest_add(wcet_normalize_roundtrip_homogeneous_assume_max, PWTEST_NOARG);
+	pwtest_add(wcet_normalize_roundtrip_homogeneous_conservative, PWTEST_NOARG);
 	pwtest_add(wcet_normalize_roundtrip_heterogeneous, PWTEST_NOARG);
 
 	return PWTEST_PASS;

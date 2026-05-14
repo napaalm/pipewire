@@ -419,14 +419,23 @@ static const struct spa_dict_item module_props[] = {
  * sketch, so the digest always holds WCETs "as if measured on the
  * fastest CPU". SAMPLE_CPU_UNKNOWN means the follower has not yet
  * been placed (e.g. very first cycle after registration) and the
- * worker treats the sample as already reference-CPU normalised. The
- * RT thread writes; the worker reads. */
+ * worker treats the sample as already reference-CPU normalised.
+ *
+ * cycles is the perf_event_open(CPU_CYCLES) delta the executor
+ * captured around the node's process() call (impl-node.c writes it
+ * into pw_node_activation::prev_run_cycles). Zero means the kernel
+ * refused perf_event_open (paranoid > 1 typically) so we fall back
+ * on the wall-clock path that conservatively assumes the sample was
+ * collected at max_freq.
+ *
+ * The RT thread writes; the worker reads. */
 #define SAMPLE_CPU_UNKNOWN UINT32_MAX
 
 struct sample {
 	uint32_t node_id;
 	uint32_t cpu;
 	uint64_t runtime_ns;
+	uint64_t cycles;
 	uint64_t period_ns;
 };
 
@@ -570,10 +579,22 @@ struct impl {
 	int cpus[MAX_CPUS];
 	float cpu_utilization;
 	/* Per-CPU relative_capacity vector aligned with cpus[],
-	 * derived from cpu_topology at module init. reconcile_init
-	 * forwards a NULL here as the homogeneous (all-1.0) identity;
-	 * a non-NULL vector is passed through to dag_create. */
+	 * derived from cpu_topology at module init. The "target"
+	 * vector reflects the dvfs policy (min_freq under
+	 * conservative, max_freq under assume-max) and is what
+	 * reconcile_init forwards to dag_create -- it is both the
+	 * admission ceiling the placer compares per-CPU load against
+	 * and the divisor sched_cb applies before sched_setattr.
+	 * NULL is the homogeneous (all-1.0) identity. The "nominal"
+	 * vector is always max-freq based; the sketch-insert path
+	 * uses it to normalise samples as if they had been collected
+	 * at max_freq, which is the smallest wall-clock time the
+	 * same work could possibly take and therefore the
+	 * conservative upper bound on the sample's true cycle
+	 * count. The two vectors agree under the assume-max policy
+	 * and diverge under conservative, where target < nominal. */
 	double *relative_capacity;
+	double *relative_capacity_nominal;
 	/* The probed (or JSON-overridden) topology. Kept alive for the
 	 * lifetime of the module so the per-CPU diagnostic fields are
 	 * available for logging at any point. */
@@ -709,6 +730,7 @@ static void module_destroy(void *data)
 
 	free(impl->nodes_by_id);
 	free(impl->relative_capacity);
+	free(impl->relative_capacity_nominal);
 	cpu_topology_destroy(&impl->topology);
 	sched_groups_fini(&impl->sched_groups);
 	free(impl);
@@ -1144,24 +1166,76 @@ static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_
 	return runtime;
 }
 
-/* Normalise a raw runtime sample collected on `sample_cpu` into
- * reference-CPU units so the sketch always holds "WCET as if measured
- * on the fastest CPU". Multiplying by relative_capacity[sample_cpu]
- * shrinks slow-CPU samples toward what they would have been on the
- * reference; the emit step (sched_cb) does the inverse divide before
- * sched_setattr. Identity on homogeneous hardware (every entry == 1.0
- * collapses both operations). Returns the raw value untouched when
- * the topology vector is absent or sample_cpu is out of range / not
- * yet known. */
+/* Convert a CPU-cycle delta collected on `sample_cpu` into a
+ * frequency-invariant reference-CPU runtime in nanoseconds. The work
+ * done by `cycles` cycles on CPU `sample_cpu` is
+ *
+ *     work = cycles * raw_capacity[sample_cpu]
+ *
+ * (raw_capacity captures the CPU's relative IPC per cycle; the same
+ * count of cycles on an E-core does less work than on a P-core). The
+ * reference CPU at its peak nominal throughput would execute that
+ * work in
+ *
+ *     ref_ns = work * 1e9 / (raw_capacity[ref] * max_freq_hz[ref])
+ *
+ * On a uniform host that collapses to cycles / max_freq[ref]. Returns
+ * a positive double on success, 0.0 when cycles is 0 or any required
+ * topology field is missing (the caller then falls back on the
+ * wall-clock path). */
+static inline double wcet_cycles_to_reference_ns(struct impl *impl,
+		uint64_t cycles, uint32_t sample_cpu)
+{
+	if (cycles == 0 || impl == NULL || impl->topology.num_cpus == 0)
+		return 0.0;
+	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
+			sample_cpu >= impl->topology.num_cpus)
+		return 0.0;
+
+	uint32_t ref_idx = impl->topology.reference_cpu_index;
+	if (ref_idx >= impl->topology.num_cpus)
+		return 0.0;
+
+	const struct cpu_info *src = &impl->topology.cpus[sample_cpu];
+	const struct cpu_info *ref = &impl->topology.cpus[ref_idx];
+	if (ref->raw_capacity == 0 || ref->max_freq_khz == 0)
+		return 0.0;
+
+	double work = (double)cycles * (double)src->raw_capacity;
+	double ref_throughput =
+		(double)ref->raw_capacity * (double)ref->max_freq_khz * 1000.0;
+	if (!(ref_throughput > 0.0))
+		return 0.0;
+	return work * 1.0e9 / ref_throughput;
+}
+
+/* Wall-clock fallback when cycles are unavailable. We do not know the
+ * cpufreq state at the moment of measurement (a per-sample sysfs read
+ * is not RT-safe), so the conservative assumption is that the sample
+ * was collected at the CPU's max_freq -- i.e. the smallest wall-clock
+ * time the same workload could possibly take. The denormalisation in
+ * sched_cb then divides by relative_capacity[placement_cpu], which is
+ * the *target* capacity (min_freq under conservative policy). The
+ * resulting kernel budget is inflated by approximately
+ * max_freq / freq_for_policy: on a host where the governor parks
+ * CPUs anywhere down to min_freq, the budget remains feasible even
+ * without per-cycle frequency information.
+ *
+ * Identity (no scaling) on homogeneous hardware *only* when
+ * max_freq == freq_for_policy, e.g. under cpus.dvfs-policy =
+ * assume-max or on a host where cpuinfo_max_freq == cpuinfo_min_freq.
+ *
+ * Falls back to the raw runtime when relative_capacity_nominal is
+ * absent or sample_cpu is out of range / not yet known. */
 static inline double wcet_sample_to_reference(struct impl *impl,
 		uint64_t runtime, uint32_t sample_cpu)
 {
-	if (impl->relative_capacity == NULL)
+	if (impl->relative_capacity_nominal == NULL)
 		return (double)runtime;
 	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
 			sample_cpu >= (uint32_t)impl->n_cpus)
 		return (double)runtime;
-	double rc = impl->relative_capacity[sample_cpu];
+	double rc = impl->relative_capacity_nominal[sample_cpu];
 	if (!(rc > 0.0))
 		return (double)runtime;
 	return (double)runtime * rc;
@@ -1169,11 +1243,23 @@ static inline double wcet_sample_to_reference(struct impl *impl,
 
 /* Apply one sample to a follower's estimator. Worker-thread or RT-
  * thread (in sync mode); never both for a given node. sample_cpu is
- * the placement CPU the follower ran on (used to normalise the
- * sample into reference-CPU units before insertion); pass
- * SAMPLE_CPU_UNKNOWN to skip the normalisation. */
+ * the placement CPU the follower ran on; cycles is the
+ * PERF_COUNT_HW_CPU_CYCLES delta the executor (impl-node.c) captured
+ * around the node's process() call. When cycles > 0 the sketch holds
+ * a frequency-invariant "ns at reference CPU peak throughput" value
+ * derived directly from the cycle count, which removes the
+ * assume-max wall-clock conservatism. When cycles == 0 (perf
+ * unavailable: paranoid > 1, kernel too old, non-Linux) the worker
+ * falls back to the wall-clock path that assumes the sample was
+ * collected at max_freq.
+ *
+ * In both paths the sketch is reference-CPU-normalised, so the emit
+ * step in sched_cb divides uniformly by
+ * relative_capacity[placement_cpu] without caring how the sample
+ * got there. */
 static void apply_sample(struct impl *impl, struct node *n,
-		uint64_t runtime, uint32_t sample_cpu, uint64_t period)
+		uint64_t runtime, uint64_t cycles,
+		uint32_t sample_cpu, uint64_t period)
 {
 	if (!n->sketch_ready) {
 		if (wcet_sketch_init(&n->sketch,
@@ -1193,7 +1279,12 @@ static void apply_sample(struct impl *impl, struct node *n,
 		n->wcet = 0;
 	}
 
-	double sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
+	/* Prefer cycles when available: they are frequency-invariant
+	 * by construction and yield a precise reference-CPU WCET
+	 * without the assume-max inflation. */
+	double sample_ref = wcet_cycles_to_reference_ns(impl, cycles, sample_cpu);
+	if (sample_ref <= 0.0)
+		sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
 
 	if (runtime > 0 && n->sketch_ready)
 		wcet_sketch_add(&n->sketch, sample_ref);
@@ -1308,6 +1399,7 @@ static void recalc_params_sync(struct node *drv)
 				    tnode->info.id, runtime, period);
 
 		apply_sample(impl, n, runtime,
+				SPA_ATOMIC_LOAD(na->prev_run_cycles),
 				n->last_applied ? n->last_cpu : SAMPLE_CPU_UNKNOWN,
 				period);
 
@@ -1449,6 +1541,7 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 		s->cpu = (n_lookup != NULL && n_lookup->last_applied) ?
 				n_lookup->last_cpu : SAMPLE_CPU_UNKNOWN;
 		s->runtime_ns = runtime;
+		s->cycles = SPA_ATOMIC_LOAD(t->activation->prev_run_cycles);
 		s->period_ns = period;
 		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
 	}
@@ -1490,7 +1583,8 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 			}
 		}
 		if (n)
-			apply_sample(impl, n, s->runtime_ns, s->cpu, s->period_ns);
+			apply_sample(impl, n, s->runtime_ns, s->cycles,
+					s->cpu, s->period_ns);
 
 		processed += sizeof(struct sample);
 	}
@@ -2076,15 +2170,25 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 	impl->n_cpus = (int)impl->topology.num_cpus;
 
 	free(impl->relative_capacity);
+	free(impl->relative_capacity_nominal);
 	impl->relative_capacity = calloc(impl->topology.num_cpus,
 			sizeof(*impl->relative_capacity));
-	if (!impl->relative_capacity) {
+	impl->relative_capacity_nominal = calloc(impl->topology.num_cpus,
+			sizeof(*impl->relative_capacity_nominal));
+	if (!impl->relative_capacity || !impl->relative_capacity_nominal) {
+		free(impl->relative_capacity);
+		free(impl->relative_capacity_nominal);
+		impl->relative_capacity = NULL;
+		impl->relative_capacity_nominal = NULL;
 		cpu_topology_destroy(&impl->topology);
 		return -1;
 	}
-	for (i = 0; i < impl->topology.num_cpus; i++)
+	for (i = 0; i < impl->topology.num_cpus; i++) {
 		impl->relative_capacity[i] =
 			impl->topology.cpus[i].relative_capacity;
+		impl->relative_capacity_nominal[i] =
+			impl->topology.cpus[i].relative_capacity_nominal;
+	}
 
 	pw_log_info("cpu-topology: smt-policy=%s dvfs-policy=%s num_cpus=%u",
 			impl->smt_policy == CPU_SMT_STRICT ? "strict" :
@@ -2097,10 +2201,11 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 		pw_log_info("cpu-topology: cpu%u core=%u island=%u "
 				"raw_cap=%" PRIu64 " min_freq_khz=%" PRIu64
 				" max_freq_khz=%" PRIu64
-				" relative_capacity=%.3f",
+				" relative_capacity=%.3f nominal=%.3f",
 				ci->cpu_id, ci->core_id, ci->island_id,
 				ci->raw_capacity, ci->min_freq_khz,
-				ci->max_freq_khz, ci->relative_capacity);
+				ci->max_freq_khz, ci->relative_capacity,
+				ci->relative_capacity_nominal);
 	}
 	return 0;
 }
