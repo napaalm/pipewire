@@ -408,6 +408,42 @@ PWTEST(reconcile_rec_11_soft_failure_recovery)
 	return PWTEST_PASS;
 }
 
+/* Late-schedulable recovery without a topology bump. A follower that
+ * was zero-wcet on the first reconcile after it appeared (typical for
+ * pw_stream-based shim clients: paplay, aplay, ...) gets included in
+ * the DAG as soon as its sketch produces a non-zero budget, even
+ * though the structural fingerprint (id + tid + edges) is unchanged.
+ * Without this behaviour, the persistent-DAG fast path would freeze
+ * such followers out of scheduling forever. */
+PWTEST(reconcile_rec_11b_late_schedulable_no_gen_bump)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb1 = { 0 };
+	struct cb_ctx cb2 = { 0 };
+	reconcile_topo_t rt1, rt2;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	t.followers[2].wcet = 0;
+	rt1 = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt1, cb_record, &cb1), 0);
+	pwtest_int_eq((int)cb1.calls, 4);
+
+	/* WCET recovers, but generation is the SAME. The sketch warm-up
+	 * does not bump the structural fingerprint, so the topology
+	 * snapshot would otherwise hand the worker an unchanged
+	 * generation. The reconcile layer must still re-include the
+	 * newly schedulable follower. */
+	t.followers[2].wcet = 10000;
+	rt2 = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt2, cb_record, &cb2), 0);
+	pwtest_int_eq((int)cb2.calls, 5);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 /* Feedback edge filtering happens at the caller (module
  * layer); the reconcile layer simply consumes the filtered topology.
  * Here we test that a topology missing a "would-be" edge still
@@ -1182,6 +1218,7 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_rec_9_period_change, PWTEST_NOARG);
 	pwtest_add(reconcile_rec_10_soft_failure_excludes, PWTEST_NOARG);
 	pwtest_add(reconcile_rec_11_soft_failure_recovery, PWTEST_NOARG);
+	pwtest_add(reconcile_rec_11b_late_schedulable_no_gen_bump, PWTEST_NOARG);
 	pwtest_add(reconcile_rec_12_feedback_pre_filtered, PWTEST_NOARG);
 	pwtest_add(reconcile_rec_13_library_failure_drops_dag, PWTEST_NOARG);
 	pwtest_add(reconcile_rec_14_threshold_zero_always_triggers, PWTEST_NOARG);
