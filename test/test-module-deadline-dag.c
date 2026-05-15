@@ -2657,6 +2657,271 @@ PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
 	return PWTEST_PASS;
 }
 
+/* -------------------------------------------------------------------
+ * Merged/fused-group collapse in the antichain enumeration.
+ *
+ * Nodes that share a non-zero dag_node::group_id (stamped by the
+ * reconcile layer when libpipewire's chain-merge or subgraph-fusion
+ * has put them on the same data-loop thread) are co-located on the
+ * same CPU and execute sequentially. Treating each group as a single
+ * virtual node in dag_comp_unrelated:
+ *
+ *   - shrinks the branch-and-bound search space from |real nodes| to
+ *     |groups| -- the run-time win the optimisation targets;
+ *   - emits antichains whose bitsets contain every member of every
+ *     chosen group, so assign_cpus still accounts for the full
+ *     per-CPU load contribution of the group (sum across members,
+ *     which matches the actual single-thread utilisation model).
+ *
+ * The tests below verify both effects on small, hand-traceable
+ * graphs. They also document the equivalence with the pre-collapse
+ * behaviour on ungrouped (singleton) graphs.
+ * ------------------------------------------------------------------- */
+
+PWTEST(unrelated_collapse_chain_pair_with_independent_node)
+{
+	/* 1 -> 2 chain plus an independent node 3. With no grouping
+	 * the enumeration emits two maximal antichains: {1, 3} and
+	 * {2, 3}. Stamping {1, 2} as one co-location group collapses
+	 * the pair into a single virtual node, leaving a single
+	 * antichain whose bitset still contains all three real
+	 * indices. CPU placement and node deadlines are independent
+	 * of the change; both baselines must continue to admit. */
+	static const uint32_t all_ids[] = { 1, 2, 3 };
+	static const uint32_t pair_13[] = { 1, 3 };
+	static const uint32_t pair_23[] = { 2, 3 };
+
+	dag_t *g_base = dag_create(100, 100, 0.90f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+
+	pwtest_int_eq((int)g_base->unrelated_size, 2);
+	pwtest_bool_true(dag_has_unrelated_subset(g_base, pair_13, 2));
+	pwtest_bool_true(dag_has_unrelated_subset(g_base, pair_23, 2));
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.90f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 42), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 3));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 3);
+	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_two_chains_to_single_antichain)
+{
+	/* Two independent 2-node chains: 1 -> 3 and 2 -> 4. Without
+	 * grouping the enumeration finds four maximal antichains:
+	 * {1,2}, {1,4}, {3,2}, {3,4}. Stamping each chain as its own
+	 * group collapses the search to two virtual nodes that are
+	 * mutually unrelated, leaving exactly one antichain whose
+	 * bitset is the union of both groups' members. The total
+	 * relative deadline budget is unchanged (4 real nodes), so a
+	 * 0.50 ceiling still admits with one CPU. */
+	static const uint32_t all_ids[] = { 1, 2, 3, 4 };
+
+	dag_t *g_base = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 5, 103), 0);
+	pwtest_int_eq(add_real_node(g_base, 4, 5, 104), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 2, 4), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+	pwtest_int_eq((int)g_base->unrelated_size, 4);
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 5, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 10), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 10), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 20), 0);
+	pwtest_int_eq(dag_set_node_group(g, 4, 20), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 4));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 4);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_chain_three_nodes_one_group)
+{
+	/* A 3-node chain 1 -> 2 -> 3 has three maximal real-node
+	 * antichains in the baseline ({1}, {2}, {3} -- each cut is
+	 * maximal because every other node is a successor or
+	 * predecessor). Stamping all three with the same group_id
+	 * collapses the enumeration to a single antichain whose
+	 * bitset is the union of all members; this is the case
+	 * where expansion adds bits that the rep-only bitset would
+	 * have missed. The placement is unchanged (every node ends
+	 * up on the same CPU either way). */
+	static const uint32_t all_ids[] = { 1, 2, 3 };
+
+	dag_t *g_base = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g_base);
+	pwtest_int_eq(add_real_node(g_base, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g_base, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g_base, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g_base, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g_base), 0);
+	pwtest_int_eq((int)g_base->unrelated_size, 3);
+	dag_destroy(g_base);
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 9), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 9), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 1);
+	pwtest_bool_true(dag_has_unrelated_subset(g, all_ids, 3));
+	pwtest_int_eq((int)bitset_population(g->unrelated[0], g->indexed_count), 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_group_relation_via_non_rep_member)
+{
+	/* A group's relation to a third node depends on whether
+	 * ANY member is reachable from / reaches the third node,
+	 * not just the representative. Picking the rep alone (the
+	 * lowest-index member, here node 1) would miss the case
+	 * where a non-rep member is the related one.
+	 *
+	 * Graph: node 1 is isolated; 2 -> 3. Group {1, 3} stamped
+	 * with the same group_id; node 2 ungrouped. The rep of the
+	 * group is node 1 (lowest index in topo order); node 1 is
+	 * unrelated to node 2, but the non-rep member node 3 IS
+	 * reachable from node 2. The group-level check must report
+	 * RELATED -- otherwise the enumeration would put the group
+	 * and node 2 in one antichain, which would be wrong because
+	 * the actual execution chain 2 -> 3 is preserved at the
+	 * node level. */
+	static const uint32_t group_only[] = { 1, 3 };
+	static const uint32_t solo[] = { 2 };
+
+	dag_t *g = dag_create(100, 100, 0.50f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 42), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 2);
+	pwtest_bool_true(dag_has_unrelated_subset(g, group_only, 2));
+	pwtest_bool_true(dag_has_unrelated_subset(g, solo, 1));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_mixed_grouped_and_ungrouped)
+{
+	/* A 2-node grouped chain plus a single ungrouped neighbour.
+	 * The group must collapse to one rep; the ungrouped node
+	 * stays its own singleton; the resulting CPU placement is the
+	 * same as the grouped-only case where ordinary worst-fit
+	 * picks the emptier CPU for the ungrouped node. The
+	 * antichain count drops from two (pre-collapse: {1,3} and
+	 * {2,3}) to one (post-collapse: {1,2,3}). */
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 5), 0);
+	/* node 3 stays ungrouped (group_id = 0) */
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
+	pwtest_bool_true(a->cpu != c->cpu);
+
+	pwtest_int_eq((int)g->unrelated_size, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(unrelated_collapse_no_groups_matches_baseline)
+{
+	/* A graph with no group_id stamps must continue to produce
+	 * its pre-collapse antichains under the new code path (where
+	 * every real node becomes its own singleton dense group --
+	 * the rep equals the sole member, group_node_succ equals
+	 * node->successors, and expansion is a no-op). The diamond
+	 * 1 -> {2, 3} -> 4 has three maximal real-node antichains
+	 * ({1} alone, {2,3} together, {4} alone); the fork-mid
+	 * antichain {2, 3} must still be present, and its bitset
+	 * must contain exactly two bits. */
+	static const uint32_t mids[] = { 2, 3 };
+
+	dag_t *g = dag_create(100, 100, 0.90f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 10, 104), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)g->unrelated_size, 3);
+	pwtest_bool_true(dag_has_unrelated_subset(g, mids, 2));
+	pwtest_int_eq((int)dag_max_unrelated_size(g), 2);
+	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
@@ -2739,6 +3004,13 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(hetero_high_density_picks_faster_cpu, PWTEST_NOARG);
 	pwtest_add(hetero_admission_rejects_workload_that_only_fits_at_full_capacity, PWTEST_NOARG);
 	pwtest_add(hetero_feasibility_scaled_by_slowest_cpu, PWTEST_NOARG);
+
+	pwtest_add(unrelated_collapse_chain_pair_with_independent_node, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_two_chains_to_single_antichain, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_chain_three_nodes_one_group, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_group_relation_via_non_rep_member, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_mixed_grouped_and_ungrouped, PWTEST_NOARG);
+	pwtest_add(unrelated_collapse_no_groups_matches_baseline, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
