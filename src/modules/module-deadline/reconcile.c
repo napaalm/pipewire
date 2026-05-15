@@ -318,9 +318,31 @@ static int reconcile_apply_persistent(reconcile_state_t *state,
 	uint32_t i;
 	bool topology_changed = topo->generation != state->topo_gen_applied;
 	bool period_changed = topo->period != state->dag_period;
+	bool late_schedulable = false;
+
+	/* The topology generation is structural-only (id+tid+edges) so
+	 * a follower whose wcet was 0 at the first reconcile after it
+	 * appeared (a fresh shim stream typically reports 0 for one or
+	 * two cycles before the driver stamps its first prev_run_time)
+	 * stays out of the DAG forever even after its sketch produces
+	 * a meaningful budget. Detect that transition explicitly: any
+	 * follower that is now schedulable but is missing from the
+	 * persistent DAG forces a rebuild on this pass, exactly as a
+	 * structural change would. */
+	if (state->dag != NULL && !period_changed && !topology_changed) {
+		for (i = 0; i < topo->n_followers; i++) {
+			const reconcile_follower_t *f = &topo->followers[i];
+			if (!follower_schedulable(f))
+				continue;
+			if (dag_find_node(state->dag, f->id) == NULL) {
+				late_schedulable = true;
+				break;
+			}
+		}
+	}
 
 	/* Cold start, period change, or post-failure rebuild. */
-	if (state->dag == NULL || period_changed || topology_changed) {
+	if (state->dag == NULL || period_changed || topology_changed || late_schedulable) {
 		if (state->dag) {
 			dag_destroy(state->dag);
 			state->dag = NULL;
