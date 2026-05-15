@@ -1736,7 +1736,16 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 		goto error_clean;
 	}
 
-	if (this->data_loop != context->main_loop) {
+	if (this->data_loop != context->main_loop && !this->remote) {
+		/* Run do_gettid synchronously on the data loop so the
+		 * resulting PW_KEY_NODE_LOOP_TID is the TID of the thread
+		 * that will actually run the node's process callback. For
+		 * remote nodes (the daemon's view of a client-node proxy)
+		 * the callback runs in the client process, not here, so
+		 * publishing the daemon-side data-loop TID would mislead
+		 * downstream consumers; the client publishes its own TID
+		 * via the same property and the value propagates back
+		 * through the client-node info update path. */
 		pw_loop_invoke(this->data_loop,
 				do_gettid, SPA_ID_INVALID, NULL, 0, true, properties);
 	} else {
@@ -2033,9 +2042,15 @@ int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_lo
 	 *    this always re-adds. */
 	pw_loop_invoke(new_loop, do_node_prepare, 1, NULL, 0, true, node);
 
-	/* 7. refresh the published TID. */
-	pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
-			node->properties);
+	/* 7. refresh the published TID. Skip for remote nodes -- the
+	 *    relocation primitive is only ever called on locally owned
+	 *    nodes (fusion_node_eligible excludes remote) so this guard
+	 *    is defensive, but it keeps the invariant from the create
+	 *    path: PW_KEY_NODE_LOOP_TID names the thread that runs the
+	 *    process callback, which for remote nodes lives elsewhere. */
+	if (!node->remote)
+		pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
+				node->properties);
 	pw_impl_node_emit_info_changed(node, &node->info);
 
 	pw_log_info("%p: relocation complete, new loop:'%s' new tid:%s",

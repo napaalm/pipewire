@@ -1046,9 +1046,21 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
 	const char *name, *klass, *group;
 	struct pw_data_loop *loop;
-	bool request_dynamic = props ? pw_properties_get_bool(props, PW_KEY_NODE_LOOP_DYNAMIC, false) : false;
 
-	if (!impl->dynamic_data_loops || (remote && !request_dynamic))
+	/* Dynamic data loops are only meaningful for nodes whose
+	 * processing thread the *current* process owns end-to-end.
+	 * Remote nodes (the server's view of a client-node proxy)
+	 * never run user code on the data loop -- the eventfd
+	 * dispatcher is all that lives there -- so giving each
+	 * proxy its own thread costs a pthread per connected stream
+	 * for no scheduling benefit and quickly hits the kernel's
+	 * per-process resource limits under load (pipewire-pulse,
+	 * pipewire-alsa and pipewire-jack each opening one
+	 * client-node per stream). The owning process's pw_impl_node
+	 * still gets its own dynamic loop and publishes its TID via
+	 * PW_KEY_NODE_LOOP_TID, which propagates to the proxy
+	 * properties and is what downstream consumers use. */
+	if (!impl->dynamic_data_loops || remote)
 		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
 
 	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
