@@ -1144,6 +1144,294 @@ PWTEST(cpu_placement_equal_density_lowest_cpu)
 	return PWTEST_PASS;
 }
 
+/* CP-aware placement order: assign_cpus sorts candidates by
+ * downstream critical-path priority (longest_len, equivalent to
+ * HEFT's upward rank rank_u with zero communication cost --
+ * Topcuoglu et al. 2002, papers/Topcuoglu-HEFT-TPDS2002.pdf, eq.
+ * 8). Density is the secondary key; topological index is the
+ * final tie-breaker.
+ *
+ * Regression test: a 4-node chain (A->B->C->D, all WCET=1, chain
+ * CP=4 ns, chain density 0.04) plus one independent node E
+ * (WCET=3, CP=3, density 0.03) lays the chain on a single CPU
+ * (the unrelated-set sums never accumulate across related chain
+ * nodes, so cpu_peak does not grow past the chain density) and
+ * sends the independent node to the next free CPU. The CP-aware
+ * ordering visits B (CP=3, density 0.04) before E (CP=3, density
+ * 0.03 -- density loses the tie-break); the density-only ordering
+ * visits B (idx 1, density 0.04) before E (idx 4, density 0.03)
+ * via the index tie-break. Either order produces the same final
+ * placement because related chain nodes do not bump cpu_peak.
+ *
+ * This test pins the placement so that any future change to the
+ * worst-fit's interaction with CP priority is caught. */
+PWTEST(cp_aware_chain_plus_independent_placement)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 5, NULL);
+	dag_node_t *a, *b, *c, *d, *e;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(add_real_node(g, 5, 3, 105), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	d = find_node_by_id(g, 4);
+	e = find_node_by_id(g, 5);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(d);
+	pwtest_ptr_notnull(e);
+
+	/* Chain piles onto CPU 0; the independent node goes to CPU 1. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 0);
+	pwtest_int_eq((int)c->cpu, 0);
+	pwtest_int_eq((int)d->cpu, 0);
+	pwtest_int_eq((int)e->cpu, 1);
+
+	/* CP priorities (longest_len) must reflect the chain
+	 * structure: A is the head of the longest path (CP=4), and
+	 * each step downstream loses one WCET unit. E is its own
+	 * source-to-sink, CP equal to its WCET. */
+	pwtest_int_eq((int)a->longest_len, 4);
+	pwtest_int_eq((int)b->longest_len, 3);
+	pwtest_int_eq((int)c->longest_len, 2);
+	pwtest_int_eq((int)d->longest_len, 1);
+	pwtest_int_eq((int)e->longest_len, 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* CP-aware placement on two parallel chains of different lengths.
+ * The longer chain (A->B->C->D->E, density 0.05) and the shorter
+ * chain (F->G, density 0.02) are independent of each other. The
+ * chains pile onto separate CPUs (CPU 0 and CPU 1 respectively)
+ * because the unrelated-set sums for cross-chain pairs (e.g.,
+ * {A,F}, {B,F}, ..., {E,F}) push F off CPU 0 to the empty CPU 1.
+ * The internal chain order (CP priorities A=5, B=4, C=3, D=2,
+ * E=1 for the long chain; F=2, G=1 for the short one) is
+ * exercised by the deadline-splitting pass; this test pins the
+ * placement and the CP values to lock the analysis in. */
+PWTEST(cp_aware_two_chains_placement)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 7, NULL);
+	dag_node_t *a, *b, *c, *d, *e, *f, *gn;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(add_real_node(g, 4, 1, 104), 0);
+	pwtest_int_eq(add_real_node(g, 5, 1, 105), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 4, 5), 0);
+	pwtest_int_eq(add_real_node(g, 6, 1, 106), 0);
+	pwtest_int_eq(add_real_node(g, 7, 1, 107), 0);
+	pwtest_int_eq(dag_add_edge(g, 6, 7), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a  = find_node_by_id(g, 1);
+	b  = find_node_by_id(g, 2);
+	c  = find_node_by_id(g, 3);
+	d  = find_node_by_id(g, 4);
+	e  = find_node_by_id(g, 5);
+	f  = find_node_by_id(g, 6);
+	gn = find_node_by_id(g, 7);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_ptr_notnull(d);
+	pwtest_ptr_notnull(e);
+	pwtest_ptr_notnull(f);
+	pwtest_ptr_notnull(gn);
+
+	/* Chain 1 lives on CPU 0; chain 2 lives on CPU 1. */
+	pwtest_int_eq((int)a->cpu,  0);
+	pwtest_int_eq((int)b->cpu,  0);
+	pwtest_int_eq((int)c->cpu,  0);
+	pwtest_int_eq((int)d->cpu,  0);
+	pwtest_int_eq((int)e->cpu,  0);
+	pwtest_int_eq((int)f->cpu,  1);
+	pwtest_int_eq((int)gn->cpu, 1);
+
+	pwtest_int_eq((int)a->longest_len, 5);
+	pwtest_int_eq((int)b->longest_len, 4);
+	pwtest_int_eq((int)c->longest_len, 3);
+	pwtest_int_eq((int)d->longest_len, 2);
+	pwtest_int_eq((int)e->longest_len, 1);
+	pwtest_int_eq((int)f->longest_len, 2);
+	pwtest_int_eq((int)gn->longest_len, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* When every node is independent (no edges), each node's
+ * critical-path priority collapses to its own WCET. The CP-aware
+ * order therefore coincides with WCET-descending order, which on
+ * an end-to-end deadline equal to the period also coincides with
+ * density-descending order. This regression test pins that
+ * coincidence so existing density-driven tests stay valid. */
+PWTEST(cp_aware_independent_set_matches_density_order)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 4, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 3, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Nodes truly identical by (CP, density) fall to the topological
+ * index tie-breaker; on the worst-fit pass with two empty CPUs the
+ * first identical node lands on CPU 0, the second on CPU 1, the
+ * third on whichever side is lighter -- here CPU 0. This is the
+ * same deterministic ordering that the pre-CP-aware code
+ * produced; the final tie-breaker is unchanged. */
+PWTEST(cp_aware_equal_cp_and_density_breaks_by_topological_index)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Co-location groups force every group member onto the same CPU
+ * as the first-visited member of the group, regardless of how the
+ * placement order interleaves the rest of the DAG. With CP-aware
+ * ordering the high-CP group member is visited first and pins the
+ * CPU; subsequent members still land on that pinned CPU. */
+PWTEST(cp_aware_group_keeps_co_location)
+{
+	dag_t *g = dag_create(100, 100, 0.50f, 2, NULL);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	/* Chain A->B (WCET 5, 5). CP(A)=10, CP(B)=5, density 0.10. */
+	pwtest_int_eq(add_real_node(g, 1, 5, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	/* Independent C (WCET 5). CP=5, density 0.05. */
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* A is visited first (CP=10) and picks CPU 0 (empty, lowest
+	 * tied). C (CP=5, density 0.05) ties with B (CP=5, density
+	 * 0.10) by CP; density tie-break visits B before C, but B is
+	 * forced to A's CPU by group 1. C then lands on CPU 1
+	 * (worst-fit picks the empty bin). */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 0);
+	pwtest_int_eq((int)c->cpu, 1);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Heterogeneous CPUs: relative_capacity scales how much room a
+ * CPU has, not the CP-priority of the candidates. The chain head
+ * is still visited first (it has the highest CP); the worst-fit
+ * inner loop then picks the CPU with the most remaining capacity
+ * after dividing the candidate's density by the per-CPU
+ * relative_capacity (i.e., a slower CPU at 0.5x looks twice as
+ * loaded as the same WCET on a 1.0x CPU). On two CPUs with
+ * capacities {1.0, 0.5} and three independent nodes, the densest
+ * candidate is placed on the faster CPU because it is the
+ * least-loaded option under relative utilisation. */
+PWTEST(cp_aware_hetero_capacity_picks_faster_cpu_first)
+{
+	double caps[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(100, 100, 0.50f, 2, caps);
+	dag_node_t *a, *b, *c;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 5, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 5, 103), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* A (CP=10, density 0.10) lands on CPU 0 (relative load
+	 * 0.10/1.0 = 0.10 vs 0.10/0.5 = 0.20 on CPU 1; CPU 0 is the
+	 * worst-fit winner on an empty bin too). B and C then tie at
+	 * CP=5 and density 0.05; index tie-break visits B first.
+	 * After A, CPU 0 carries 0.10 of relative load and CPU 1
+	 * carries 0; B's relative load is 0.05 on CPU 0 vs 0.10 on
+	 * CPU 1, so worst-fit picks CPU 1 (whichever has lower peak
+	 * after the candidate is added: CPU 1 ends at 0.10, CPU 0
+	 * would end at 0.15 -- CPU 1 wins). C then sees CPU 0 at
+	 * 0.10 (would become 0.15) and CPU 1 at 0.10 (would become
+	 * 0.20); CPU 0 wins, again by lower projected load. */
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 1);
+	pwtest_int_eq((int)c->cpu, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(feasibility_tight_critical_path)
 {
 	dag_t *g = dag_create(30, 30, 1.0f, 1, NULL);
@@ -2404,6 +2692,13 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
 	pwtest_add(cpu_placement_orders_by_descending_density, PWTEST_NOARG);
 	pwtest_add(cpu_placement_equal_density_lowest_cpu, PWTEST_NOARG);
+	pwtest_add(cp_aware_chain_plus_independent_placement, PWTEST_NOARG);
+	pwtest_add(cp_aware_two_chains_placement, PWTEST_NOARG);
+	pwtest_add(cp_aware_independent_set_matches_density_order, PWTEST_NOARG);
+	pwtest_add(cp_aware_equal_cp_and_density_breaks_by_topological_index,
+			PWTEST_NOARG);
+	pwtest_add(cp_aware_group_keeps_co_location, PWTEST_NOARG);
+	pwtest_add(cp_aware_hetero_capacity_picks_faster_cpu_first, PWTEST_NOARG);
 	pwtest_add(load_reject_non_finite_or_out_of_range, PWTEST_NOARG);
 	pwtest_add(load_ordinary_cap_admits, PWTEST_NOARG);
 	pwtest_add(load_near_bound_admits, PWTEST_NOARG);
