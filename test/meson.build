@@ -113,6 +113,23 @@ test('test-cpu-topology',
                link_with: pwtest_lib)
 )
 
+test('test-fusion-cost',
+    executable('test-fusion-cost',
+               'test-fusion-cost.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-fusion-graph',
+    executable('test-fusion-graph',
+               'test-fusion-graph.c',
+               '../src/pipewire/fusion-graph.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-client',
     executable('test-client',
                'test-client.c',
