@@ -1761,17 +1761,39 @@ struct cpu_assignment_info {
 	dag_node_t *node;
 	uint32_t index;
 	double util;
+	/* Critical-path priority: WCET of the longest weighted path from
+	 * this node to any sink, *inclusive* of the node's own WCET. This
+	 * is exactly the HEFT "upward rank" rank_u defined in Topcuoglu,
+	 * Hariri, Wu, "Performance-Effective and Low-Complexity Task
+	 * Scheduling for Heterogeneous Computing", IEEE TPDS 13(3):260-274,
+	 * 2002 (papers/Topcuoglu-HEFT-TPDS2002.pdf), eq. (8), specialised
+	 * to communication cost c_{i,j} = 0 -- our DAG models in-process
+	 * audio flows where edges carry no measured transfer cost. The
+	 * value is read straight from dag_node_t::longest_len, which
+	 * dag_populate_longest_paths has already computed as part of the
+	 * deadline-splitting pass; no extra pass is needed. */
+	uint64_t cp_priority;
 };
 
 /* qsort comparator for CPU-assignment-info entries. Primary key:
- * density (descending). Secondary key: topological index
- * (ascending) -- a deterministic, ordering-stable tie-breaker that
- * keeps the worst-fit placement reproducible across runs and across
- * compilers' qsort implementations (which are not stable in
- * general). */
-static int compare_density_desc(double a_density, uint32_t a_key,
-		double b_density, uint32_t b_key)
+ * critical-path priority (descending) -- nodes that constrain the
+ * longest source-to-sink path are placed first so the worst-fit
+ * loop commits to the tightest deadlines while bins are still
+ * empty. Secondary key: utilisation density (descending) -- among
+ * nodes whose downstream critical paths are equally long the denser
+ * one is harder to admit, so it takes precedence in the worst-fit
+ * scan. Final tie-break: topological index (ascending) -- a
+ * deterministic, ordering-stable tie-breaker that keeps the
+ * placement reproducible across runs and across compilers' qsort
+ * implementations (which are not stable in general). */
+static int compare_cp_priority_desc(uint64_t a_priority, double a_density,
+		uint32_t a_key, uint64_t b_priority, double b_density,
+		uint32_t b_key)
 {
+	if (a_priority < b_priority)
+		return 1;
+	if (a_priority > b_priority)
+		return -1;
 	if (a_density < b_density)
 		return 1;
 	if (a_density > b_density)
@@ -1788,9 +1810,12 @@ static int compare_cpu_assignment_info_desc(const void *a, const void *b)
 	const struct cpu_assignment_info *info_a = a;
 	const struct cpu_assignment_info *info_b = b;
 
-	/* Place denser tasks first. Equal-density nodes keep topological order. */
-	return compare_density_desc(info_a->util, info_a->index,
-			info_b->util, info_b->index);
+	/* Place critical-path-heavier tasks first; equal-priority nodes
+	 * fall back to density-descending; equal-density nodes keep
+	 * topological order. */
+	return compare_cp_priority_desc(
+			info_a->cp_priority, info_a->util, info_a->index,
+			info_b->cp_priority, info_b->util, info_b->index);
 }
 
 /* Per-candidate tie-break used by the worst-fit CPU loop in
@@ -1823,7 +1848,26 @@ static bool prefer_cpu_choice(double projected, uint32_t cpu,
  * pass over the antichain enumeration of the partial order); for
  * each CPU we maintain a per-unrelated-set running sum
  * (cpu_set_util[cpu * unrelated_size + s]), and admission checks
- * the worst case across all sets containing the candidate node. */
+ * the worst case across all sets containing the candidate node.
+ *
+ * Placement order. Candidates are sorted by *critical-path priority*
+ * descending: the longest weighted path from the candidate to any
+ * sink (its longest_len, i.e. HEFT's upward rank rank_u with zero
+ * communication cost -- Topcuoglu et al. 2002,
+ * papers/Topcuoglu-HEFT-TPDS2002.pdf, eq. 8 and step 3 of Fig. 2).
+ * The intuition is that nodes on the longest chain receive the
+ * tightest deadlines from the proportional split (see Saifullah et
+ * al. 2014, papers/Saifullah-ParallelRTDAGs-TPDS2014.pdf, for the
+ * decomposition rule we already use in assign_deadlines_iterative);
+ * placing them first lets the worst-fit search commit to those
+ * tight admissions while every CPU bin is still empty. Utilisation
+ * density (ratio between WCET and the binding-deadline budget) is
+ * the secondary key because among equal-CP nodes the denser one is
+ * harder to admit. This is the partitioned-fixed-priority allocation
+ * framework studied in Casini et al. 2018,
+ * papers/Casini-PartitionedFP-RTSS2018.pdf -- worst-fit/best-fit
+ * heuristics where the ordering of the input list dominates the
+ * resulting feasibility ratio. */
 static int assign_cpus(dag_t *g)
 {
 	uint32_t count = g->indexed_count;
@@ -1853,6 +1897,7 @@ static int assign_cpus(dag_t *g)
 			info[i].node = g->indexed_nodes[i];
 			info[i].index = g->indexed_nodes[i]->index;
 			info[i].util = 0.0;
+			info[i].cp_priority = 0;
 			continue;
 		}
 
@@ -1868,6 +1913,13 @@ static int assign_cpus(dag_t *g)
 		info[i].node = g->indexed_nodes[i];
 		info[i].index = g->indexed_nodes[i]->index;
 		info[i].util = ((double)g->indexed_nodes[i]->wcet) / denom;
+		/* longest_len is set by dag_populate_longest_paths, which
+		 * dag_recalculate has already called on this g (either via
+		 * dag_build_analysis for a fresh build, or directly on the
+		 * cached-analysis path before reaching assign_cpus). It is
+		 * inclusive of the node's own WCET and includes the best
+		 * downstream chain to a sink; that is the HEFT upward rank. */
+		info[i].cp_priority = g->indexed_nodes[i]->longest_len;
 	}
 
 	qsort(info, count, sizeof(*info), compare_cpu_assignment_info_desc);
