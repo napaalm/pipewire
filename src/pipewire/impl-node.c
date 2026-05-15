@@ -2066,6 +2066,44 @@ int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_lo
 	 *    invalidate the old fd. */
 	update_inbound_peers(node, new_system, new_fd);
 
+	/* 3b. Trigger forwarding (xrun-safety): between step 2 and
+	 *     step 3 the old fd is still observable by peers whose view
+	 *     update has not yet propagated, and any trigger they
+	 *     issued during that window left a non-zero eventfd counter
+	 *     on the now-unread old fd. Drain it once now (the source
+	 *     has been removed in step 2, so we are the only reader)
+	 *     and re-issue the same count on the new fd. This way every
+	 *     in-flight trigger lands on the new loop's eventfd; the
+	 *     subsequent do_node_prepare (step 6) consumes it as part
+	 *     of its routine read-once-to-clear, and no driver cycle is
+	 *     lost across the migration. The pre-existing "lost
+	 *     triggers" window from this function's original
+	 *     implementation is therefore closed -- which was the
+	 *     observable cause of xruns during chain consolidation. */
+	{
+		uint64_t pending = 0;
+		int rr = spa_system_eventfd_read(old_system, old_fd, &pending);
+		if (rr == 0 && pending > 0) {
+			int wr = spa_system_eventfd_write(new_system, new_fd,
+					pending);
+			if (wr < 0)
+				pw_log_warn("%p: migration trigger forward "
+						"failed (count=%"PRIu64"): %s",
+						node, pending, spa_strerror(wr));
+			else
+				pw_log_debug("%p: migration forwarded "
+						"%"PRIu64" pending trigger(s)",
+						node, pending);
+		}
+		/* -EAGAIN is the steady-state case (no pending counter)
+		 * and is silently accepted. Other errors are unlikely
+		 * (the fd is owned by us and was non-blocking when
+		 * created); log them but do not fail the migration --
+		 * the worst case here is one missed wake-up that the
+		 * next driver cycle recovers from, which is the
+		 * pre-existing contract this fix tightens. */
+	}
+
 	/* 4. flip the node's own bookkeeping */
 	node->source.fd = new_fd;
 	node->rt.target.system = new_system;
