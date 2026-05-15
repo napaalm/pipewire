@@ -121,6 +121,14 @@ test('test-fusion-cost',
                link_with: pwtest_lib)
 )
 
+test('test-cycle-counter',
+    executable('test-cycle-counter',
+               'test-cycle-counter.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-fusion-graph',
     executable('test-fusion-graph',
                'test-fusion-graph.c',

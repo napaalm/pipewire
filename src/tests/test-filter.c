@@ -295,6 +295,16 @@ static void test_create_port(void)
 	res = pw_filter_connect(filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0);
 	spa_assert_se(res >= 0);
 
+	/* RT_PROCESS filters default to a dedicated dynamic data loop so
+	 * the per-thread TID and CPUTIME / cycle measurements isolate the
+	 * filter. The flag is stamped on the filter properties at connect
+	 * time. */
+	{
+		const struct pw_properties *fp = pw_filter_get_properties(filter, NULL);
+		spa_assert_se(fp != NULL);
+		spa_assert_se(spa_streq(pw_properties_get(fp, PW_KEY_NODE_LOOP_DYNAMIC), "true"));
+	}
+
 	printf("wait connect\n");
 	while (true) {
 		state = pw_filter_get_state(filter, NULL);
@@ -340,6 +350,82 @@ static void test_create_port(void)
 	pw_main_loop_destroy(loop);
 }
 
+/* RT_PROCESS filters get a dedicated dynamic data loop by default;
+ * non-RT filters keep their main-loop binding. Verify the property
+ * defaults at connect time so future changes do not silently break
+ * the per-thread isolation that downstream consumers rely on. */
+static void test_loop_default(void)
+{
+	struct {
+		uint32_t flags;
+		const char *expect_dynamic;
+		const char *expect_class;
+	} cases[] = {
+		{ PW_FILTER_FLAG_RT_PROCESS, "true", NULL },
+		{ 0,                          NULL,   "main" },
+	};
+
+	for (size_t i = 0; i < SPA_N_ELEMENTS(cases); i++) {
+		struct pw_main_loop *loop = pw_main_loop_new(NULL);
+		struct pw_context *context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 12);
+		spa_assert_se(context != NULL);
+		struct pw_core *core = pw_context_connect_self(context, NULL, 0);
+		spa_assert_se(core != NULL);
+
+		struct pw_filter *filter = pw_filter_new(core, "test-loop-default", NULL);
+		spa_assert_se(filter != NULL);
+
+		int res = pw_filter_connect(filter, cases[i].flags, NULL, 0);
+		spa_assert_se(res >= 0);
+
+		const struct pw_properties *fp = pw_filter_get_properties(filter, NULL);
+		spa_assert_se(fp != NULL);
+		const char *dyn = pw_properties_get(fp, PW_KEY_NODE_LOOP_DYNAMIC);
+		const char *cls = pw_properties_get(fp, PW_KEY_NODE_LOOP_CLASS);
+		if (cases[i].expect_dynamic == NULL)
+			spa_assert_se(dyn == NULL);
+		else
+			spa_assert_se(spa_streq(dyn, cases[i].expect_dynamic));
+		if (cases[i].expect_class == NULL)
+			spa_assert_se(cls == NULL);
+		else
+			spa_assert_se(spa_streq(cls, cases[i].expect_class));
+
+		pw_filter_destroy(filter);
+		pw_context_destroy(context);
+		pw_main_loop_destroy(loop);
+	}
+}
+
+/* Caller-supplied PW_KEY_NODE_LOOP_NAME / CLASS / DYNAMIC must win over
+ * the connect-time defaults; otherwise an app that already pinned its
+ * filter to a specific loop would lose its binding. */
+static void test_loop_default_user_override(void)
+{
+	struct pw_main_loop *loop = pw_main_loop_new(NULL);
+	struct pw_context *context = pw_context_new(pw_main_loop_get_loop(loop), NULL, 12);
+	spa_assert_se(context != NULL);
+	struct pw_core *core = pw_context_connect_self(context, NULL, 0);
+	spa_assert_se(core != NULL);
+
+	struct pw_filter *filter = pw_filter_new(core, "test-loop-override",
+			pw_properties_new(PW_KEY_NODE_LOOP_CLASS, "data.rt", NULL));
+	spa_assert_se(filter != NULL);
+
+	int res = pw_filter_connect(filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0);
+	spa_assert_se(res >= 0);
+
+	const struct pw_properties *fp = pw_filter_get_properties(filter, NULL);
+	spa_assert_se(fp != NULL);
+	/* User pin wins: the auto-default did not fire. */
+	spa_assert_se(spa_streq(pw_properties_get(fp, PW_KEY_NODE_LOOP_CLASS), "data.rt"));
+	spa_assert_se(pw_properties_get(fp, PW_KEY_NODE_LOOP_DYNAMIC) == NULL);
+
+	pw_filter_destroy(filter);
+	pw_context_destroy(context);
+	pw_main_loop_destroy(loop);
+}
+
 int main(int argc, char *argv[])
 {
 	pw_init(&argc, &argv);
@@ -348,6 +434,8 @@ int main(int argc, char *argv[])
 	test_create();
 	test_properties();
 	test_create_port();
+	test_loop_default();
+	test_loop_default_user_override();
 
 	pw_deinit();
 
