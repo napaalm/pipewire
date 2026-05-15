@@ -2884,6 +2884,13 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 		node->cycle_fd = -2;
 	}
 
+	/* Free the per-node subgraph-fusion sliding-window backing
+	 * buffer. Allocated lazily by context.c::fusion_ensure_window_size
+	 * on first WCET sample; release here on node teardown so we do
+	 * not leak across destroys. */
+	free(node->fusion_window.samples);
+	node->fusion_window.samples = NULL;
+
 	if (node->data_loop)
 		pw_context_release_node_loop(context, node->data_loop);
 

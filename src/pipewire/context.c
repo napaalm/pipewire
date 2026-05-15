@@ -131,6 +131,20 @@ struct impl {
 	bool subgraph_fusion;
 	uint64_t wakeup_cost_ns;
 	uint32_t fusion_min_samples;
+
+	/* Target wall-clock window for the per-node sliding-mean WCET
+	 * estimator (subgraph-fusion only). The actual sample count
+	 * N is derived from this and the live graph cycle period at
+	 * each fusion scan (see pw_fusion_window_target_n in
+	 * fusion-cost.h); the band is clamped to [N_MIN, N_MAX].
+	 *
+	 * fusion_window_samples_override is the operator escape hatch:
+	 * 0 means "auto-derive", non-zero pins N regardless of the
+	 * cycle period. Both knobs default to the auto-derivation
+	 * path so an out-of-the-box operator never has to think about
+	 * cycle periods. */
+	uint64_t fusion_window_time_ns;
+	uint32_t fusion_window_samples_override;
 };
 
 
@@ -293,11 +307,31 @@ static int setup_data_loops(struct impl *impl)
 		impl->fusion_min_samples = (uint32_t)pw_properties_get_int32(
 				this->properties,
 				"context.subgraph-fusion.min-samples", 4);
-		pw_log_info("%p: fusion: chains=%d subgraph=%d wakeup_cost=%"PRIu64"ns min_samples=%u",
+
+		/* Target wall-clock window (default 250 ms, see
+		 * fusion-cost.h block comment for the principled
+		 * motivation). N is derived from this at fusion-scan
+		 * time. The samples-override knob takes precedence when
+		 * non-zero. */
+		impl->fusion_window_time_ns =
+			(uint64_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.window-time-ms",
+				(int)(PW_FUSION_WINDOW_DEFAULT_TIME_NS / 1000000ULL))
+			* 1000000ULL;
+		impl->fusion_window_samples_override = (uint32_t)
+			pw_properties_get_int32(this->properties,
+				"context.subgraph-fusion.window-samples", 0);
+
+		pw_log_info("%p: fusion: chains=%d subgraph=%d "
+				"wakeup_cost=%"PRIu64"ns min_samples=%u "
+				"window_time=%"PRIu64"ms window_samples_override=%u",
 				this, impl->merge_adjacent_chains,
 				impl->subgraph_fusion,
 				impl->wakeup_cost_ns,
-				impl->fusion_min_samples);
+				impl->fusion_min_samples,
+				(uint64_t)(impl->fusion_window_time_ns / 1000000ULL),
+				impl->fusion_window_samples_override);
 	}
 
 	lib_name = pw_properties_get(this->properties, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM);
@@ -1912,9 +1946,88 @@ static const char *fusion_loop_group(struct impl *impl, struct pw_loop *loop)
 	return NULL;
 }
 
-/* Update the per-node EMA from the activation's prev_run_time. Called
- * once per recalc per eligible node before the cost model runs. */
-static void fusion_refresh_wcet(struct pw_impl_node *node)
+/* Find a representative driver period to feed the sliding-window
+ * size derivation. Walk node_list once and return the first
+ * driver-node period the eligible followers actually depend on. The
+ * choice is intentionally simple: the common case is one driver per
+ * graph and the multi-driver case is rare enough that any
+ * tie-breaking policy is defensible; "first eligible driver" is the
+ * cheapest and most deterministic.
+ *
+ * Returns 0 if no driver has been negotiated yet (cold-start case,
+ * called before pw_context_recalc_graph has settled). The caller
+ * pairs this with pw_fusion_window_target_n() which returns N_MIN
+ * for period_ns == 0, so a cold-start scan still picks a sane
+ * window length and starts warming up. */
+static uint64_t fusion_representative_period_ns(struct pw_context *context)
+{
+	struct pw_impl_node *n;
+	spa_list_for_each(n, &context->node_list, link) {
+		if (!n->driver || n->remote || n->exported)
+			continue;
+		if (n->target_rate.denom == 0 || n->target_quantum == 0)
+			continue;
+		return (uint64_t)SPA_NSEC_PER_SEC *
+			(uint64_t)n->target_quantum /
+			(uint64_t)n->target_rate.denom;
+	}
+	return 0;
+}
+
+/* Resolve the active per-fusion-scan sample-count target. Honours
+ * the operator override (fusion_window_samples_override) when
+ * non-zero; otherwise derives from the cycle period and the target
+ * wall-clock window via pw_fusion_window_target_n(). */
+static uint32_t fusion_resolve_target_n(struct impl *impl,
+		uint64_t period_ns)
+{
+	if (impl->fusion_window_samples_override > 0) {
+		uint32_t n = impl->fusion_window_samples_override;
+		if (n < PW_FUSION_WINDOW_N_MIN)
+			n = PW_FUSION_WINDOW_N_MIN;
+		if (n > PW_FUSION_WINDOW_N_MAX)
+			n = PW_FUSION_WINDOW_N_MAX;
+		return n;
+	}
+	return pw_fusion_window_target_n(period_ns,
+			impl->fusion_window_time_ns);
+}
+
+/* Ensure the per-node sliding-window backing buffer is sized to
+ * `target_n` samples. Reallocates on size change and clears the
+ * accumulated state -- a window-size change is a regime change for
+ * the estimator and the previous samples are no longer
+ * representative of the new aggregation. Returns 0 on success,
+ * -ENOMEM on allocation failure (caller treats failure as "skip
+ * this node's update this cycle"). */
+static int fusion_ensure_window_size(struct pw_impl_node *node,
+		uint32_t target_n)
+{
+	struct pw_fusion_window *w = &node->fusion_window;
+
+	if (target_n == 0)
+		target_n = PW_FUSION_WINDOW_N_MIN;
+
+	if (w->capacity == target_n && w->samples != NULL)
+		return 0;
+
+	uint64_t *resized = realloc(w->samples,
+			(size_t)target_n * sizeof(*resized));
+	if (resized == NULL)
+		return -ENOMEM;
+
+	w->samples = resized;
+	w->capacity = target_n;
+	pw_fusion_window_clear(w);
+	return 0;
+}
+
+/* Update the per-node sliding-window mean from the activation's
+ * prev_run_time. Called once per recalc per eligible node before
+ * the cost model runs. The buffer is grown/shrunk lazily here -- a
+ * fresh node will allocate on first call; a node whose driver's
+ * quantum changes will see the buffer resized on the next scan. */
+static void fusion_refresh_wcet(struct pw_impl_node *node, uint32_t target_n)
 {
 	uint64_t sample;
 
@@ -1925,9 +2038,9 @@ static void fusion_refresh_wcet(struct pw_impl_node *node)
 		return;
 	sample = node->rt.target.activation->prev_run_time;
 
-	/* alpha = 1/8 -- see fusion-cost.h commentary. */
-	pw_fusion_ema_update(&node->fusion_runtime_ema,
-			&node->fusion_samples, sample, 3);
+	if (fusion_ensure_window_size(node, target_n) < 0)
+		return;
+	pw_fusion_window_update(&node->fusion_window, sample);
 }
 
 /* Apply the desired group name to one node: stamp the property, look
@@ -1979,14 +2092,16 @@ static void fusion_apply_group(struct pw_context *context,
 		return;
 	}
 
-	/* Reset the per-node WCET EMA: the previous owning thread's
-	 * prev_run_time is no longer representative of the new thread's
-	 * scheduling (different siblings on the same loop, different
-	 * core, different cache state). The first sample after the
-	 * migration seeds the EMA and the samples counter restarts the
-	 * warm-up window before Sarkar's criterion fires again. */
-	node->fusion_runtime_ema = 0;
-	node->fusion_samples = 0;
+	/* Reset the per-node WCET sliding window: the previous owning
+	 * thread's prev_run_time samples are no longer representative
+	 * of the new thread (different siblings on the same loop,
+	 * different core, different cache state). The samples buffer
+	 * stays allocated -- only the sum / head / count are cleared
+	 * -- so a relocate-and-warmup loop does not allocate
+	 * repeatedly. The warm-up gate (count < min_samples) then
+	 * restarts; Sarkar's criterion only fires again once enough
+	 * post-migration samples have accumulated. */
+	pw_fusion_window_clear(&node->fusion_window);
 
 	pw_log_info("%p: node %u moved to loop:'%s' group:'%s'",
 			context, node->info.id, new_loop->name,
@@ -2075,30 +2190,45 @@ static void detect_and_apply_fusion(struct pw_context *context)
 		return;
 	}
 
-	spa_list_for_each(node, &context->node_list, link) {
-		if (!fusion_node_eligible(context, node))
-			continue;
-		fusion_refresh_wcet(node);
+	/* Resolve the active sliding-window size from the live graph
+	 * cycle period (or the operator override if pinned). Done once
+	 * per scan so every eligible node uses the same N -- the
+	 * cost-model's min_samples gate then has consistent meaning
+	 * across the graph. */
+	{
+		uint64_t period_ns = fusion_representative_period_ns(context);
+		uint32_t target_n = fusion_resolve_target_n(impl, period_ns);
+		pw_log_debug("%p: fusion window target=%u (period=%"PRIu64
+				"ns time=%"PRIu64"ms override=%u)",
+				context, target_n, period_ns,
+				(uint64_t)(impl->fusion_window_time_ns / 1000000ULL),
+				impl->fusion_window_samples_override);
 
-		if (n_eligible == cap) {
-			uint32_t new_cap = cap * 2;
-			struct pw_impl_node **r = realloc(table,
-					new_cap * sizeof(*r));
-			if (r == NULL)
+		spa_list_for_each(node, &context->node_list, link) {
+			if (!fusion_node_eligible(context, node))
+				continue;
+			fusion_refresh_wcet(node, target_n);
+
+			if (n_eligible == cap) {
+				uint32_t new_cap = cap * 2;
+				struct pw_impl_node **r = realloc(table,
+						new_cap * sizeof(*r));
+				if (r == NULL)
+					goto cleanup;
+				table = r;
+				cap = new_cap;
+			}
+
+			rc = pw_fusion_graph_add_node(fg, node->info.id,
+					pw_fusion_window_mean(&node->fusion_window),
+					node->fusion_window.count);
+			if (rc < 0) {
+				pw_log_warn("%p: fusion_graph_add_node(%u) failed: %s",
+						context, node->info.id, spa_strerror(rc));
 				goto cleanup;
-			table = r;
-			cap = new_cap;
+			}
+			table[n_eligible++] = node;
 		}
-
-		rc = pw_fusion_graph_add_node(fg, node->info.id,
-				node->fusion_runtime_ema,
-				node->fusion_samples);
-		if (rc < 0) {
-			pw_log_warn("%p: fusion_graph_add_node(%u) failed: %s",
-					context, node->info.id, spa_strerror(rc));
-			goto cleanup;
-		}
-		table[n_eligible++] = node;
 	}
 
 	if (n_eligible == 0)

@@ -11,6 +11,7 @@
 #include <sys/types.h> /* for pthread_t */
 
 #include "pipewire/impl.h"
+#include "pipewire/fusion-cost.h"
 
 #include <spa/support/plugin.h>
 #include <spa/pod/builder.h>
@@ -903,20 +904,28 @@ struct pw_impl_node {
 	 * prev_run_cycles. */
 	int cycle_fd;
 
-	/* Per-node smoothed WCET used by the subgraph-fusion cost model
-	 * in context.c (Sarkar 1989 §5.3 internalisation criterion).
-	 * Each call to pw_context_recalc_graph reads
-	 * rt.target.activation->prev_run_time and folds it into
-	 * fusion_runtime_ema via pw_fusion_ema_update(); fusion_samples
-	 * tracks how many measurements have accumulated so the cost
-	 * model can refuse to apply Sarkar's inequality until the
-	 * estimate is warm (Gerasoulis-Yang 1993 chain-only fallback
-	 * runs in the meantime). Reset to 0 when the node migrates to a
-	 * new data loop -- the previous owning thread's prev_run_time
-	 * is no longer representative. Owned by the main loop; nothing
-	 * in the RT path reads or writes these fields. */
-	uint64_t fusion_runtime_ema;
-	uint32_t fusion_samples;
+	/* Per-node sliding-window WCET estimator used by the subgraph-
+	 * fusion cost model in context.c (Sarkar 1989 §5.3
+	 * internalisation criterion). Each call to
+	 * pw_context_recalc_graph reads rt.target.activation->prev_run_time
+	 * and folds it into the sliding mean via
+	 * pw_fusion_window_update(); the window's `count` field tracks
+	 * how many measurements have accumulated so the cost model can
+	 * refuse to apply the inequality until the estimate is warm
+	 * (Gerasoulis-Yang 1993 chain-only fallback runs in the
+	 * meantime).
+	 *
+	 * The samples buffer is allocated lazily on first call from
+	 * context.c, sized to the auto-derived N for the current cycle
+	 * period; reallocated when the period changes meaningfully.
+	 * Cleared (count reset to 0, sum to 0) when the node migrates
+	 * to a new data loop -- the previous owning thread's
+	 * prev_run_time is no longer representative.
+	 *
+	 * Owned by the main loop; nothing in the RT path reads or
+	 * writes these fields. fusion_window.samples is freed in
+	 * pw_impl_node's destroy path. */
+	struct pw_fusion_window fusion_window;
 
 
 	void *user_data;                /**< extra user data */
