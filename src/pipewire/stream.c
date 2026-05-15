@@ -2096,6 +2096,18 @@ pw_stream_connect(struct pw_stream *stream,
 		if (pw_properties_get(stream->properties, PW_KEY_NODE_LOOP_CLASS) == NULL)
 			pw_properties_set(stream->properties, PW_KEY_NODE_LOOP_CLASS, "main");
 		pw_properties_set(stream->properties, PW_KEY_NODE_ASYNC, "true");
+	} else {
+		/* Real-time streams default to a dedicated dynamic data loop
+		 * unless the caller pinned them to a specific loop by name
+		 * or class. A dedicated loop runs the stream's process()
+		 * callback on its own thread, so the per-thread TID can be
+		 * published in PW_KEY_NODE_LOOP_TID and the per-thread
+		 * CPUTIME / cycle counters captured in impl-node's
+		 * process_node() reflect this stream alone. */
+		if (pw_properties_get(stream->properties, PW_KEY_NODE_LOOP_DYNAMIC) == NULL &&
+		    pw_properties_get(stream->properties, PW_KEY_NODE_LOOP_NAME) == NULL &&
+		    pw_properties_get(stream->properties, PW_KEY_NODE_LOOP_CLASS) == NULL)
+			pw_properties_set(stream->properties, PW_KEY_NODE_LOOP_DYNAMIC, "true");
 	}
 	if (flags & PW_STREAM_FLAG_DRIVER)
 		pw_properties_set(stream->properties, PW_KEY_NODE_DRIVER, "true");
