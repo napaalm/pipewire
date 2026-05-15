@@ -903,6 +903,21 @@ struct pw_impl_node {
 	 * prev_run_cycles. */
 	int cycle_fd;
 
+	/* Per-node smoothed WCET used by the subgraph-fusion cost model
+	 * in context.c (Sarkar 1989 §5.3 internalisation criterion).
+	 * Each call to pw_context_recalc_graph reads
+	 * rt.target.activation->prev_run_time and folds it into
+	 * fusion_runtime_ema via pw_fusion_ema_update(); fusion_samples
+	 * tracks how many measurements have accumulated so the cost
+	 * model can refuse to apply Sarkar's inequality until the
+	 * estimate is warm (Gerasoulis-Yang 1993 chain-only fallback
+	 * runs in the meantime). Reset to 0 when the node migrates to a
+	 * new data loop -- the previous owning thread's prev_run_time
+	 * is no longer representative. Owned by the main loop; nothing
+	 * in the RT path reads or writes these fields. */
+	uint64_t fusion_runtime_ema;
+	uint32_t fusion_samples;
+
 
 	void *user_data;                /**< extra user data */
 };
