@@ -98,6 +98,32 @@ static void dag_free_indexed_nodes(dag_t *g)
 	g->indexed_count = 0;
 }
 
+static void dag_free_groups(dag_t *g)
+{
+	uint32_t i;
+
+	if (!g)
+		return;
+
+	if (g->group_members) {
+		for (i = 0; i < g->group_count; i++)
+			free(g->group_members[i]);
+		free(g->group_members);
+		g->group_members = NULL;
+	}
+	if (g->group_node_succ) {
+		for (i = 0; i < g->group_count; i++)
+			free(g->group_node_succ[i]);
+		free(g->group_node_succ);
+		g->group_node_succ = NULL;
+	}
+	free(g->node_group_index);
+	g->node_group_index = NULL;
+	free(g->group_rep_node_index);
+	g->group_rep_node_index = NULL;
+	g->group_count = 0;
+}
+
 /* Per-recalc scratch buffer lifecycle. Allocated to the dense-index
  * cardinality (which is itself a one-shot allocation per recalc),
  * so the scratch buffers cost is amortised over the entire recalc
@@ -156,6 +182,7 @@ static void dag_invalidate_analysis(dag_t *g)
 	}
 
 	dag_free_unrelated(g);
+	dag_free_groups(g);
 	dag_free_indexed_nodes(g);
 	dag_workspace_free(g);
 }
@@ -1093,6 +1120,138 @@ static int dag_build_successors(dag_t *g)
 	return 0;
 }
 
+/* Build the co-location group caches consumed by dag_comp_unrelated.
+ *
+ * Every real indexed node is assigned a dense group index: nodes
+ * sharing a non-zero dag_node::group_id share the same dense group;
+ * group_id == 0 (the default) makes the node its own singleton group.
+ * Fictitious nodes are left out (node_group_index[i] = UINT32_MAX).
+ *
+ * For each group we materialise:
+ *   - group_rep_node_index: the lowest-index member (the topologically
+ *     earliest one, since indexed_nodes is in topo order). Used as the
+ *     candidate in the antichain branch-and-bound.
+ *   - group_members: bitset (over indexed_count) of every member.
+ *     Used to expand a representative-only antichain into the full
+ *     per-node bitset stored in g->unrelated, so the worst-fit pass
+ *     still accumulates each member's utilisation contribution.
+ *   - group_node_succ: union of every member's node-level successors
+ *     bitset. Used as the group-level reachability test: a candidate
+ *     v's group is related to a chosen u's group iff
+ *     group_node_succ[g(u)] intersects group_members[g(v)] (or vice
+ *     versa). Since each member's successors mask includes itself,
+ *     this also captures intra-group membership without a special
+ *     case.
+ *
+ * Singleton-group case (no non-zero group_ids in the DAG): the result
+ * is equivalent to the pre-collapse algorithm -- each rep equals its
+ * sole member, every group_node_succ equals the member's successors
+ * mask, and expansion is a no-op. So workloads that never invoke
+ * chain-merge or subgraph-fusion see no behavioural change.
+ *
+ * The function is called by dag_build_analysis after
+ * dag_build_successors and before dag_comp_unrelated. Returns 0 on
+ * success, -1 with errno=ENOMEM on allocation failure; partial state
+ * is freed via dag_free_groups (already wired into
+ * dag_invalidate_analysis). */
+static int dag_build_groups(dag_t *g)
+{
+	uint32_t count = g->indexed_count;
+	uint32_t i, j;
+	uint32_t group_count = 0;
+	uint32_t *group_source_id = NULL;
+
+	if (count == 0)
+		return 0;
+
+	g->node_group_index = malloc((size_t)count * sizeof(*g->node_group_index));
+	if (!g->node_group_index) {
+		errno = ENOMEM;
+		return -1;
+	}
+	for (i = 0; i < count; i++)
+		g->node_group_index[i] = UINT32_MAX;
+
+	/* Worst case is one dense group per real node (every node
+	 * ungrouped, group_id == 0); allocate to that ceiling so we can
+	 * resolve duplicates in a single pass without rehashing. */
+	group_source_id = malloc((size_t)count * sizeof(*group_source_id));
+	if (!group_source_id) {
+		dag_free_groups(g);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	for (i = 0; i < count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		uint32_t gid;
+		uint32_t dense = UINT32_MAX;
+
+		if (n->fictitious)
+			continue;
+
+		gid = n->group_id;
+		if (gid != 0) {
+			for (j = 0; j < group_count; j++) {
+				if (group_source_id[j] == gid) {
+					dense = j;
+					break;
+				}
+			}
+		}
+		if (dense == UINT32_MAX) {
+			dense = group_count++;
+			/* Singletons share source-id 0 in the lookup
+			 * table but never collide because we only consult
+			 * the table when gid != 0. */
+			group_source_id[dense] = gid;
+		}
+		g->node_group_index[i] = dense;
+	}
+
+	g->group_count = group_count;
+	if (group_count == 0) {
+		free(group_source_id);
+		return 0;
+	}
+
+	g->group_members = calloc(group_count, sizeof(*g->group_members));
+	g->group_node_succ = calloc(group_count, sizeof(*g->group_node_succ));
+	g->group_rep_node_index = malloc((size_t)group_count *
+			sizeof(*g->group_rep_node_index));
+	if (!g->group_members || !g->group_node_succ || !g->group_rep_node_index) {
+		free(group_source_id);
+		dag_free_groups(g);
+		errno = ENOMEM;
+		return -1;
+	}
+	for (i = 0; i < group_count; i++) {
+		g->group_rep_node_index[i] = UINT32_MAX;
+		g->group_members[i] = bitset_alloc((int)count);
+		g->group_node_succ[i] = bitset_alloc((int)count);
+		if (!g->group_members[i] || !g->group_node_succ[i]) {
+			free(group_source_id);
+			dag_free_groups(g);
+			errno = ENOMEM;
+			return -1;
+		}
+	}
+
+	for (i = 0; i < count; i++) {
+		uint32_t dense = g->node_group_index[i];
+		if (dense == UINT32_MAX)
+			continue;
+		bitset_set(g->group_members[dense], i);
+		bitset_or(g->group_node_succ[dense],
+				g->indexed_nodes[i]->successors, (int)count);
+		if (g->group_rep_node_index[dense] == UINT32_MAX)
+			g->group_rep_node_index[dense] = i;
+	}
+
+	free(group_source_id);
+	return 0;
+}
+
 static int dag_ensure_unrelated_capacity(dag_t *g, uint32_t needed)
 {
 	if (g->unrelated_capacity >= needed)
@@ -1166,9 +1325,76 @@ static void dag_unrelated_squash(dag_t *g)
 	}
 }
 
+/* Group-level reachability mask for `n`. When the group caches are
+ * present, returns the union of node-level successors over every
+ * member of n's group; otherwise falls back to n's own successors.
+ * Equivalent to n->successors for singleton groups, so the
+ * no-grouping case sees no behavioural change. */
+static inline bitset_t *dag_antichain_succ_mask(dag_t *g, dag_node_t *n)
+{
+	if (!n)
+		return NULL;
+	if (g->node_group_index && n->index != DAG_NODE_INDEX_INVALID) {
+		uint32_t gi = g->node_group_index[n->index];
+		if (gi != UINT32_MAX)
+			return g->group_node_succ[gi];
+	}
+	return n->successors;
+}
+
+/* Group-level "are these two nodes related?" predicate. Two nodes are
+ * related when their groups are: some member of one's group is
+ * reachable from some member of the other's. The intersect-based
+ * check accounts for the case where a representative is unreachable
+ * but a non-representative member is; testing the representatives
+ * alone would miss that. For singleton groups this reduces exactly
+ * to dag_nodes_are_related (each group_node_succ equals its sole
+ * member's successors mask, and group_members is a single-bit set
+ * pointing at the rep), so the fallback path is just a defensive
+ * shortcut when the caches are absent. */
+static bool dag_antichain_related(dag_t *g, dag_node_t *a, dag_node_t *b)
+{
+	if (!a || !b || !a->successors || !b->successors)
+		return false;
+
+	if (g->node_group_index &&
+			a->index != DAG_NODE_INDEX_INVALID &&
+			b->index != DAG_NODE_INDEX_INVALID) {
+		uint32_t ga = g->node_group_index[a->index];
+		uint32_t gb = g->node_group_index[b->index];
+
+		if (ga != UINT32_MAX && gb != UINT32_MAX) {
+			return bitset_intersects(g->group_node_succ[ga],
+					g->group_members[gb],
+					(int)g->indexed_count) ||
+				bitset_intersects(g->group_node_succ[gb],
+					g->group_members[ga],
+					(int)g->indexed_count);
+		}
+	}
+
+	return dag_nodes_are_related(a, b);
+}
+
 static void dag_build_antichain_initial_stack(dag_t *g, bitset_t *stack)
 {
 	bitset_zero(stack, (int)g->indexed_count);
+
+	if (g->group_count > 0) {
+		/* Only one bit per group: the representative. The antichain
+		 * enumeration's branch-and-bound thus has |groups|, not
+		 * |real nodes|, candidates at every level; for merged
+		 * chains or fused subgraphs that ratio can be a large
+		 * constant. Other group members are not in the stack and
+		 * are re-introduced into the emitted bitsets only via the
+		 * post-recursion expansion in dag_comp_unrelated_recur. */
+		for (uint32_t i = 0; i < g->group_count; i++) {
+			uint32_t rep = g->group_rep_node_index[i];
+			if (rep != UINT32_MAX)
+				bitset_set(stack, rep);
+		}
+		return;
+	}
 
 	for (uint32_t i = 0; i < g->indexed_count; i++) {
 		if (!g->indexed_nodes[i]->fictitious)
@@ -1180,18 +1406,19 @@ static void dag_build_antichain_next_stack(dag_t *g, bitset_t *dst,
 		bitset_t *src, uint32_t chosen_index)
 {
 	dag_node_t *chosen = g->indexed_nodes[chosen_index];
+	bitset_t *chosen_succ = dag_antichain_succ_mask(g, chosen);
 	int candidate;
 
 	bitset_cpy(dst, src, (int)g->indexed_count);
 	bitset_nclear(dst, 0, (int)chosen_index);
-	bitset_andnot(dst, chosen->successors, (int)g->indexed_count);
+	bitset_andnot(dst, chosen_succ, (int)g->indexed_count);
 
 	for (candidate = bitset_next_set(dst, (int)g->indexed_count, -1);
 			candidate >= 0;
 			candidate = bitset_next_set(dst, (int)g->indexed_count, candidate)) {
 		dag_node_t *node = g->indexed_nodes[candidate];
 
-		if (node->fictitious || bitset_test(node->successors, chosen_index))
+		if (node->fictitious || dag_antichain_related(g, node, chosen))
 			bitset_clear(dst, candidate);
 	}
 }
@@ -1203,12 +1430,35 @@ static bool dag_antichain_is_redundant(dag_t *g, bitset_t *stack,
 	int candidate = bitset_next_set(stack, (int)g->indexed_count, last_added);
 
 	while (candidate >= 0 && (uint32_t)candidate < chosen_index) {
-		if (!dag_nodes_are_related(g->indexed_nodes[candidate], chosen))
+		if (!dag_antichain_related(g, g->indexed_nodes[candidate], chosen))
 			return true;
 		candidate = bitset_next_set(stack, (int)g->indexed_count, candidate);
 	}
 
 	return false;
+}
+
+/* Expand a representative-only antichain bitset into its full per-node
+ * membership: every set bit in `src` is mapped to its group's member
+ * bitset and ORed into `dst`. The downstream worst-fit pass tests
+ * per-node bits, so the stored unrelated sets must carry every
+ * member, not just the representative. For singleton groups this
+ * leaves the input unchanged; the no-group branch in
+ * dag_comp_unrelated_recur skips the call entirely. */
+static void dag_unrelated_expand_groups(dag_t *g, bitset_t *dst, bitset_t *src)
+{
+	bitset_cpy(dst, src, (int)g->indexed_count);
+	if (g->group_count == 0 || !g->node_group_index)
+		return;
+
+	for (int i = bitset_next_set(src, (int)g->indexed_count, -1);
+			i >= 0;
+			i = bitset_next_set(src, (int)g->indexed_count, i)) {
+		uint32_t gi = g->node_group_index[i];
+		if (gi == UINT32_MAX)
+			continue;
+		bitset_or(dst, g->group_members[gi], (int)g->indexed_count);
+	}
 }
 
 static int dag_comp_unrelated_recur(dag_t *g, bitset_t *curr_cut,
@@ -1224,9 +1474,12 @@ static int dag_comp_unrelated_recur(dag_t *g, bitset_t *curr_cut,
 		dag_build_antichain_next_stack(g, new_stack, stack, (uint32_t)candidate);
 
 		if (bitset_empty(new_stack, (int)g->indexed_count)) {
-			if (!dag_antichain_is_redundant(g, stack, last_added, (uint32_t)candidate) &&
-					dag_add_unrelated(g, new_cut) < 0)
-				return -1;
+			if (!dag_antichain_is_redundant(g, stack, last_added, (uint32_t)candidate)) {
+				bitset_decl_zero(expanded, (int)g->indexed_count);
+				dag_unrelated_expand_groups(g, expanded, new_cut);
+				if (dag_add_unrelated(g, expanded) < 0)
+					return -1;
+			}
 		} else if (dag_comp_unrelated_recur(g, new_cut, new_stack, candidate) < 0) {
 			return -1;
 		}
@@ -1386,6 +1639,9 @@ static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources,
 		goto error;
 
 	if (dag_build_successors(g) < 0)
+		goto error;
+
+	if (dag_build_groups(g) < 0)
 		goto error;
 
 	dag_populate_longest_paths(g);

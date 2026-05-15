@@ -126,6 +126,30 @@ struct dag {
 	uint32_t unrelated_size;
 	uint32_t unrelated_capacity;
 
+	/* Co-location group caches used to collapse merged/fused nodes
+	 * into a single virtual node during the antichain enumeration.
+	 * Nodes that share a non-zero dag_node::group_id (stamped by
+	 * the reconcile layer from a shared PW_KEY_NODE_LOOP_TID) are
+	 * placed in the same dense group; ungrouped real nodes each
+	 * become their own singleton group. Fictitious nodes never
+	 * participate (node_group_index[i] == UINT32_MAX). The
+	 * antichain enumeration only iterates over one representative
+	 * per group, shrinking the branching factor of the
+	 * dag_comp_unrelated branch-and-bound from |real nodes| to
+	 * |groups|; on emission, every representative bit is expanded
+	 * into the full member bitset so the downstream worst-fit
+	 * pass still sees the correct per-node load contributions.
+	 *
+	 * Allocated by dag_build_groups (called from
+	 * dag_build_analysis after dag_build_successors); freed by
+	 * dag_invalidate_analysis (same lifecycle as indexed_nodes /
+	 * unrelated). NULL outside an active analysis. */
+	uint32_t   group_count;
+	uint32_t  *node_group_index;     /* indexed_count entries; UINT32_MAX = fictitious / not in a group */
+	uint32_t  *group_rep_node_index; /* group_count entries; lowest-index member of each group */
+	bitset_t **group_members;        /* group_count entries; each is a bitset over indexed_count */
+	bitset_t **group_node_succ;      /* group_count entries; union of members' node-level successors */
+
 	/* Persistent O(log N) id -> dag_node_t* index. Sorted by
 	 * dag_node_t::id ascending; maintained by dag_add_node and
 	 * dag_remove_node, queried by dag_find_node. Geometric

@@ -197,6 +197,15 @@ static inline int bitset_includes(bitset_t *a, bitset_t *b, int nbits) {
 	return 1;
 }
 
+// Return 1 if sets a and b share at least one set bit, 0 otherwise.
+static inline int bitset_intersects(bitset_t *a, bitset_t *b, int nbits) {
+	register int _stopword = _bitset_word(nbits - 1);
+	for (int _word = 0; _word <= _stopword; _word++)
+		if (a[_word] & b[_word])
+			return 1;
+	return 0;
+}
+
 // return 1 if after call s contains the next valid subset, 0 if iteration ended
 static inline int bitset_subset_next(bitset_t *s, int nbits) {
 	for (; ; s++, nbits -= 64) {
