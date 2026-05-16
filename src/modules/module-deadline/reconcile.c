@@ -3,6 +3,9 @@
 /* SPDX-License-Identifier: MIT */
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <stdbool.h>
 
@@ -44,9 +47,21 @@ struct reconcile_state {
 	uint32_t consecutive_failures;
 	uint64_t topo_gen_seen;
 	bool     topo_gen_seen_valid;
+
+	/* Per-state feasibility classification, refreshed at every
+	 * reconcile_dispatch_contracted call. See reconcile.h for
+	 * the semantics of mode / consecutive_hard_passes and the
+	 * hysteresis contract. */
+	struct reconcile_feasibility feas;
 };
 
 #define RECONCILE_FAILURE_BACKOFF 16u
+
+/* Hard-restoration hysteresis: a SOFT-to-HARD transition only
+ * fires after this many consecutive feasibility passes; an
+ * isolated good cycle in a stream of failures does not flip
+ * the warning state and risk operator confusion. */
+#define RECONCILE_HARD_RESTORE_HYSTERESIS 3u
 
 reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double cpu_utilization,
@@ -87,6 +102,18 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 bool reconcile_state_has_persistent_dag(const reconcile_state_t *state)
 {
 	return state != NULL && state->persistent && state->dag != NULL;
+}
+
+void reconcile_state_feasibility(const reconcile_state_t *state,
+		struct reconcile_feasibility *out)
+{
+	if (out == NULL)
+		return;
+	if (state == NULL) {
+		memset(out, 0, sizeof(*out));
+		return;
+	}
+	*out = state->feas;
 }
 
 void reconcile_drop(reconcile_state_t *state)
@@ -705,6 +732,88 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 				cn->cumulative_deadline_ns,
 				cn->local_deadline_ns,
 				period_ns, cpu);
+	}
+
+	/* Feasibility classification on the macro-dag. Demotion to
+	 * SOFT_DEGRADED is immediate on the first failure; promotion
+	 * back to HARD requires N consecutive feasible passes
+	 * (hysteresis). The chosen mode plus the reasons are stamped
+	 * on state->feas so module-deadline can surface them. */
+	{
+		struct reconcile_feasibility f;
+		bool density_ok, dbf_ok, feasible;
+		double max_d = 0.0;
+		uint32_t failing_cpu_d = 0;
+		uint64_t failing_t = 0, failing_demand = 0;
+		uint32_t failing_cpu_dbf = 0;
+
+		memset(&f, 0, sizeof(f));
+		density_ok = dag_density_feasible(macro_dag, &max_d,
+				&failing_cpu_d);
+		dbf_ok = dag_dbf_feasible(macro_dag, &failing_cpu_dbf,
+				&failing_t, &failing_demand);
+		feasible = density_ok || dbf_ok;
+
+		f.density_passed = density_ok;
+		f.max_density = max_d;
+		f.density_failing_cpu = failing_cpu_d;
+		f.dbf_passed = dbf_ok;
+		f.dbf_failing_t = failing_t;
+		f.dbf_failing_demand = failing_demand;
+		f.dbf_failing_cpu = failing_cpu_dbf;
+
+		if (feasible) {
+			if (state->feas.mode == RECONCILE_MODE_SOFT_DEGRADED) {
+				/* Promote only after hysteresis worth
+				 * of consecutive passes. */
+				uint32_t n = state->feas.consecutive_hard_passes + 1;
+				if (n >= RECONCILE_HARD_RESTORE_HYSTERESIS) {
+					f.mode = RECONCILE_MODE_HARD;
+					f.consecutive_hard_passes = n;
+					snprintf(f.reason, sizeof(f.reason),
+						 "%s", "");
+					pw_log_warn("reconcile: schedule "
+						"feasible again "
+						"(method=%s, max_density=%.3f); "
+						"hard-real-time guarantees "
+						"restored",
+						density_ok ? "density" : "dbf",
+						max_d);
+				} else {
+					f.mode = RECONCILE_MODE_SOFT_DEGRADED;
+					f.consecutive_hard_passes = n;
+					snprintf(f.reason, sizeof(f.reason),
+						 "%s", state->feas.reason);
+				}
+			} else {
+				f.mode = RECONCILE_MODE_HARD;
+				f.consecutive_hard_passes =
+					state->feas.consecutive_hard_passes + 1;
+				if (f.consecutive_hard_passes >
+				    RECONCILE_HARD_RESTORE_HYSTERESIS)
+					f.consecutive_hard_passes =
+						RECONCILE_HARD_RESTORE_HYSTERESIS;
+			}
+		} else {
+			const char *reason = !density_ok && !dbf_ok
+				? "edf_infeasible"
+				: (!density_ok ? "density_above_one"
+					      : "dbf_overload");
+			f.mode = RECONCILE_MODE_SOFT_DEGRADED;
+			f.consecutive_hard_passes = 0;
+			snprintf(f.reason, sizeof(f.reason), "%s", reason);
+			if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
+				pw_log_warn("reconcile: schedule infeasible "
+					"(reason=%s, max_density=%.3f, "
+					"dbf_failing_t=%" PRIu64 "); "
+					"hard-real-time guarantees dropped, "
+					"continuing with kernel-valid "
+					"parameters",
+					reason, max_d, failing_t);
+			}
+		}
+
+		state->feas = f;
 	}
 
 	dag_destroy(macro_dag);

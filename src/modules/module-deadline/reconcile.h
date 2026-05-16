@@ -157,6 +157,52 @@ int reconcile_apply(reconcile_state_t *state,
 		const reconcile_topo_t *topo,
 		reconcile_sched_cb_t sched_cb, void *sched_data);
 
+/*
+ * Reconcile-side feasibility classification.
+ *
+ * After each reconcile_apply, the dispatcher records whether the
+ * contracted-DAG schedule passes the constrained-deadline EDF
+ * density and processor-demand (DBF) tests (Baruah, Howell &
+ * Rosier 1990 RTS). The summary lives on reconcile_state; the
+ * accessor below copies it out so module-deadline.c can surface
+ * it in the JSON snapshot's mode / feasibility fields without
+ * needing access to the struct definition.
+ *
+ *   RECONCILE_MODE_HARD: both density and DBF agree the schedule
+ *     is feasible, or density failed but the exact DBF accepted.
+ *   RECONCILE_MODE_SOFT_DEGRADED: both predicates rejected. The
+ *     kernel call still ships valid parameters (runtime <=
+ *     local_deadline <= period stays enforced in module-deadline's
+ *     apply path) but the analysis no longer claims to meet
+ *     every deadline on every activation.
+ *
+ * Demotion is immediate on the first failure; promotion from
+ * SOFT to HARD requires N consecutive feasible passes
+ * (hysteresis is internal to reconcile_state). A NULL state
+ * returns a default-zero report.
+ */
+enum reconcile_mode {
+	RECONCILE_MODE_HARD          = 0,
+	RECONCILE_MODE_SOFT_DEGRADED = 1,
+};
+
+struct reconcile_feasibility {
+	enum reconcile_mode mode;
+	bool     density_passed;
+	double   max_density;
+	uint32_t density_failing_cpu;
+	bool     dbf_passed;
+	uint64_t dbf_failing_t;
+	uint64_t dbf_failing_demand;
+	uint32_t dbf_failing_cpu;
+	uint32_t consecutive_hard_passes;
+	/* Stable lower_snake_case rejection reason; empty in HARD. */
+	char     reason[64];
+};
+
+void reconcile_state_feasibility(const reconcile_state_t *state,
+		struct reconcile_feasibility *out);
+
 #ifdef __cplusplus
 }
 #endif

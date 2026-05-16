@@ -2380,12 +2380,20 @@ static void dump_combined_json_main(struct impl *impl, struct node *drv)
 	c.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
 	c.period_ns = drv->topo.period;
 	c.deadline_ns = drv->topo.period;
-	/* "prototype" mode acknowledges that hard / soft-degraded
-	 * classification does not yet exist in the implementation; the
-	 * field is reserved for the eventual transition logic. */
-	c.mode = "prototype";
-	c.feasibility_method = "none";
-	c.feasibility_status = "n/a";
+	{
+		struct reconcile_feasibility feas;
+		reconcile_state_feasibility(drv->reconcile, &feas);
+		c.mode = (feas.mode == RECONCILE_MODE_HARD)
+			? "hard" : "soft_degraded";
+		if (feas.density_passed)
+			c.feasibility_method = "density";
+		else if (feas.dbf_passed)
+			c.feasibility_method = "dbf";
+		else
+			c.feasibility_method = "none";
+		c.feasibility_status = (feas.mode == RECONCILE_MODE_HARD)
+			? "feasible" : "infeasible";
+	}
 	c.raw = &raw;
 	c.sched = &sched;
 	c.fusion = &fusion;
