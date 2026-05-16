@@ -36,13 +36,43 @@ extern "C" {
  * period; single-CPU placement enforced by dag_set_node_group), so
  * we just keep the latest observation. leader_id is the lowest
  * follower id seen for this TID; it's the cache anchor module-
- * deadline uses to skip a redundant sched_setattr when the summed
- * tuple matches the last applied value. */
+ * deadline uses to skip a redundant sched_setattr when the
+ * applied tuple matches the last applied value.
+ *
+ * Runtime is summed: a fused thread runs its members serially, so
+ * the kernel must reserve the sum of per-member runtimes.
+ *
+ * The deadline handed to sched_setattr is NOT the sum of member
+ * deadlines: per Linux kernel sched-deadline.rst the configured
+ * deadline is a relative quantity against the task's own
+ * activation, while a per-member splitter slice represents a node's
+ * relative budget. Summing the slices conflates the two and
+ * produces a fused-thread deadline that has no defined meaning. The
+ * accumulator therefore records:
+ *
+ *   - leader_local_deadline: the leader follower's own kernel-API
+ *     local deadline. For a singleton (n_members == 1) this is the
+ *     deadline the kernel must see -- the un-fused node's
+ *     splitter slice.
+ *   - max_cumulative_deadline: the maximum graph-relative
+ *     cumulative deadline across the group's members. For a
+ *     multi-member (chain-fused) thread this is a conservative
+ *     hotfix kernel deadline, valid as long as the group is
+ *     externally atomic: the chain must finish by the latest
+ *     graph-relative milestone its members owe. The contracted-
+ *     DAG re-assignment that lands in a follow-up cycle will
+ *     replace this stopgap with a properly re-derived
+ *     local_deadline computed on a macro-node.
+ *
+ * The caller picks between the two at apply time according to
+ * group composition.
+ */
 struct sched_group {
 	pid_t    tid;
 	uint32_t leader_id;
 	uint64_t sum_runtime;
-	uint64_t sum_deadline;
+	uint64_t leader_local_deadline;
+	uint64_t max_cumulative_deadline;
 	uint64_t period;
 	uint32_t cpu;
 	uint32_t n_members;
@@ -76,20 +106,25 @@ struct sched_group *sched_groups_find_or_insert(struct sched_groups *sg, pid_t t
 /* Convenience: fold one per-node observation into the matching TID
  * slot.
  *
- * - Updates leader_id to min(existing leader, id). The first
- *   observation initialises it to `id`.
- * - Adds runtime / deadline to the running sums.
- * - Overwrites period and cpu with the latest values (these are
- *   constant across a group's members by construction; the
- *   overwrite is just simpler than tracking "first observation
- *   only").
+ * - Adds `runtime` to sum_runtime (fused threads run members
+ *   serially).
+ * - Tracks max_cumulative_deadline = max over members. Used by the
+ *   caller as the chain-fused thread's kernel deadline pending the
+ *   contracted-DAG re-assignment that lands later.
+ * - leader_id moves to min(existing leader, id); on every move,
+ *   leader_local_deadline is rewritten to the new leader's local
+ *   deadline so the singleton kernel-deadline path stays anchored
+ *   on the lowest-id member.
+ * - Overwrites period and cpu with the latest values (constant
+ *   across a group's members by construction).
  * - Bumps n_members.
  *
  * tid <= 0 is treated as "no thread to merge onto" and returns
  * -EINVAL without touching sg. ENOMEM from a backing-array realloc
  * returns -ENOMEM. Returns 0 on success. */
 int sched_groups_add(struct sched_groups *sg, uint32_t id, pid_t tid,
-		uint64_t runtime, uint64_t deadline,
+		uint64_t runtime,
+		uint64_t cumulative_deadline, uint64_t local_deadline,
 		uint64_t period, uint32_t cpu);
 
 #ifdef __cplusplus

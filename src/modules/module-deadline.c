@@ -910,12 +910,6 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
-	/* The kernel-API value the sched_setattr() chain consumes is
-	 * the local (kernel-relative) deadline. The graph-relative
-	 * cumulative deadline travels alongside for the future
-	 * max-aggregation hotfix and for the JSON snapshot. */
-	uint64_t deadline = local_deadline;
-	(void)cumulative_deadline;
 
 	/* Denormalise runtime from reference-CPU units into kernel
 	 * units for the placement CPU. The sketch holds WCETs as if the
@@ -937,7 +931,8 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 	}
 
 	int res = sched_groups_add(&impl->sched_groups, id, tid,
-			runtime_kernel, deadline, period, cpu);
+			runtime_kernel, cumulative_deadline, local_deadline,
+			period, cpu);
 	if (res == -ENOMEM)
 		pw_log_warn("sched: out of memory accumulating tid=%d", (int)tid);
 	/* -EINVAL (tid <= 0) is silently ignored: a follower with no
@@ -974,14 +969,58 @@ static void apply_sched_groups(struct impl *impl)
 	for (i = 0; i < impl->sched_groups.count; i++) {
 		struct sched_group *g = &impl->sched_groups.entries[i];
 		struct node *anchor;
+		uint64_t kernel_deadline;
 		int rc_sched, rc_aff;
 
 		impl->sched_calls_total++;
 
+		/* Pick the kernel-API deadline:
+		 *   - singleton (n_members == 1): leader's local_deadline,
+		 *     which is the un-fused node's splitter slice and the
+		 *     correct relative-deadline value;
+		 *   - multi-member: the maximum cumulative deadline across
+		 *     the fused thread's members. This is a conservative
+		 *     stopgap (it may exceed the chain's actual relative
+		 *     budget) pending the contracted-DAG re-assignment that
+		 *     will derive a proper local deadline for the macro-node.
+		 *     Clamp to the period so the kernel SCHED_DEADLINE
+		 *     contract `deadline <= period` is always satisfied. */
+		if (g->n_members <= 1) {
+			kernel_deadline = g->leader_local_deadline;
+		} else {
+			kernel_deadline = g->max_cumulative_deadline;
+			if (kernel_deadline > g->period)
+				kernel_deadline = g->period;
+		}
+
+		/* Pre-syscall validation. SCHED_DEADLINE requires
+		 *   0 < runtime <= deadline <= period.
+		 * If the workload exceeds the deadline window, skip the
+		 * syscall and log: the kernel would reject anyway, and
+		 * leaving the previous parameters in place is harmless. A
+		 * future soft-degraded path will redistribute when this
+		 * fires; for now the warning is the contract surface. */
+		if (g->sum_runtime == 0 || kernel_deadline == 0 ||
+		    g->sum_runtime > kernel_deadline ||
+		    kernel_deadline > g->period) {
+			pw_log_warn("sched: invalid params for tid=%d "
+					"runtime=%" PRIu64 " deadline=%" PRIu64
+					" period=%" PRIu64
+					" (n_members=%u, leader=%u); "
+					"skipping sched_setattr",
+					(int)g->tid, g->sum_runtime,
+					kernel_deadline, g->period,
+					g->n_members, g->leader_id);
+			anchor = find_node_by_id(impl, g->leader_id);
+			if (anchor != NULL)
+				anchor->last_applied = false;
+			continue;
+		}
+
 		anchor = find_node_by_id(impl, g->leader_id);
 		if (anchor != NULL && anchor->last_applied &&
 				anchor->last_runtime == g->sum_runtime &&
-				anchor->last_deadline == g->sum_deadline &&
+				anchor->last_deadline == kernel_deadline &&
 				anchor->last_period == g->period &&
 				anchor->last_cpu == g->cpu) {
 			impl->sched_calls_skipped++;
@@ -989,7 +1028,7 @@ static void apply_sched_groups(struct impl *impl)
 		}
 
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
-				g->sum_deadline, g->period,
+				kernel_deadline, g->period,
 				impl->sched_reclaim);
 		rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
 
@@ -998,7 +1037,7 @@ static void apply_sched_groups(struct impl *impl)
 
 		if (rc_sched == 0 && rc_aff == 0) {
 			anchor->last_runtime  = g->sum_runtime;
-			anchor->last_deadline = g->sum_deadline;
+			anchor->last_deadline = kernel_deadline;
 			anchor->last_period   = g->period;
 			anchor->last_cpu      = g->cpu;
 			anchor->last_applied  = true;

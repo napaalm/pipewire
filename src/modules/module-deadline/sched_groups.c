@@ -74,7 +74,8 @@ struct sched_group *sched_groups_find_or_insert(struct sched_groups *sg, pid_t t
 	g->tid = tid;
 	g->leader_id = UINT32_MAX;
 	g->sum_runtime = 0;
-	g->sum_deadline = 0;
+	g->leader_local_deadline = 0;
+	g->max_cumulative_deadline = 0;
 	g->period = 0;
 	g->cpu = 0;
 	g->n_members = 0;
@@ -82,7 +83,8 @@ struct sched_group *sched_groups_find_or_insert(struct sched_groups *sg, pid_t t
 }
 
 int sched_groups_add(struct sched_groups *sg, uint32_t id, pid_t tid,
-		uint64_t runtime, uint64_t deadline,
+		uint64_t runtime,
+		uint64_t cumulative_deadline, uint64_t local_deadline,
 		uint64_t period, uint32_t cpu)
 {
 	struct sched_group *g;
@@ -97,11 +99,14 @@ int sched_groups_add(struct sched_groups *sg, uint32_t id, pid_t tid,
 		return -ENOMEM;
 
 	g->sum_runtime += runtime;
-	g->sum_deadline += deadline;
+	if (cumulative_deadline > g->max_cumulative_deadline)
+		g->max_cumulative_deadline = cumulative_deadline;
 	g->period = period;
 	g->cpu = cpu;
-	if (g->n_members == 0 || id < g->leader_id)
+	if (g->n_members == 0 || id < g->leader_id) {
 		g->leader_id = id;
+		g->leader_local_deadline = local_deadline;
+	}
 	g->n_members++;
 	return 0;
 }

@@ -16,9 +16,19 @@
  *
  *   - add folds a per-node observation into the right slot:
  *       leader_id = min(existing, id)
- *       sum_runtime / sum_deadline += this call's values
+ *       sum_runtime += this call's runtime
+ *       max_cumulative_deadline = max(existing, cumulative_deadline)
+ *       leader_local_deadline = the local_deadline of the
+ *           lowest-id member observed so far
  *       period / cpu := latest call's values
  *       n_members ++
+ *     (The accumulator no longer sums per-member deadlines; the
+ *      Linux kernel SCHED_DEADLINE API documents the configured
+ *      deadline as a relative quantity against the task's
+ *      activation, while a member splitter slice is a per-node
+ *      relative budget. Summing the slices conflates the two; the
+ *      caller now picks max_cumulative_deadline (multi-member
+ *      groups) or leader_local_deadline (singletons) at apply time.)
  *
  *   - tid <= 0 returns -EINVAL without touching the accumulator
  *     (a follower with no published thread can't be scheduled).
@@ -100,7 +110,8 @@ PWTEST(sg_find_or_insert_creates_fresh_entry)
 	pwtest_int_eq((int)g->tid, 42);
 	pwtest_int_eq((int)g->leader_id, (int)UINT32_MAX);
 	pwtest_int_eq((int)g->sum_runtime, 0);
-	pwtest_int_eq((int)g->sum_deadline, 0);
+	pwtest_int_eq((int)g->leader_local_deadline, 0);
+	pwtest_int_eq((int)g->max_cumulative_deadline, 0);
 	pwtest_int_eq((int)g->period, 0);
 	pwtest_int_eq((int)g->cpu, 0);
 	pwtest_int_eq((int)g->n_members, 0);
@@ -159,12 +170,14 @@ PWTEST(sg_add_records_first_observation)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1000, 2000, 5000, 2), 0);
+	/* sched_groups_add(sg, id, tid, runtime, cumulative, local, period, cpu). */
+	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1000, 2000, 2000, 5000, 2), 0);
 	pwtest_int_eq((int)sg.count, 1);
 	pwtest_int_eq((int)sg.entries[0].tid, 100);
 	pwtest_int_eq((int)sg.entries[0].leader_id, 7);
 	pwtest_int_eq((int)sg.entries[0].sum_runtime, 1000);
-	pwtest_int_eq((int)sg.entries[0].sum_deadline, 2000);
+	pwtest_int_eq((int)sg.entries[0].leader_local_deadline, 2000);
+	pwtest_int_eq((int)sg.entries[0].max_cumulative_deadline, 2000);
 	pwtest_int_eq((int)sg.entries[0].period, 5000);
 	pwtest_int_eq((int)sg.entries[0].cpu, 2);
 	pwtest_int_eq((int)sg.entries[0].n_members, 1);
@@ -173,19 +186,53 @@ PWTEST(sg_add_records_first_observation)
 	return PWTEST_PASS;
 }
 
-PWTEST(sg_add_sums_runtime_and_deadline)
+PWTEST(sg_add_runtime_sums_but_deadlines_do_not)
+{
+	/* Runtime sums (a fused thread runs members serially). The
+	 * deadline does NOT: the kernel's relative-deadline semantics
+	 * are not preserved by summing per-member slices. The
+	 * accumulator must instead track the maximum cumulative
+	 * milestone and the lowest-id member's local deadline; the
+	 * caller picks at apply time. */
+	struct sched_groups sg;
+	sched_groups_init(&sg);
+
+	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1000, 2000, 800, 5000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 8, 100,  500, 1500, 700, 5000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 9, 100,  300, 2700, 900, 5000, 1), 0);
+
+	pwtest_int_eq((int)sg.count, 1);
+	pwtest_int_eq((int)sg.entries[0].sum_runtime, 1800);
+	pwtest_int_eq((int)sg.entries[0].n_members, 3);
+	/* max across cumulative: max(2000, 1500, 2700) = 2700. */
+	pwtest_int_eq((int)sg.entries[0].max_cumulative_deadline, 2700);
+	/* leader = id 7 (the lowest); its local deadline = 800. */
+	pwtest_int_eq((int)sg.entries[0].leader_id, 7);
+	pwtest_int_eq((int)sg.entries[0].leader_local_deadline, 800);
+
+	sched_groups_fini(&sg);
+	return PWTEST_PASS;
+}
+
+/* Regression guard: the old summed-deadline behaviour produced
+ * 800 + 700 + 900 = 2400. The new behaviour must NOT produce that
+ * value on the deadline-shaped slots. */
+PWTEST(sg_add_no_summed_deadline_for_fused_thread)
 {
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1000, 2000, 5000, 1), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 8, 100,  500, 1500, 5000, 1), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 9, 100,  300,  800, 5000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1000, 2000, 800, 5000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 8, 100,  500, 1500, 700, 5000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 9, 100,  300, 2700, 900, 5000, 1), 0);
 
 	pwtest_int_eq((int)sg.count, 1);
-	pwtest_int_eq((int)sg.entries[0].sum_runtime, 1800);
-	pwtest_int_eq((int)sg.entries[0].sum_deadline, 4300);
-	pwtest_int_eq((int)sg.entries[0].n_members, 3);
+	pwtest_bool_true(sg.entries[0].max_cumulative_deadline != 2400);
+	pwtest_bool_true(sg.entries[0].leader_local_deadline != 2400);
+	/* And spot-check: both new fields are bounded by the actual
+	 * inputs (no inflation). */
+	pwtest_bool_true(sg.entries[0].max_cumulative_deadline <= 2700);
+	pwtest_bool_true(sg.entries[0].leader_local_deadline <= 900);
 
 	sched_groups_fini(&sg);
 	return PWTEST_PASS;
@@ -201,16 +248,16 @@ PWTEST(sg_add_leader_id_is_minimum_observed)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 50, 100, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 50, 100, 1, 1, 1, 1, 0), 0);
 	pwtest_int_eq((int)sg.entries[0].leader_id, 50);
 
-	pwtest_int_eq(sched_groups_add(&sg, 30, 100, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 30, 100, 1, 1, 1, 1, 0), 0);
 	pwtest_int_eq((int)sg.entries[0].leader_id, 30);
 
-	pwtest_int_eq(sched_groups_add(&sg, 70, 100, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 70, 100, 1, 1, 1, 1, 0), 0);
 	pwtest_int_eq((int)sg.entries[0].leader_id, 30);
 
-	pwtest_int_eq(sched_groups_add(&sg, 10, 100, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 10, 100, 1, 1, 1, 1, 0), 0);
 	pwtest_int_eq((int)sg.entries[0].leader_id, 10);
 
 	sched_groups_fini(&sg);
@@ -228,11 +275,11 @@ PWTEST(sg_add_period_and_cpu_track_latest)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1, 1, 5000, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 7, 100, 1, 1, 1, 5000, 0), 0);
 	pwtest_int_eq((int)sg.entries[0].period, 5000);
 	pwtest_int_eq((int)sg.entries[0].cpu, 0);
 
-	pwtest_int_eq(sched_groups_add(&sg, 8, 100, 1, 1, 5001, 3), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 8, 100, 1, 1, 1, 5001, 3), 0);
 	pwtest_int_eq((int)sg.entries[0].period, 5001);
 	pwtest_int_eq((int)sg.entries[0].cpu, 3);
 
@@ -245,8 +292,8 @@ PWTEST(sg_add_invalid_tid_returns_einval)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 7, 0, 1, 1, 1, 0), -EINVAL);
-	pwtest_int_eq(sched_groups_add(&sg, 7, -1, 1, 1, 1, 0), -EINVAL);
+	pwtest_int_eq(sched_groups_add(&sg, 7, 0, 1, 1, 1, 1, 0), -EINVAL);
+	pwtest_int_eq(sched_groups_add(&sg, 7, -1, 1, 1, 1, 1, 0), -EINVAL);
 	pwtest_int_eq((int)sg.count, 0);
 
 	sched_groups_fini(&sg);
@@ -255,7 +302,7 @@ PWTEST(sg_add_invalid_tid_returns_einval)
 
 PWTEST(sg_add_null_sg_returns_einval)
 {
-	pwtest_int_eq(sched_groups_add(NULL, 7, 100, 1, 1, 1, 0), -EINVAL);
+	pwtest_int_eq(sched_groups_add(NULL, 7, 100, 1, 1, 1, 1, 0), -EINVAL);
 	return PWTEST_PASS;
 }
 
@@ -264,17 +311,19 @@ PWTEST(sg_add_two_tids_yields_two_slots)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 1, 100, 10, 20, 1000, 0), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 2, 200, 30, 40, 1000, 1), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 1, 100, 10, 20, 20, 1000, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 2, 200, 30, 40, 40, 1000, 1), 0);
 	pwtest_int_eq((int)sg.count, 2);
 
 	struct sched_group *a = sched_groups_find_or_insert(&sg, 100);
 	struct sched_group *b = sched_groups_find_or_insert(&sg, 200);
 	pwtest_int_eq((int)a->sum_runtime, 10);
-	pwtest_int_eq((int)a->sum_deadline, 20);
+	pwtest_int_eq((int)a->leader_local_deadline, 20);
+	pwtest_int_eq((int)a->max_cumulative_deadline, 20);
 	pwtest_int_eq((int)a->leader_id, 1);
 	pwtest_int_eq((int)b->sum_runtime, 30);
-	pwtest_int_eq((int)b->sum_deadline, 40);
+	pwtest_int_eq((int)b->leader_local_deadline, 40);
+	pwtest_int_eq((int)b->max_cumulative_deadline, 40);
 	pwtest_int_eq((int)b->leader_id, 2);
 
 	sched_groups_fini(&sg);
@@ -289,8 +338,8 @@ PWTEST(sg_reset_clears_count_keeps_capacity)
 	uint32_t cap_before;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 1, 100, 1, 1, 1, 0), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 2, 200, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 1, 100, 1, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 2, 200, 1, 1, 1, 1, 0), 0);
 	cap_before = sg.cap;
 	pwtest_bool_true(cap_before > 0);
 
@@ -300,7 +349,7 @@ PWTEST(sg_reset_clears_count_keeps_capacity)
 
 	/* After reset, find_or_insert allocates from the existing
 	 * backing array (no realloc). */
-	pwtest_int_eq(sched_groups_add(&sg, 7, 300, 1, 1, 1, 0), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 7, 300, 1, 1, 1, 1, 0), 0);
 	pwtest_int_eq((int)sg.count, 1);
 	pwtest_int_eq((int)sg.cap, (int)cap_before);
 
@@ -354,17 +403,26 @@ PWTEST(sg_realistic_chain_pattern)
 	struct sched_groups sg;
 	sched_groups_init(&sg);
 
-	pwtest_int_eq(sched_groups_add(&sg, 12, 555, 4000, 9000, 100000, 2), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 11, 555, 5000, 9500, 100000, 2), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 10, 555, 6000, 9300, 100000, 2), 0);
-	pwtest_int_eq(sched_groups_add(&sg, 13, 666, 2000, 8000, 100000, 1), 0);
+	/* Chain members carry distinct cumulative and local deadlines
+	 * so the test can check the new max/leader-local fields
+	 * independently. Cumulative grows along the chain
+	 * (9000 -> 9300 -> 9500); local is the per-member splitter
+	 * slice (3000, 3100, 3400). */
+	pwtest_int_eq(sched_groups_add(&sg, 12, 555, 4000, 9500, 3400, 100000, 2), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 11, 555, 5000, 9300, 3100, 100000, 2), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 10, 555, 6000, 9000, 3000, 100000, 2), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 13, 666, 2000, 8000, 8000, 100000, 1), 0);
 
 	pwtest_int_eq((int)sg.count, 2);
 
 	struct sched_group *chain = sched_groups_find_or_insert(&sg, 555);
 	pwtest_int_eq((int)chain->leader_id, 10);
 	pwtest_int_eq((int)chain->sum_runtime, 15000);
-	pwtest_int_eq((int)chain->sum_deadline, 27800);
+	/* No summed deadline; the kernel-API value is picked at apply
+	 * time from the leader's local (3000) for singletons or from
+	 * max_cumulative (9500) for multi-member groups. */
+	pwtest_int_eq((int)chain->leader_local_deadline, 3000);
+	pwtest_int_eq((int)chain->max_cumulative_deadline, 9500);
 	pwtest_int_eq((int)chain->n_members, 3);
 	pwtest_int_eq((int)chain->cpu, 2);
 	pwtest_int_eq((int)chain->period, 100000);
@@ -372,7 +430,8 @@ PWTEST(sg_realistic_chain_pattern)
 	struct sched_group *alone = sched_groups_find_or_insert(&sg, 666);
 	pwtest_int_eq((int)alone->leader_id, 13);
 	pwtest_int_eq((int)alone->sum_runtime, 2000);
-	pwtest_int_eq((int)alone->sum_deadline, 8000);
+	pwtest_int_eq((int)alone->leader_local_deadline, 8000);
+	pwtest_int_eq((int)alone->max_cumulative_deadline, 8000);
 	pwtest_int_eq((int)alone->n_members, 1);
 	pwtest_int_eq((int)alone->cpu, 1);
 
@@ -382,7 +441,7 @@ PWTEST(sg_realistic_chain_pattern)
 	 * from zero. */
 	sched_groups_reset(&sg);
 	pwtest_int_eq((int)sg.count, 0);
-	pwtest_int_eq(sched_groups_add(&sg, 11, 555, 7000, 9500, 100000, 2), 0);
+	pwtest_int_eq(sched_groups_add(&sg, 11, 555, 7000, 9500, 9500, 100000, 2), 0);
 	chain = sched_groups_find_or_insert(&sg, 555);
 	pwtest_int_eq((int)chain->sum_runtime, 7000);
 	pwtest_int_eq((int)chain->leader_id, 11);
@@ -402,7 +461,8 @@ PWTEST_SUITE(module_deadline_sched_groups)
 	pwtest_add(sg_find_or_insert_distinct_tids_give_distinct_slots, PWTEST_NOARG);
 	pwtest_add(sg_find_or_insert_null_sg_returns_null, PWTEST_NOARG);
 	pwtest_add(sg_add_records_first_observation, PWTEST_NOARG);
-	pwtest_add(sg_add_sums_runtime_and_deadline, PWTEST_NOARG);
+	pwtest_add(sg_add_runtime_sums_but_deadlines_do_not, PWTEST_NOARG);
+	pwtest_add(sg_add_no_summed_deadline_for_fused_thread, PWTEST_NOARG);
 	pwtest_add(sg_add_leader_id_is_minimum_observed, PWTEST_NOARG);
 	pwtest_add(sg_add_period_and_cpu_track_latest, PWTEST_NOARG);
 	pwtest_add(sg_add_invalid_tid_returns_einval, PWTEST_NOARG);
