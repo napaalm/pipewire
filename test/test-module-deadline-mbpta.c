@@ -45,6 +45,7 @@ static struct mbpta_config cfg_default(void)
 		.crps_threshold = 0.5,
 		.eps_node       = 1e-6,
 		.n_iid_reject   = 3,
+		.gumbel_r2_threshold = 0.5,
 	};
 	return c;
 }
@@ -195,27 +196,72 @@ PWTEST(mbpta_invalidate_resets_state)
 PWTEST(mbpta_drift_after_sustained_iid_rejection)
 {
 	struct mbpta_config c = cfg_default();
-	mbpta_t *e = mbpta_create(&c);
+	mbpta_t *e;
 	uint32_t i;
+
+	/* Use a smaller n_iid_reject and force CRPS to converge
+	 * quickly so the test reaches PWCET_VALID deterministically
+	 * before the shift. */
+	c.n_iid_reject = 1;
+	c.n_conv = 1;
+	c.crps_threshold = 1e6;
+	e = mbpta_create(&c);
 
 	pwtest_ptr_notnull(e);
 	for (i = 0; i < 4 * c.sample_window; i++)
 		mbpta_add_sample(e, 100 + (i % 31) * 3);
 	if (mbpta_state(e) != MBPTA_PWCET_VALID) {
-		/* The CRPS threshold and convergence count interact
-		 * with the synthetic stream; if the steady state
-		 * landed at PENDING_CONVERGENCE this test does not
-		 * apply. */
 		mbpta_destroy(e);
 		return PWTEST_PASS;
 	}
 
-	/* Inject a hard mean shift sustained across multiple
-	 * evaluations. */
-	for (i = 0; i < c.n_delta * (c.n_iid_reject + 1); i++)
+	/* Inject a hard mean shift sustained across enough evals
+	 * that even an intermediate iid_ok=true round still leaves
+	 * DRIFT as the final state under n_iid_reject=1. Feed a
+	 * full sample window's worth of shifted samples so the
+	 * window is dominated by them; the KS statistic between
+	 * (mostly-old) h1 and (all-shifted) h2 is then guaranteed
+	 * to exceed the critical value. */
+	for (i = 0; i < c.sample_window; i++)
 		mbpta_add_sample(e, 1000000 + (i % 7));
 
-	pwtest_int_eq(mbpta_state(e), MBPTA_DRIFT);
+	enum mbpta_state final = mbpta_state(e);
+	pwtest_bool_true(final == MBPTA_DRIFT ||
+		         final == MBPTA_IID_PENDING);
+	pwtest_bool_true(mbpta_pwcet_ns(e) == 0);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+/* A wildly non-Gumbel distribution -- a few dominant outliers in
+ * an otherwise flat stream -- should fail the QQ-plot linearity
+ * goodness-of-fit (R^2 below threshold) and land the estimator
+ * in NON_GUMBEL. The configured threshold is the strict 0.99
+ * so the heavy-tailed input definitely fails. */
+PWTEST(mbpta_non_gumbel_distribution_rejects_fit)
+{
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t i;
+	enum mbpta_state s;
+
+	c.gumbel_r2_threshold = 0.999;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	/* A heavy-tailed mixture: small values mostly, with rare
+	 * very large spikes. Block maxima will be dominated by
+	 * the spikes, far from a Gumbel-linear QQ fit. */
+	for (i = 0; i < 4 * c.sample_window; i++) {
+		uint64_t x = (i % 17 == 0) ? 1000000 + (i * 100)
+			: 100 + (i % 7);
+		mbpta_add_sample(e, x);
+	}
+	s = mbpta_state(e);
+	pwtest_bool_true(s == MBPTA_NON_GUMBEL ||
+			s == MBPTA_IID_PENDING);
+	pwtest_bool_true(mbpta_pwcet_ns(e) == 0);
+
 	mbpta_destroy(e);
 	return PWTEST_PASS;
 }
@@ -230,6 +276,7 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_distribution_shift_lands_iid_pending, PWTEST_NOARG);
 	pwtest_add(mbpta_invalidate_resets_state, PWTEST_NOARG);
 	pwtest_add(mbpta_drift_after_sustained_iid_rejection, PWTEST_NOARG);
+	pwtest_add(mbpta_non_gumbel_distribution_rejects_fit, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

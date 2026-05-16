@@ -100,6 +100,9 @@ mbpta_t *mbpta_create(const struct mbpta_config *cfg)
 		return NULL;
 	if (cfg->eps_node <= 0.0 || cfg->eps_node >= 1.0)
 		return NULL;
+	if (cfg->gumbel_r2_threshold < 0.0 ||
+	    cfg->gumbel_r2_threshold > 1.0)
+		return NULL;
 
 	e = calloc(1, sizeof(*e));
 	if (e == NULL)
@@ -301,13 +304,15 @@ static uint32_t build_block_maxima(const mbpta_t *e, double *out, uint32_t cap)
  * squares fit y = mu + sigma * q on (q_i, bm[i]) gives mu =
  * intercept, sigma = slope. */
 static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
-		double *out_sigma)
+		double *out_sigma, double *out_r2)
 {
 	double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+	double sy_mean, ss_res = 0.0, ss_tot = 0.0;
 	uint32_t i;
 
 	*out_mu = 0.0;
 	*out_sigma = 0.0;
+	*out_r2 = 0.0;
 	if (n < 2)
 		return;
 
@@ -325,6 +330,22 @@ static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
 		return;
 	*out_sigma = ((double)n * sxy - sx * sy) / denom;
 	*out_mu = (sy - *out_sigma * sx) / (double)n;
+
+	/* Coefficient of determination R^2 = 1 - SS_res / SS_tot.
+	 * Gumbel data fits a straight line on the QQ plot; a low
+	 * R^2 is evidence the distribution is not Gumbel and the
+	 * caller routes to NON_GUMBEL. */
+	sy_mean = sy / (double)n;
+	for (i = 0; i < n; i++) {
+		double p = (double)(i + 1) / (double)(n + 1);
+		double q = -log(-log(p));
+		double y_pred = *out_mu + *out_sigma * q;
+		double res = bm[i] - y_pred;
+		double tot = bm[i] - sy_mean;
+		ss_res += res * res;
+		ss_tot += tot * tot;
+	}
+	*out_r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
 }
 
 /* CRPS comparison between two sorted block-maxima series. We use
@@ -392,7 +413,11 @@ static void mbpta_step(mbpta_t *e)
 		if (e->state == MBPTA_PWCET_VALID) {
 			if (e->iid_reject_streak >= e->cfg.n_iid_reject)
 				e->state = MBPTA_DRIFT;
-		} else {
+		} else if (e->state != MBPTA_DRIFT) {
+			/* Once in DRIFT, stay there until i.i.d.
+			 * recovers; transitioning back to IID_PENDING
+			 * would erase the historical-diagnostics
+			 * signal the plan specifically requires. */
 			e->state = MBPTA_IID_PENDING;
 		}
 		e->convergence_streak = 0;
@@ -413,8 +438,11 @@ static void mbpta_step(mbpta_t *e)
 		return;
 	}
 
-	gumbel_fit(bm, n_blocks, &mu, &sigma);
+	double r2 = 0.0;
+	gumbel_fit(bm, n_blocks, &mu, &sigma, &r2);
 	if (sigma <= 0.0)
+		gumbel_ok = false;
+	if (r2 < e->cfg.gumbel_r2_threshold)
 		gumbel_ok = false;
 
 	if (!gumbel_ok) {

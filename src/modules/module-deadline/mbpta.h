@@ -117,6 +117,19 @@ struct mbpta_config {
 	double   crps_threshold;
 	double   eps_node;
 	uint32_t n_iid_reject;
+	/* Goodness-of-fit threshold on the QQ-plot's coefficient of
+	 * determination R^2. The full Cucu-Grosjean 2012 §II-A
+	 * pipeline runs the exponential-tail (ET) test from Gomes
+	 * & Pestana to decide whether the block-maxima series
+	 * falls in the Gumbel sub-family of GEV. This
+	 * implementation stands in a weaker check on the linearity
+	 * of the QQ regression: a Gumbel-distributed series fits a
+	 * straight line on the QQ plot, so a low R^2 is evidence
+	 * the distribution is not Gumbel. R^2 below
+	 * `gumbel_r2_threshold` lands the estimator in NON_GUMBEL.
+	 * Default 0.90; the formal ET test is reserved for a
+	 * future landing. */
+	double   gumbel_r2_threshold;
 };
 
 typedef struct mbpta mbpta_t;
