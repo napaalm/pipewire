@@ -125,7 +125,10 @@ context.modules = [
 
     { name = libpipewire-module-deadline
         args = {
-            cpus.available   = [ 0 1 2 3 ]
+            # cpus.available defaults to every CPU reachable through
+            # the process affinity mask. Set it explicitly to reserve
+            # a subset of cores for audio:
+            #   cpus.available = [ 2 3 4 5 6 7 ]
             cpus.utilization = 0.95
         }
     }

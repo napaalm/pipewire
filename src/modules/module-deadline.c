@@ -84,6 +84,11 @@
  * ## Module Options
  *
  * - `cpus.available`: The list of CPUs to which the threads are bound.
+ *                       If unset or empty, the default is every CPU
+ *                       currently reachable through the pipewire
+ *                       process' affinity mask (typically every online
+ *                       CPU). Restrict explicitly only when you want a
+ *                       subset of cores reserved for audio.
  * - `cpus.utilization`: The maximum CPU utilization (per core) that DEADLINE
  *                       threads are allowed to consume. The default is 0.95.
  * - `cpus.smt-policy`:  How to handle SMT-paired logical CPUs within
@@ -210,7 +215,9 @@
  * context.modules = [
  * {   name = libpipewire-module-deadline
  *     args = {
- *         cpus.available   = [ 0 1 2 3 ]
+ *         # cpus.available defaults to every CPU the process can run
+ *         # on; uncomment to restrict explicitly.
+ *         # cpus.available = [ 2 3 4 5 6 7 ]
  *         cpus.utilization = 0.95
  *     }
  *     flags = [ ifexists nofail ]
@@ -2052,10 +2059,38 @@ static const struct pw_context_events context_events = {
 	.driver_removed = context_driver_removed,
 };
 
+/* Fill impl->cpus[] with every CPU reachable through the pipewire
+ * process' current affinity mask. This is the fallback when
+ * cpus.available is unset or empty: it gives the operator "use every
+ * CPU the kernel lets us touch" without forcing them to enumerate the
+ * topology by hand. Returns the number of CPUs written, or 0 if the
+ * affinity query itself fails (the caller will then refuse to load). */
+static int default_cpus_from_affinity(struct impl *impl)
+{
+	cpu_set_t set;
+	int i, n = 0;
+
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) < 0) {
+		pw_log_warn("sched_getaffinity failed: %m");
+		return 0;
+	}
+	for (i = 0; i < CPU_SETSIZE && n < MAX_CPUS; i++) {
+		if (CPU_ISSET(i, &set))
+			impl->cpus[n++] = i;
+	}
+	return n;
+}
+
 static void parse_cpus(struct impl *impl, const char *cpus_str)
 {
 	struct spa_json it[3];
 	int i = 0, v;
+
+	if (cpus_str == NULL || cpus_str[0] == '\0') {
+		impl->n_cpus = default_cpus_from_affinity(impl);
+		return;
+	}
 
 	spa_json_init(&it[0], cpus_str, strlen(cpus_str));
 	if (spa_json_enter_array(&it[0], &it[1]) <= 0)
@@ -2069,6 +2104,8 @@ static void parse_cpus(struct impl *impl, const char *cpus_str)
 			i++;
 		}
 	}
+	if (i == 0)
+		i = default_cpus_from_affinity(impl);
 	impl->n_cpus = i;
 }
 
@@ -2238,8 +2275,12 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	parse_cpus(impl, pw_properties_get(props, "cpus.available"));
 
+	impl->cpu_utilization = 0.95f;
 	const char *cpu_utilization_str = pw_properties_get(props, "cpus.utilization");
-	spa_json_parse_float(cpu_utilization_str, strlen(cpu_utilization_str), &impl->cpu_utilization);
+	if (cpu_utilization_str != NULL && cpu_utilization_str[0] != '\0')
+		spa_json_parse_float(cpu_utilization_str,
+				strlen(cpu_utilization_str),
+				&impl->cpu_utilization);
 
 	if (build_cpu_topology(impl, props) < 0) {
 		/* Strict refusal or sysfs failure: disable deadline policy
