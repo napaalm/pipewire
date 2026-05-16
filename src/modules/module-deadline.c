@@ -1078,11 +1078,18 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 
 		/* Pre-syscall validation. SCHED_DEADLINE requires
 		 *   0 < runtime <= deadline <= period.
-		 * If the workload exceeds the deadline window, skip the
-		 * syscall and log: the kernel would reject anyway, and
-		 * leaving the previous parameters in place is harmless. A
-		 * future soft-degraded path will redistribute when this
-		 * fires; for now the warning is the contract surface. */
+		 * If the analysis published a tuple that violates the
+		 * contract (typically runtime > local_deadline because a
+		 * follower's measured WCET exceeds its split slice),
+		 * skipping the syscall is necessary but not sufficient:
+		 * the active schedule no longer meets the contracted
+		 * bound, so the driver's mode must transition to
+		 * soft-degraded so the snapshot reflects reality and
+		 * the soft redistributor takes over on subsequent
+		 * passes. Without the transition, an operator inspecting
+		 * the snapshot would still see mode=hard while the
+		 * graph runs without the kernel admission test it
+		 * promises. */
 		if (g->sum_runtime == 0 || kernel_deadline == 0 ||
 		    g->sum_runtime > kernel_deadline ||
 		    kernel_deadline > g->period) {
@@ -1097,6 +1104,7 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			anchor = find_node_by_id(impl, g->leader_id);
 			if (anchor != NULL)
 				anchor->last_applied = false;
+			any_failure = true;
 			continue;
 		}
 
@@ -1137,7 +1145,8 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 	 * the next reconcile pass re-evaluates and may promote
 	 * back to HARD via the standard hysteresis path. */
 	if (any_failure && drv != NULL && drv->reconcile != NULL)
-		reconcile_state_force_soft(drv->reconcile, "kernel_rejected");
+		reconcile_state_force_soft(drv->reconcile,
+				"kernel_rejected_or_invalid_params");
 }
 
 /* Bsearch over impl->nodes_by_id for `id`; returns the array slot

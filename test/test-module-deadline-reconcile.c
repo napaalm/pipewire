@@ -1367,6 +1367,44 @@ PWTEST(reconcile_mode_hysteresis_promotes_after_n_passes)
 	return PWTEST_PASS;
 }
 
+/* apply_sched_groups detects a published runtime > local_deadline
+ * tuple before issuing sched_setattr: shipping that tuple would
+ * see the kernel reject it anyway. Per the operator-facing
+ * contract, the published schedule mode must transition to
+ * soft-degraded so that the JSON snapshot reflects the loss of the
+ * hard claim (and the soft redistributor can take over on later
+ * passes). The mechanism is reconcile_state_force_soft, called
+ * from apply_sched_groups with the "kernel_rejected_or_invalid_params"
+ * reason. This test pins that mechanism end-to-end: a state in
+ * HARD after a feasible reconcile must flip to SOFT_DEGRADED on a
+ * force-soft call and carry the invalid-params reason verbatim. */
+PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	struct reconcile_feasibility feas;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_HARD);
+
+	reconcile_state_force_soft(s,
+			"kernel_rejected_or_invalid_params");
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason,
+			"kernel_rejected_or_invalid_params");
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 /* When no fusion groups are formed, every follower is its own
  * macro-node leader. The MBPTA fusion-group-invalidation path keys
  * off the leader id staying stable across reconcile passes
@@ -1440,6 +1478,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_mode_hysteresis_promotes_after_n_passes, PWTEST_NOARG);
 
 	pwtest_add(reconcile_singleton_fusion_leader_equals_follower_id,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_invalid_params_demotes_to_soft_degraded,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
