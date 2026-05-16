@@ -103,23 +103,40 @@ extern "C" {
  * model can be unit-tested without bringing up a pw_context.
  */
 
+enum pw_fusion_decision {
+	PW_FUSION_DECISION_SPLIT = 0,
+	PW_FUSION_DECISION_LINEAR_ONLY,
+	PW_FUSION_DECISION_FUSE,
+};
+
 struct pw_fusion_component {
 	uint32_t n_nodes;
 	uint64_t sum_wcet_ns;
 	uint64_t cp_wcet_ns;
 	uint32_t cp_hops;
 	uint32_t min_samples_seen;
+	/* The component's most recent applied decision, supplied by
+	 * the caller so the cost model can apply hysteresis around the
+	 * Sarkar threshold and avoid flip-flopping on small WCET
+	 * jitter near the boundary. SPLIT (the default) means "no
+	 * prior decision", which suppresses the hysteresis. */
+	enum pw_fusion_decision prev_decision;
 };
 
 struct pw_fusion_params {
 	uint64_t wakeup_cost_ns;
 	uint32_t min_samples;
-};
-
-enum pw_fusion_decision {
-	PW_FUSION_DECISION_SPLIT = 0,
-	PW_FUSION_DECISION_LINEAR_ONLY,
-	PW_FUSION_DECISION_FUSE,
+	/* Hysteresis margin around the Sarkar threshold, expressed as
+	 * a percentage of the budget (0..100). When prev_decision is
+	 * known, the criterion must miss the threshold by more than
+	 * this margin in order to flip the decision; small jitter
+	 * inside the band leaves the previous decision in place.
+	 *
+	 * The default value of 10 (10%) is a sensible starting point:
+	 * larger than typical per-cycle WCET sampling noise on a
+	 * tuned-RT host, smaller than the change one would expect
+	 * from a real workload shift. */
+	uint32_t hysteresis_pct;
 };
 
 /* Apply Sarkar's internalisation criterion to the component.
@@ -174,10 +191,53 @@ pw_fusion_decide(const struct pw_fusion_component *c,
 	 * most a handful of microseconds for cp_hops in the hundreds,
 	 * far below UINT64 limits). */
 	budget = c->cp_wcet_ns + (uint64_t)c->cp_hops * p->wakeup_cost_ns;
-	if (c->sum_wcet_ns <= budget)
-		return PW_FUSION_DECISION_FUSE;
 
-	return PW_FUSION_DECISION_LINEAR_ONLY;
+	/* Hysteresis: when the caller has a record of the previous
+	 * decision, require the criterion to miss the threshold by
+	 * more than `hysteresis_pct` of the budget before flipping.
+	 * Each relocation costs one missed cycle on the migrating
+	 * node, so a component that toggles between FUSE and
+	 * LINEAR_ONLY on small jitter near the boundary pays
+	 * recurring xrun pressure for no real change in workload.
+	 * The band keeps the prior decision sticky inside that
+	 * neighbourhood.
+	 *
+	 * The band is symmetric around `budget`:
+	 *     prev=FUSE: flip to LINEAR_ONLY only if
+	 *         sum_wcet > budget + margin (sample drifted clearly
+	 *         above the threshold)
+	 *     prev=LINEAR_ONLY: flip to FUSE only if
+	 *         sum_wcet < budget - margin (sample drifted clearly
+	 *         below the threshold)
+	 *     prev=SPLIT (no prior knowledge): no hysteresis applied.
+	 */
+	{
+		bool would_fuse = (c->sum_wcet_ns <= budget);
+		uint64_t margin = 0;
+
+		if (p->hysteresis_pct > 0 && p->hysteresis_pct <= 100)
+			margin = budget * p->hysteresis_pct / 100u;
+
+		if (c->prev_decision == PW_FUSION_DECISION_FUSE && !would_fuse) {
+			if (c->sum_wcet_ns <= budget + margin)
+				return PW_FUSION_DECISION_FUSE;
+			return PW_FUSION_DECISION_LINEAR_ONLY;
+		}
+		if (c->prev_decision == PW_FUSION_DECISION_LINEAR_ONLY &&
+		    would_fuse) {
+			/* Stay LINEAR_ONLY when sum is inside the lower
+			 * half of the band: sum >= budget - margin, i.e.
+			 * sum + margin >= budget. The inequality is
+			 * inclusive on the edge to match the symmetric
+			 * upper-band rule (sum <= budget + margin keeps
+			 * FUSE on its edge). */
+			if (budget == 0 || c->sum_wcet_ns + margin >= budget)
+				return PW_FUSION_DECISION_LINEAR_ONLY;
+			return PW_FUSION_DECISION_FUSE;
+		}
+		return would_fuse ?
+			PW_FUSION_DECISION_FUSE : PW_FUSION_DECISION_LINEAR_ONLY;
+	}
 }
 
 /* Sliding-window mean for per-node WCET smoothing.

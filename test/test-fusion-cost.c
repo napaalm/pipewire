@@ -961,6 +961,191 @@ PWTEST(fusion_decide_dynamic_isolated_spike_absorbed_by_window)
 	return PWTEST_PASS;
 }
 
+/* --------------------------------------------------------------------
+ * Hysteresis tests for pw_fusion_decide.
+ *
+ * The cost model carries a `prev_decision` hint in the component
+ * struct and a `hysteresis_pct` knob in the params. The intent is to
+ * keep a component sticky against its prior decision when the WCET
+ * sample is close to the threshold, so transient jitter does not
+ * trigger a relocation. Each test below pins one branch of the
+ * hysteresis logic.
+ *
+ * Notation: with hysteresis_pct=H, budget=B, sum=S, the band is
+ *   [B-margin, B+margin] where margin = B*H/100.
+ *
+ * Outside the band, decisions follow the base rule (S<=B fuses).
+ * Inside the band, the previous decision sticks.
+ * -------------------------------------------------------------------- */
+
+static void build_balanced_pair(struct pw_fusion_component *c,
+		uint64_t per_node_wcet)
+{
+	c->n_nodes = 2;
+	c->sum_wcet_ns = 2 * per_node_wcet;
+	c->cp_wcet_ns = 2 * per_node_wcet; /* chain: cp == sum */
+	c->cp_hops = 1;
+	c->min_samples_seen = 16;
+	c->prev_decision = PW_FUSION_DECISION_SPLIT;
+}
+
+PWTEST(hysteresis_no_prev_decision_uses_base_rule)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 50 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	/* sum = 200, cp = 200, hops = 1, wakeup = 1000.
+	 * budget = 200 + 1*1000 = 1200. sum (200) <= 1200 -> FUSE. */
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+
+	c.sum_wcet_ns = 5000;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_keeps_fuse_when_sum_just_above_threshold)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 20 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.sum_wcet_ns = 1300;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+
+	c.sum_wcet_ns = 1440;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+
+	c.sum_wcet_ns = 1441;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_keeps_linear_only_when_sum_just_below_threshold)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 20 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_LINEAR_ONLY;
+	c.sum_wcet_ns = 1000;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	c.sum_wcet_ns = 960;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	c.sum_wcet_ns = 959;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_zero_pct_disables_band)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 0 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.sum_wcet_ns = 1201;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	c.prev_decision = PW_FUSION_DECISION_LINEAR_ONLY;
+	c.sum_wcet_ns = 1199;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_clamp_above_100_is_safe)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 1000 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.sum_wcet_ns = 1201;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_warmup_takes_precedence)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 16, .hysteresis_pct = 50 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.min_samples_seen = 3;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_split_returned_for_degenerate)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 50 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.n_nodes = 1;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_SPLIT);
+
+	c.n_nodes = 2;
+	c.cp_hops = 0;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_SPLIT);
+	return PWTEST_PASS;
+}
+
+PWTEST(hysteresis_band_endpoints_keep_prev)
+{
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 25 };
+	struct pw_fusion_component c;
+
+	build_balanced_pair(&c, 100);
+	c.prev_decision = PW_FUSION_DECISION_FUSE;
+	c.sum_wcet_ns = 1500; /* edge: budget + margin */
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+	c.sum_wcet_ns = 1501;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+
+	c.prev_decision = PW_FUSION_DECISION_LINEAR_ONLY;
+	c.sum_wcet_ns = 900; /* edge: budget - margin */
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_LINEAR_ONLY);
+	c.sum_wcet_ns = 899;
+	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
+			(int)PW_FUSION_DECISION_FUSE);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(fusion_cost)
 {
 	pwtest_add(fusion_decide_null_inputs_split, PWTEST_NOARG);
@@ -988,5 +1173,13 @@ PWTEST_SUITE(fusion_cost)
 	pwtest_add(fusion_decide_dynamic_low_to_high_to_low, PWTEST_NOARG);
 	pwtest_add(fusion_decide_dynamic_threshold_crossing_is_monotonic, PWTEST_NOARG);
 	pwtest_add(fusion_decide_dynamic_isolated_spike_absorbed_by_window, PWTEST_NOARG);
+	pwtest_add(hysteresis_no_prev_decision_uses_base_rule, PWTEST_NOARG);
+	pwtest_add(hysteresis_keeps_fuse_when_sum_just_above_threshold, PWTEST_NOARG);
+	pwtest_add(hysteresis_keeps_linear_only_when_sum_just_below_threshold, PWTEST_NOARG);
+	pwtest_add(hysteresis_zero_pct_disables_band, PWTEST_NOARG);
+	pwtest_add(hysteresis_clamp_above_100_is_safe, PWTEST_NOARG);
+	pwtest_add(hysteresis_warmup_takes_precedence, PWTEST_NOARG);
+	pwtest_add(hysteresis_split_returned_for_degenerate, PWTEST_NOARG);
+	pwtest_add(hysteresis_band_endpoints_keep_prev, PWTEST_NOARG);
 	return PWTEST_PASS;
 }

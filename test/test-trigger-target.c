@@ -4,8 +4,7 @@
 
 /*
  * Unit tests for the same-loop fast path in
- * src/pipewire/private.h::trigger_target_v1 (§3.5 of
- * docs/scheduling-optimizations.md).
+ * src/pipewire/private.h::trigger_target_v1.
  *
  * The function under test sits in a header (static inline,
  * referenced through a function pointer) and depends on three
@@ -44,14 +43,14 @@
  *   mixed_predecessors_last_to_fire_drives_eventfd
  *   external_into_interior_does_not_break_inline_for_same_loop_edge
  *
- * The last three are the cases the user flagged: a fused subgraph
- * with an additional cross-loop edge entering one of its interior
- * nodes. Per-edge state in pw_node_activation_state means each
- * predecessor independently decrements the same `pending` counter
- * and only the *last* one to fire transitions the status. Whether
- * that last decrement comes through the same-loop or eventfd path
- * is decided per call and must be consistent with which predecessor
- * happens to win the race in the field.
+ * The mixed-predecessor cases stress the scenario where a fused
+ * subgraph has an additional cross-loop edge entering one of its
+ * interior nodes. Per-edge state in pw_node_activation_state means
+ * each predecessor independently decrements the same `pending`
+ * counter and only the *last* one to fire transitions the status.
+ * Whether that last decrement comes through the same-loop or
+ * eventfd path is decided per call and must be consistent with
+ * which predecessor happens to win the race in the field.
  */
 
 #include "config.h"

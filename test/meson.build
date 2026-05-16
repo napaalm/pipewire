@@ -154,12 +154,10 @@ test('test-loop',
                link_with: pwtest_lib)
 )
 
-# Same-loop fast path in trigger_target_v1 (§3.5 of
-# docs/scheduling-optimizations.md). The test intercepts
+# Same-loop fast path in trigger_target_v1. The test intercepts
 # pw_impl_node_dispatch_inline through ld's --wrap so the dispatch
 # decision inside the static-inline trigger_target_v1 can be observed
-# without spinning up a real pw_impl_node + spa_node graph (covered
-# instead by live-test/inline-dispatch.sh).
+# without spinning up a real pw_impl_node + spa_node graph.
 test('test-trigger-target',
     executable('test-trigger-target',
                'test-trigger-target.c',

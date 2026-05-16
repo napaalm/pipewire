@@ -22,6 +22,11 @@ struct fusion_node {
 	uint32_t id;
 	uint64_t wcet_ns;
 	uint32_t samples;
+	/* Caller-supplied hint: the decision that was last applied to
+	 * this node (or its component) in a previous evaluate() pass.
+	 * Used by the cost model for hysteresis. SPLIT means "no
+	 * prior history", which disables hysteresis. */
+	enum pw_fusion_decision prev_decision;
 
 	/* Filled by evaluate(). */
 	int32_t  comp_root;          /* dense index of the canonical
@@ -130,9 +135,19 @@ int pw_fusion_graph_add_node(struct pw_fusion_graph *g, uint32_t id,
 	g->nodes[g->n_nodes].id = id;
 	g->nodes[g->n_nodes].wcet_ns = wcet_ns;
 	g->nodes[g->n_nodes].samples = samples;
+	g->nodes[g->n_nodes].prev_decision = PW_FUSION_DECISION_SPLIT;
 	g->nodes[g->n_nodes].comp_root = -1;
 	g->n_nodes++;
 	return (int)(g->n_nodes - 1);
+}
+
+int pw_fusion_graph_set_prev_decision(struct pw_fusion_graph *g,
+		uint32_t node_idx, enum pw_fusion_decision prev)
+{
+	if (g == NULL || node_idx >= g->n_nodes)
+		return -EINVAL;
+	g->nodes[node_idx].prev_decision = prev;
+	return 0;
 }
 
 int pw_fusion_graph_add_edge(struct pw_fusion_graph *g,
@@ -349,6 +364,19 @@ int pw_fusion_graph_evaluate(struct pw_fusion_graph *g,
 		c->component_sum_wcet_ns += g->nodes[i].wcet_ns;
 	}
 
+	/* Aggregate the previous decision per component for the
+	 * hysteresis path. Take the strongest hint any member carries
+	 * (FUSE > LINEAR_ONLY > SPLIT): the previous scan applied one
+	 * decision per component, so all members agree; if the
+	 * component grew this scan and some members joined freshly
+	 * (their prev_decision is SPLIT), the max keeps the previous
+	 * decision sticky for the established core. */
+	for (i = 0; i < g->n_nodes; i++) {
+		uint32_t root = (uint32_t)g->nodes[i].comp_root;
+		if (g->nodes[i].prev_decision > per_comp[root].prev_decision)
+			per_comp[root].prev_decision = g->nodes[i].prev_decision;
+	}
+
 	/* Run the CP DP once per component (iteration is over roots). */
 	for (i = 0; i < g->n_nodes; i++) {
 		uint64_t cp = 0;
@@ -382,6 +410,7 @@ int pw_fusion_graph_evaluate(struct pw_fusion_graph *g,
 		c.cp_wcet_ns = per_comp[i].component_cp_wcet_ns;
 		c.cp_hops = per_comp[i].component_cp_hops;
 		c.min_samples_seen = per_comp[i].component_min_samples;
+		c.prev_decision = per_comp[i].prev_decision;
 		per_comp[i].decision = pw_fusion_decide(&c, params);
 	}
 

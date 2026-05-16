@@ -131,6 +131,7 @@ struct impl {
 	bool subgraph_fusion;
 	uint64_t wakeup_cost_ns;
 	uint32_t fusion_min_samples;
+	uint32_t fusion_hysteresis_pct;
 
 	/* Target wall-clock window for the per-node sliding-mean WCET
 	 * estimator (subgraph-fusion only). The actual sample count
@@ -307,6 +308,11 @@ static int setup_data_loops(struct impl *impl)
 		impl->fusion_min_samples = (uint32_t)pw_properties_get_int32(
 				this->properties,
 				"context.subgraph-fusion.min-samples", 4);
+		impl->fusion_hysteresis_pct = (uint32_t)pw_properties_get_int32(
+				this->properties,
+				"context.subgraph-fusion.hysteresis-pct", 10);
+		if (impl->fusion_hysteresis_pct > 100)
+			impl->fusion_hysteresis_pct = 100;
 
 		/* Target wall-clock window (default 250 ms, see
 		 * fusion-cost.h block comment for the principled
@@ -1047,10 +1053,6 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 	const char *name, *klass, *group;
 	struct pw_data_loop *loop;
 
-	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
-	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
-	group = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_GROUP) : NULL;
-
 	/* Dynamic data loops are only meaningful for nodes whose
 	 * processing thread the *current* process owns end-to-end.
 	 * Remote nodes (the server's view of a client-node proxy)
@@ -1060,26 +1062,18 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 	 * per connected stream for no scheduling benefit and quickly
 	 * hit the kernel's per-process resource limits under load
 	 * (pipewire-pulse, pipewire-alsa and pipewire-jack each open
-	 * one client-node per stream, see 265ba39f0).
-	 *
-	 * BUT: when the subgraph-fusion pass explicitly sets
-	 * PW_KEY_NODE_LOOP_GROUP on a proxy to co-locate it with
-	 * other group members, we DO route through the dynamic-loop
-	 * path -- group membership is the whole point of the
-	 * acquisition. The dynamic-loop allocator already ref-counts
-	 * per group, so multiple proxies that all want the same
-	 * group land on the same loop (one pthread per group rather
-	 * than per proxy); the 265ba39f0 budget concern is preserved
-	 * because remote proxies WITHOUT a group still take the
-	 * static-pool path below.
-	 *
-	 * This routing is what makes Solution C usable from the
-	 * fusion pass: the pass stamps a desired group on the
-	 * proxy's properties and reacquires the loop; without this
-	 * branch the desired group would be silently discarded and
-	 * the proxy would never leave its initial static-pool loop. */
-	if (!impl->dynamic_data_loops || (remote && group == NULL))
+	 * one client-node per stream). The owning process's
+	 * pw_impl_node still gets its own dynamic loop and publishes
+	 * its TID via PW_KEY_NODE_LOOP_TID, which propagates to the
+	 * proxy through the standard client-node info update path
+	 * and is what downstream consumers (module-deadline,
+	 * pw-top, ...) read. */
+	if (!impl->dynamic_data_loops || remote)
 		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
+
+	name = pw_properties_get(props, PW_KEY_NODE_LOOP_NAME);
+	klass = pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS);
+	group = pw_properties_get(props, PW_KEY_NODE_LOOP_GROUP);
 
 	loop = acquire_dynamic_data_loop(impl, name, klass, group);
 	if (loop) {
@@ -1754,18 +1748,18 @@ static uint32_t find_best_rate(const uint32_t *rates, uint32_t n_rates, uint32_t
  *     async (async ports carry one cycle of buffer slack and are not
  *     a precedence constraint in-period).
  *   - Node eligible iff not exported, not a driver, and currently
- *     parked on a dynamic data loop (not the main loop, not a static
- *     loop). Remote-proxy nodes ARE eligible: the relocation
- *     primitive pw_impl_node_set_data_loop now keeps the eventfd
- *     open across migration, so the client-node protocol layer's
- *     reference to it stays valid (see the fd-lifetime block above
- *     pw_impl_node_set_data_loop in impl-node.c). What this fuses
- *     on the daemon side is only the routing of the wake -- the
- *     actual processing thread for a remote proxy lives in the
- *     client process and is whatever loop the client put it on.
- *     The §3.5 inline-dispatch fast path correctly continues to opt
- *     out for remote endpoints because process_node on a proxy is a
- *     stub (client-node.c::impl_node_process); see pw_node_peer_ref.
+ *     parked on either a dynamic data loop or a shared remote-proxy
+ *     loop (not the main loop). Remote-proxy nodes ARE eligible,
+ *     but they are not relocated on the daemon side: when fusion
+ *     decides a remote node belongs to a group, the daemon stamps
+ *     the desired group on the proxy's properties and emits the
+ *     pw_client_node set_loop_group event; the owning client
+ *     reacquires its own data loop with that group and publishes
+ *     its new thread back through the standard info-update path.
+ *     The proxy's PW_KEY_NODE_LOOP_TID then reflects the actual
+ *     thread, which is what module-deadline groups on for
+ *     SCHED_DEADLINE budget aggregation. The daemon never advertises
+ *     fusion that the owning process has not yet committed to.
  *
  * Fusion semantics
  * ----------------
@@ -2030,16 +2024,29 @@ static uint32_t fusion_resolve_target_n(struct impl *impl,
 }
 
 /* Ensure the per-node sliding-window backing buffer is sized to
- * `target_n` samples. Reallocates on size change and clears the
- * accumulated state -- a window-size change is a regime change for
- * the estimator and the previous samples are no longer
- * representative of the new aggregation. Returns 0 on success,
- * -ENOMEM on allocation failure (caller treats failure as "skip
- * this node's update this cycle"). */
+ * `target_n` samples. The capacity changes when the driver's cycle
+ * period changes (so the auto-derived window length tracks the new
+ * cadence) -- but the SAMPLES we already collected remain valid
+ * measurements of recent WCET. Clearing them on every period
+ * change forced the warm-up gate to fire repeatedly, which sent
+ * the fusion decision flipping between LINEAR_ONLY (samples too
+ * young) and FUSE (samples ready), driving the property
+ * propagation and the client-side relocation into a feedback loop.
+ *
+ * Resize in place and preserve as many recent samples as the new
+ * capacity allows: copy them out into a small dense buffer in
+ * arrival order, point the window at the resized backing array,
+ * and write the preserved samples back. The window is now a
+ * fresh ring with head=0 and count<=new_cap, holding the most
+ * recent samples in oldest-first order. The sum is recomputed
+ * from those samples. */
 static int fusion_ensure_window_size(struct pw_impl_node *node,
 		uint32_t target_n)
 {
 	struct pw_fusion_window *w = &node->fusion_window;
+	uint64_t *resized;
+	uint32_t old_capacity, old_count, old_head;
+	uint64_t *old_samples = NULL;
 
 	if (target_n == 0)
 		target_n = PW_FUSION_WINDOW_N_MIN;
@@ -2047,14 +2054,47 @@ static int fusion_ensure_window_size(struct pw_impl_node *node,
 	if (w->capacity == target_n && w->samples != NULL)
 		return 0;
 
-	uint64_t *resized = realloc(w->samples,
+	old_capacity = w->capacity;
+	old_count = w->count;
+	old_head = w->head;
+
+	/* Snapshot the samples we want to keep. If the window had
+	 * never been allocated, there are no samples to preserve. */
+	if (w->samples != NULL && old_count > 0) {
+		uint32_t keep = old_count < target_n ? old_count : target_n;
+		uint32_t i;
+		uint32_t start = (old_head + old_capacity - old_count)
+			% old_capacity;
+		old_samples = malloc((size_t)keep * sizeof(*old_samples));
+		if (old_samples == NULL)
+			return -ENOMEM;
+		for (i = 0; i < keep; i++)
+			old_samples[i] = w->samples[(start + i) % old_capacity];
+		/* The first `old_count - keep` samples are dropped because
+		 * the new capacity is smaller; that is the only sample
+		 * loss the resize introduces. */
+		old_count = keep;
+	} else {
+		old_count = 0;
+	}
+
+	resized = realloc(w->samples,
 			(size_t)target_n * sizeof(*resized));
-	if (resized == NULL)
+	if (resized == NULL) {
+		free(old_samples);
 		return -ENOMEM;
+	}
 
 	w->samples = resized;
 	w->capacity = target_n;
 	pw_fusion_window_clear(w);
+
+	if (old_samples != NULL) {
+		uint32_t i;
+		for (i = 0; i < old_count; i++)
+			pw_fusion_window_update(w, old_samples[i]);
+		free(old_samples);
+	}
 	return 0;
 }
 
@@ -2079,29 +2119,89 @@ static void fusion_refresh_wcet(struct pw_impl_node *node, uint32_t target_n)
 	pw_fusion_window_update(&node->fusion_window, sample);
 }
 
-/* Apply the desired group name to one node: stamp the property, look
- * up / create the destination loop, relocate via
- * pw_impl_node_set_data_loop. `desired` of NULL means "no group";
- * the loop is acquired without a group string so the node lands on a
- * private dynamic loop again. */
+/* Apply the desired group name to one node.
+ *
+ *   - For locally-owned nodes (non-remote): stamp the property,
+ *     look up / create the destination loop, relocate via
+ *     pw_impl_node_set_data_loop. The relocation moves the only
+ *     thread that runs user code for this node, so the daemon's
+ *     view of node->data_loop is the authoritative source of
+ *     "what thread does the work".
+ *
+ *   - For remote-proxy nodes: the daemon never owns the process
+ *     thread that runs user code (that lives in the client
+ *     process). Relocating the daemon-side proxy would advertise
+ *     fusion that did not actually happen, and module-deadline
+ *     (which groups SCHED_DEADLINE budgets by PW_KEY_NODE_LOOP_TID)
+ *     would aggregate budgets onto a TID that does not represent
+ *     where the work runs. Instead we stamp the desired group on
+ *     the proxy's properties and let pw_impl_node_update_properties
+ *     emit info_changed; client-node-impl listens for that event,
+ *     compares against the last value it published, and emits the
+ *     pw_client_node set_loop_group event over the protocol. The
+ *     owning process honours the request, relocates its local
+ *     pw_impl_node (via the non-remote branch above, in that
+ *     process's pw_context), and publishes its new TID back
+ *     through pw_client_node_update info. The proxy's
+ *     PW_KEY_NODE_LOOP_TID then reflects the actual thread,
+ *     observable by module-deadline and other consumers.
+ *
+ * `desired` of NULL means "no group"; for local nodes the loop
+ * is acquired without a group string so the node lands on a
+ * private dynamic loop again. For remote nodes the property is
+ * cleared, signalling the client to remove its own grouping. */
 static void fusion_apply_group(struct pw_context *context,
 		struct pw_impl_node *node, const char *desired)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
-	const char *current = fusion_loop_group(impl, node->data_loop);
-	bool same = (desired == NULL && current == NULL) ||
-		(desired != NULL && current != NULL &&
-		 spa_streq(desired, current));
+	const char *current;
+	bool same;
 	struct pw_loop *new_loop, *old_loop;
 	int res;
 
-	pw_log_debug("%p: fusion node %u (%s) current_group:'%s' desired_group:'%s'",
+	if (node->remote) {
+		/* The authoritative current group on a remote proxy is
+		 * whatever the proxy's PW_KEY_NODE_LOOP_GROUP property
+		 * says, because that is what we previously stamped (or
+		 * never touched). The proxy's data_loop is not
+		 * meaningful for grouping -- it is the shared
+		 * eventfd-dispatch loop from the static pool. */
+		current = pw_properties_get(node->properties,
+				PW_KEY_NODE_LOOP_GROUP);
+	} else {
+		current = fusion_loop_group(impl, node->data_loop);
+	}
+	same = (desired == NULL && current == NULL) ||
+		(desired != NULL && current != NULL &&
+		 spa_streq(desired, current));
+
+	pw_log_debug("%p: fusion node %u (%s) remote:%d "
+			"current_group:'%s' desired_group:'%s'",
 			context, node->info.id, node->name ? node->name : "?",
+			node->remote,
 			current ? current : "<none>",
 			desired ? desired : "<none>");
 
 	if (same)
 		return;
+
+	if (node->remote) {
+		/* Stamp the property via pw_impl_node_update_properties
+		 * so info_changed listeners (notably the client-node
+		 * impl) see the change and forward it to the owning
+		 * process. NULL desired means "remove the grouping" --
+		 * pass an empty dict update to clear the key. */
+		struct spa_dict_item items[1];
+		items[0] = SPA_DICT_ITEM_INIT(PW_KEY_NODE_LOOP_GROUP, desired);
+		pw_impl_node_update_properties(node,
+				&SPA_DICT_INIT(items, 1));
+		pw_log_info("%p: node %u (remote) loop-group request '%s' -> "
+				"'%s' (client will relocate)",
+				context, node->info.id,
+				current ? current : "<none>",
+				desired ? desired : "<none>");
+		return;
+	}
 
 	pw_properties_set(node->properties, PW_KEY_NODE_LOOP_GROUP, desired);
 
@@ -2263,6 +2363,15 @@ static void detect_and_apply_fusion(struct pw_context *context)
 						context, node->info.id, spa_strerror(rc));
 				goto cleanup;
 			}
+			/* Replay the previous applied decision so the
+			 * cost model can apply hysteresis around the
+			 * Sarkar threshold. Nodes that have never been
+			 * decided carry SPLIT, which disables the
+			 * hysteresis (no prior knowledge to be sticky
+			 * about). */
+			(void)pw_fusion_graph_set_prev_decision(fg,
+					(uint32_t)rc,
+					node->fusion_prev_decision);
 			table[n_eligible++] = node;
 		}
 	}
@@ -2303,6 +2412,7 @@ static void detect_and_apply_fusion(struct pw_context *context)
 
 	params.wakeup_cost_ns = impl->wakeup_cost_ns;
 	params.min_samples = impl->fusion_min_samples;
+	params.hysteresis_pct = impl->fusion_hysteresis_pct;
 
 	rc = pw_fusion_graph_evaluate(fg, &params, decisions);
 	if (rc < 0) {
@@ -2349,6 +2459,12 @@ static void detect_and_apply_fusion(struct pw_context *context)
 			fusion_apply_group(context, table[i], NULL);
 			break;
 		}
+
+		/* Record what we applied so the next scan's
+		 * hysteresis path replays it. We use the per-node
+		 * field directly; nodes that get destroyed clear it
+		 * naturally with the rest of pw_impl_node. */
+		table[i]->fusion_prev_decision = d->decision;
 	}
 
 cleanup:

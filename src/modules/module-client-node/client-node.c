@@ -124,6 +124,19 @@ struct impl {
 
 	uint32_t bind_node_version;
 	uint32_t bind_node_id;
+
+	/* Last loop group that was published to the owning client via
+	 * the set_loop_group protocol event. Tracked here so the
+	 * info_changed listener can detect transitions and avoid
+	 * resending the same value on every unrelated info update.
+	 *
+	 * NULL means "no group has ever been published" (the client
+	 * was created with no group, or the daemon has not yet
+	 * decided one); a non-NULL malloced string means the value
+	 * the client was last told to use, which by the protocol
+	 * contract is also the value the proxy's
+	 * PW_KEY_NODE_LOOP_GROUP property currently advertises. */
+	char *published_loop_group;
 };
 
 #define pw_client_node_resource(r,m,v,...)	\
@@ -153,6 +166,8 @@ struct impl {
 	pw_client_node_resource(r,set_activation,0,__VA_ARGS__)
 #define pw_client_node_resource_port_set_mix_info(r,...)	\
 	pw_client_node_resource(r,port_set_mix_info,1,__VA_ARGS__)
+#define pw_client_node_resource_set_loop_group(r,...)	\
+	pw_client_node_resource(r,set_loop_group,2,__VA_ARGS__)
 
 static int update_params(struct params *p, uint32_t n_params, const struct spa_pod **params)
 {
@@ -1441,6 +1456,7 @@ static void node_free(void *data)
 
 	if (impl->data_source.fd != -1)
 		spa_system_close(data_system, impl->data_source.fd);
+	free(impl->published_loop_group);
 	free(impl);
 }
 
@@ -1784,10 +1800,70 @@ static void node_data_loop_changed(void *data, struct pw_loop *old_loop,
 			NULL, 0, true, &impl->data_source);
 }
 
+/* Detect a change in PW_KEY_NODE_LOOP_GROUP on the proxy and
+ * forward it to the owning client via the set_loop_group protocol
+ * event. The proxy property is what the server-side fusion pass
+ * stamps when it decides this node should join (or leave) a
+ * co-location group; the value is the daemon's intent, and the
+ * client honours it by re-acquiring its own data loop with that
+ * group. The proxy's TID property only updates after the client
+ * has actually relocated and published the new TID back via
+ * pw_client_node_update, so consumers that group on
+ * PW_KEY_NODE_LOOP_TID (notably module-deadline) never see
+ * fusion bookkeeping that the owning side has not committed to.
+ *
+ * We track impl->published_loop_group so that unrelated info
+ * changes (port additions, state transitions, ...) do not cause
+ * us to re-emit the same group repeatedly; the client handler is
+ * idempotent but spamming the wire on every recalc is wasteful. */
+static void node_info_changed(void *data, const struct pw_node_info *info)
+{
+	struct impl *impl = data;
+	const char *new_group;
+	bool changed;
+
+	if (impl->resource == NULL)
+		return;
+	/* The client must understand the event; older clients silently
+	 * ignored unknown event ids in the protocol but we want a clean
+	 * version gate so the wire never carries something the peer
+	 * cannot parse. */
+	if (impl->resource->version < 7)
+		return;
+	if (info == NULL || info->props == NULL)
+		return;
+
+	new_group = spa_dict_lookup(info->props, PW_KEY_NODE_LOOP_GROUP);
+	if (new_group != NULL && new_group[0] == '\0')
+		new_group = NULL;
+
+	if (new_group == NULL && impl->published_loop_group == NULL)
+		changed = false;
+	else if (new_group != NULL && impl->published_loop_group != NULL)
+		changed = !spa_streq(new_group, impl->published_loop_group);
+	else
+		changed = true;
+
+	if (!changed)
+		return;
+
+	pw_log_info("%p: forwarding loop-group '%s' -> '%s' to client",
+			impl,
+			impl->published_loop_group ?
+				impl->published_loop_group : "<none>",
+			new_group ? new_group : "<none>");
+
+	pw_client_node_resource_set_loop_group(impl->resource, new_group);
+
+	free(impl->published_loop_group);
+	impl->published_loop_group = new_group ? strdup(new_group) : NULL;
+}
+
 static const struct pw_impl_node_events node_events = {
 	PW_VERSION_IMPL_NODE_EVENTS,
 	.free = node_free,
 	.initialized = node_initialized,
+	.info_changed = node_info_changed,
 	.port_init = node_port_init,
 	.port_added = node_port_added,
 	.port_removed = node_port_removed,

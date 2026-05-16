@@ -831,6 +831,9 @@ client_node_set_activation(void *_data,
 	}
 
 	if (ptr) {
+		struct pw_impl_node *peer_node = NULL;
+		struct pw_impl_node *iter;
+
 		link = calloc(1, sizeof(struct link));
 		if (link == NULL) {
 			res = -errno;
@@ -840,10 +843,40 @@ client_node_set_activation(void *_data,
 		link->map = mm;
 		link->target.id = node_id;
 		link->target.activation = ptr;
-		link->target.system = data->data_system;
 		link->target.fd = signalfd;
 		link->target.trigger = link->target.activation->server_version < 1 ?
 			trigger_target_v0 : trigger_target_v1;
+
+		/* Walk our local pw_context for a registered non-remote
+		 * node whose info.id matches the peer's id. If found, the
+		 * peer is another node owned by *this* process (e.g. two
+		 * pw_streams from the same client); resolve the target's
+		 * spa_system to the peer's own data-loop system so the
+		 * same-loop fast path in trigger_target_v1 can fire when
+		 * fusion has co-located both endpoints on one data loop.
+		 * src_system encodes the producer's loop; when equal to
+		 * target.system the trigger function bypasses the eventfd
+		 * and calls process_node directly. */
+		spa_list_for_each(iter, &data->context->node_list, link) {
+			if (iter->info.id == node_id && !iter->remote) {
+				peer_node = iter;
+				break;
+			}
+		}
+		if (peer_node != NULL && peer_node->data_loop != NULL) {
+			link->target.node = peer_node;
+			link->target.system = peer_node->data_loop->system;
+			link->target.src_system = data->data_system;
+		} else {
+			link->target.system = data->data_system;
+			/* Cross-process peer: leave src_system NULL so the
+			 * inline path stays disabled. process_node on a
+			 * proxy stub would not run the owner's audio code,
+			 * and the kernel eventfd already takes the wake
+			 * cross-process at minimal cost. */
+			link->target.src_system = NULL;
+		}
+
 		spa_list_append(&data->links, &link->link);
 
 		pw_impl_node_add_target(node, &link->target);
@@ -921,6 +954,75 @@ static int client_node_port_set_mix_info(void *_data,
 	return 0;
 }
 
+/* Handle the server-side request to (re)place the local
+ * pw_impl_node into a named data-loop group. The server emits this
+ * after its graph-wide fusion analysis has decided this node
+ * belongs to a particular co-location set; the client owns the
+ * thread that actually runs the process callback so the relocation
+ * has to happen here.
+ *
+ * The flow is:
+ *   - stamp PW_KEY_NODE_LOOP_GROUP on the local node's properties
+ *     (so subsequent pw_context_acquire_node_loop calls in this
+ *     client's context resolve the same group consistently);
+ *   - ask the local context's dynamic-loop allocator for a loop
+ *     matching the group (deduplicates per group name so all
+ *     same-group members land on one pthread);
+ *   - relocate the local node to that loop via
+ *     pw_impl_node_set_data_loop; the standard info-update path
+ *     publishes the new PW_KEY_NODE_LOOP_TID back to the server
+ *     and the proxy's view then matches actuality;
+ *   - release the previous loop's reference so the allocator can
+ *     reclaim it when its ref count drops to zero.
+ *
+ * Idempotent: if the requested group equals the current group the
+ * helper short-circuits inside pw_impl_node_set_data_loop and
+ * never touches the node's data loop. */
+static int client_node_set_loop_group(void *_data, const char *group)
+{
+	struct node_data *data = _data;
+	struct pw_impl_node *node = data->node;
+	struct pw_loop *new_loop, *old_loop;
+	struct spa_dict_item items[1];
+	int res;
+
+	if (node == NULL)
+		return -EIO;
+
+	pw_log_info("node %p: set_loop_group request '%s'", node,
+			group ? group : "<none>");
+
+	items[0] = SPA_DICT_ITEM_INIT(PW_KEY_NODE_LOOP_GROUP, group);
+	pw_impl_node_update_properties(node, &SPA_DICT_INIT(items, 1));
+
+	old_loop = node->data_loop;
+	new_loop = pw_context_acquire_node_loop(node->context,
+			node->properties, /* remote = */ false);
+	if (new_loop == NULL) {
+		pw_log_warn("node %p: acquire_node_loop failed for group '%s'",
+				node, group ? group : "<none>");
+		return -errno;
+	}
+	if (new_loop == old_loop) {
+		/* Already on the right loop; the allocator returned the
+		 * same pw_loop with an incremented refcount. Drop the
+		 * extra ref and bail. */
+		pw_context_release_node_loop(node->context, new_loop);
+		return 0;
+	}
+
+	res = pw_impl_node_set_data_loop(node, new_loop);
+	if (res < 0) {
+		pw_log_warn("node %p: set_data_loop failed: %s",
+				node, spa_strerror(res));
+		pw_context_release_node_loop(node->context, new_loop);
+		return res;
+	}
+
+	pw_context_release_node_loop(node->context, old_loop);
+	return 0;
+}
+
 static const struct pw_client_node_events client_node_events = {
 	PW_VERSION_CLIENT_NODE_EVENTS,
 	.transport = client_node_transport,
@@ -935,6 +1037,7 @@ static const struct pw_client_node_events client_node_events = {
 	.port_set_io = client_node_port_set_io,
 	.set_activation = client_node_set_activation,
 	.port_set_mix_info = client_node_port_set_mix_info,
+	.set_loop_group = client_node_set_loop_group,
 };
 
 static void do_node_init(struct node_data *data)
@@ -1100,6 +1203,61 @@ static void node_event(void *data, const struct spa_event *event)
 	pw_client_node_event(d->client_node, event);
 }
 
+/* Keep the cached data_loop / data_system in sync with the local
+ * node's actual data loop. The pw_remote_node initialises both at
+ * construction time from node->data_loop, but if the node later
+ * migrates (e.g. when the server's fusion pass tells us via
+ * set_loop_group that this node should join a co-location group),
+ * the cached pointers go stale: the old loop is released, its
+ * spa_system is freed, and any cross-context peer target we
+ * created previously (with target.system = data->data_system as
+ * the fallback) would dereference freed memory in
+ * trigger_target_v1's eventfd_write.
+ *
+ * Rebind the cache here so subsequent set_activation events use
+ * the new spa_system, and -- defensively -- walk this node's
+ * existing target_list and rewrite every link.target.system that
+ * was pointing at the old data_system (the fallback path's
+ * cross-context entries). Without this rewrite, links created
+ * before the migration would still hold the stale pointer.
+ *
+ * pw_impl_node's update_inbound_peers walks the OWNING context's
+ * node_list to update peers POINTING AT the migrating node; that
+ * handles the same-context case. The pw_remote_node sits across a
+ * client-node boundary, so the producer side of those targets
+ * lives in a different context and isn't reached by the
+ * pw_impl_node-side walk. Handling the rewrite here closes that
+ * gap. */
+static void node_data_loop_changed_remote(void *_data,
+		struct pw_loop *old_loop, struct pw_loop *new_loop)
+{
+	struct node_data *data = _data;
+	struct spa_system *old_system;
+	struct link *l;
+	(void)old_loop;
+
+	old_system = data->data_system;
+	data->data_loop = new_loop;
+	data->data_system = new_loop->system;
+
+	spa_list_for_each(l, &data->links, link) {
+		if (l->target.system == old_system) {
+			pw_log_debug("remote-node %p: rewrite link %p "
+					"target.system %p -> %p",
+					data, l, old_system,
+					data->data_system);
+			l->target.system = data->data_system;
+		}
+		if (l->target.src_system == old_system) {
+			pw_log_debug("remote-node %p: rewrite link %p "
+					"target.src_system %p -> %p",
+					data, l, old_system,
+					data->data_system);
+			l->target.src_system = data->data_system;
+		}
+	}
+}
+
 static const struct pw_impl_node_events node_events = {
 	PW_VERSION_IMPL_NODE_EVENTS,
 	.destroy = node_destroy,
@@ -1110,6 +1268,7 @@ static const struct pw_impl_node_events node_events = {
 	.port_removed = node_port_removed,
 	.active_changed = node_active_changed,
 	.event = node_event,
+	.data_loop_changed = node_data_loop_changed_remote,
 };
 
 static void client_node_removed(void *_data)

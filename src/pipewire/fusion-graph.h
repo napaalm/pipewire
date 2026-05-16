@@ -89,6 +89,21 @@ void pw_fusion_graph_reset(struct pw_fusion_graph *g);
 int pw_fusion_graph_add_node(struct pw_fusion_graph *g, uint32_t id,
 		uint64_t wcet_ns, uint32_t samples);
 
+/* Override the previous decision the cost model will see for the
+ * component containing the given node. Used by the hysteresis path:
+ * the caller records each component's last applied decision (keyed
+ * by the leader's id) and supplies it on the next scan so the model
+ * can suppress flip-flops in the band around Sarkar's threshold.
+ *
+ * The convention is to set it on every node that participated in
+ * the previous scan; the leader of the new component aggregates
+ * (any member's stored prev_decision agrees with the leader's
+ * since the previous scan applied one decision per component).
+ *
+ * Returns 0 on success, -EINVAL on out-of-range index. */
+int pw_fusion_graph_set_prev_decision(struct pw_fusion_graph *g,
+		uint32_t node_idx, enum pw_fusion_decision prev);
+
 /* Add a directed edge from `src_idx` to `dst_idx` (indices returned
  * by fusion_graph_add_node). Returns 0 on success, -EINVAL on
  * out-of-range indices, -ENOMEM on allocation failure. Duplicate
@@ -107,6 +122,11 @@ struct pw_fusion_graph_decision {
 	uint64_t component_cp_wcet_ns;
 	uint32_t component_cp_hops;
 	uint32_t component_min_samples;
+	/* Aggregated prior decision the cost model saw for this
+	 * component (max over members' prev_decision hints). Exposed
+	 * so the caller can confirm what the hysteresis path was
+	 * told. */
+	enum pw_fusion_decision prev_decision;
 };
 
 /* Run the full pipeline: weakly-connected partition, per-component

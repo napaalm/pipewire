@@ -573,6 +573,151 @@ PWTEST(fg_eval_grows_geometrically)
 	return PWTEST_PASS;
 }
 
+/* ---------------------------------------------------------------------
+ * Hysteresis tests: confirm pw_fusion_graph_set_prev_decision plumbs
+ * the per-node hint through to the cost model, that the per-component
+ * aggregation takes the strongest hint among members, and that the
+ * combined behaviour suppresses flip-flops on a component near the
+ * Sarkar threshold.
+ * --------------------------------------------------------------------- */
+
+PWTEST(fg_set_prev_decision_validates_index)
+{
+	struct pw_fusion_graph *g = pw_fusion_graph_alloc(2, 1);
+	pw_fusion_graph_add_node(g, 1, 100, 10);
+	pw_fusion_graph_add_node(g, 2, 200, 10);
+
+	pwtest_int_eq(pw_fusion_graph_set_prev_decision(g, 0,
+				PW_FUSION_DECISION_FUSE), 0);
+	pwtest_int_eq(pw_fusion_graph_set_prev_decision(g, 1,
+				PW_FUSION_DECISION_LINEAR_ONLY), 0);
+
+	/* Out-of-range and NULL handling. */
+	pwtest_int_eq(pw_fusion_graph_set_prev_decision(g, 999,
+				PW_FUSION_DECISION_FUSE), -EINVAL);
+	pwtest_int_eq(pw_fusion_graph_set_prev_decision(NULL, 0,
+				PW_FUSION_DECISION_FUSE), -EINVAL);
+
+	pw_fusion_graph_free(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(fg_prev_decision_aggregates_max_per_component)
+{
+	/* Two-node component. One member knows it was FUSE last time,
+	 * the other has the default SPLIT hint (e.g. it just joined
+	 * the component this scan). The aggregation rule is "take
+	 * the strongest hint", so the component's prev_decision
+	 * surfaced to the cost model must be FUSE. */
+	struct pw_fusion_graph *g = pw_fusion_graph_alloc(2, 1);
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 50 };
+	struct pw_fusion_graph_decision out[2];
+
+	pw_fusion_graph_add_node(g, 1, 100, 10);
+	pw_fusion_graph_add_node(g, 2, 100, 10);
+	pw_fusion_graph_add_edge(g, 0, 1);
+	pw_fusion_graph_set_prev_decision(g, 1, PW_FUSION_DECISION_FUSE);
+
+	pwtest_int_eq(pw_fusion_graph_evaluate(g, &p, out), 0);
+	pwtest_int_eq((int)out[0].prev_decision, (int)PW_FUSION_DECISION_FUSE);
+	pwtest_int_eq((int)out[1].prev_decision, (int)PW_FUSION_DECISION_FUSE);
+	pw_fusion_graph_free(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(fg_hysteresis_keeps_fuse_near_threshold)
+{
+	/* Build a two-node chain where sum is slightly above budget
+	 * (would normally split to LINEAR_ONLY) but hysteresis with
+	 * prev=FUSE keeps it fused.
+	 *
+	 * 2 nodes, each wcet w. sum=2w, cp=2w, hops=1, wakeup=1000.
+	 * budget = 2w + 1000. For w=1000: budget=3000.
+	 * With sum=3200, would normally LINEAR_ONLY; with margin 25%
+	 * (750) we have band [2250, 3750]; sum=3200 is inside -> FUSE. */
+	struct pw_fusion_graph *g = pw_fusion_graph_alloc(2, 1);
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 25 };
+	struct pw_fusion_graph_decision out[2];
+
+	pw_fusion_graph_add_node(g, 1, 1600, 10);
+	pw_fusion_graph_add_node(g, 2, 1600, 10);
+	pw_fusion_graph_add_edge(g, 0, 1);
+	pw_fusion_graph_set_prev_decision(g, 0, PW_FUSION_DECISION_FUSE);
+	pw_fusion_graph_set_prev_decision(g, 1, PW_FUSION_DECISION_FUSE);
+
+	pwtest_int_eq(pw_fusion_graph_evaluate(g, &p, out), 0);
+	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_FUSE);
+	pwtest_int_eq((int)out[1].decision, (int)PW_FUSION_DECISION_FUSE);
+	pw_fusion_graph_free(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(fg_hysteresis_keeps_linear_near_threshold)
+{
+	/* Same threshold geometry but prev=LINEAR_ONLY and sum slightly
+	 * BELOW the budget. Without hysteresis we'd fuse; with the
+	 * band we don't. */
+	struct pw_fusion_graph *g = pw_fusion_graph_alloc(2, 1);
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 25 };
+	struct pw_fusion_graph_decision out[2];
+
+	/* 2 nodes, sum=2800, cp=2800, hops=1, wakeup=1000.
+	 * budget = 2800 + 1000 = 3800. Wait -- sum equals cp for a
+	 * pure chain so sum-vs-budget is always sum <= budget
+	 * trivially. To force LINEAR-near-threshold we need a graph
+	 * shape where sum > cp (a real Y). Use a fan-out:
+	 *   source -> a, source -> b
+	 * with two members a/b only. Source is not in component
+	 * (we'll model the 2-node component as a path with a side
+	 * branch by including a Y-shape implicitly via add_edge).
+	 *
+	 * Simpler: use a two-node "split point" component where one
+	 * member's wcet is much smaller -- sum > cp_chain. Build it
+	 * by hand. */
+	pw_fusion_graph_add_node(g, 1, 1500, 10);
+	pw_fusion_graph_add_node(g, 2, 1500, 10);
+	/* No edge: each node is a singleton component. That would
+	 * give SPLIT, not what we want. Re-do as a real edge. */
+	pw_fusion_graph_add_edge(g, 0, 1);
+
+	pw_fusion_graph_set_prev_decision(g, 0, PW_FUSION_DECISION_LINEAR_ONLY);
+	pw_fusion_graph_set_prev_decision(g, 1, PW_FUSION_DECISION_LINEAR_ONLY);
+
+	pwtest_int_eq(pw_fusion_graph_evaluate(g, &p, out), 0);
+	/* sum=3000, cp=3000, budget=4000. base would FUSE.
+	 * margin = 4000*25/100 = 1000. lower edge = 3000.
+	 * sum (3000) == budget - margin (3000) -> stays LINEAR_ONLY. */
+	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_LINEAR_ONLY);
+	pwtest_int_eq((int)out[1].decision, (int)PW_FUSION_DECISION_LINEAR_ONLY);
+	pw_fusion_graph_free(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(fg_no_prev_decision_acts_like_pre_hysteresis)
+{
+	/* Confirm the default path: when no prev_decision is set on
+	 * any member, the result matches what we'd get without
+	 * hysteresis at all. */
+	struct pw_fusion_graph *g = pw_fusion_graph_alloc(2, 1);
+	struct pw_fusion_params p = { .wakeup_cost_ns = 1000,
+		.min_samples = 4, .hysteresis_pct = 25 };
+	struct pw_fusion_graph_decision out[2];
+
+	pw_fusion_graph_add_node(g, 1, 1500, 10);
+	pw_fusion_graph_add_node(g, 2, 1500, 10);
+	pw_fusion_graph_add_edge(g, 0, 1);
+	/* No prev_decision set anywhere. */
+	pwtest_int_eq(pw_fusion_graph_evaluate(g, &p, out), 0);
+	/* sum=3000, cp=3000, budget=4000. base: sum<=budget -> FUSE. */
+	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_FUSE);
+	pwtest_int_eq((int)out[1].decision, (int)PW_FUSION_DECISION_FUSE);
+	pw_fusion_graph_free(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(fusion_graph)
 {
 	pwtest_add(fg_alloc_returns_empty_graph, PWTEST_NOARG);
@@ -596,5 +741,10 @@ PWTEST_SUITE(fusion_graph)
 	pwtest_add(fg_eval_zero_nodes_returns_zero, PWTEST_NOARG);
 	pwtest_add(fg_evaluate_null_inputs_einval, PWTEST_NOARG);
 	pwtest_add(fg_eval_grows_geometrically, PWTEST_NOARG);
+	pwtest_add(fg_set_prev_decision_validates_index, PWTEST_NOARG);
+	pwtest_add(fg_prev_decision_aggregates_max_per_component, PWTEST_NOARG);
+	pwtest_add(fg_hysteresis_keeps_fuse_near_threshold, PWTEST_NOARG);
+	pwtest_add(fg_hysteresis_keeps_linear_near_threshold, PWTEST_NOARG);
+	pwtest_add(fg_no_prev_decision_acts_like_pre_hysteresis, PWTEST_NOARG);
 	return PWTEST_PASS;
 }

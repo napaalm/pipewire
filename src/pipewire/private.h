@@ -530,10 +530,9 @@ struct pw_node_target {
 	 * points at lives on the same data-loop thread as the producer
 	 * that owns this target struct. trigger_target_v1 then bypasses
 	 * the eventfd write + epoll wake and dispatches the consumer's
-	 * process inline on the producer's stack -- §3.5 of
-	 * docs/scheduling-optimizations.md (eventfd coalescing across
-	 * fused boundaries). NULL means "always use the eventfd path"
-	 * and is the safe default; see pw_impl_node_dispatch_inline. */
+	 * process inline on the producer's stack. NULL means "always
+	 * use the eventfd path" and is the safe default. See
+	 * pw_impl_node_dispatch_inline. */
 	struct spa_system *src_system;
 	int fd;
 	int (*trigger)(struct pw_node_target *t, uint64_t nsec);
@@ -698,14 +697,14 @@ static inline uint64_t get_cputime_ns(struct spa_system *system)
 	return SPA_TIMESPEC_TO_NSEC(&ts);
 }
 
-/* called when a producer's data-loop thread observes that its own
+/* Called when a producer's data-loop thread observes that its own
  * process has finished and one of its targets needs to advance. The
- * fast path (§3.5 of docs/scheduling-optimizations.md): when the
- * target sits on the same data-loop thread as the producer, skip the
- * eventfd write + epoll wake and dispatch the consumer's process
- * inline on the producer's stack. The state machine is identical:
- * pw_impl_node_dispatch_inline does the same CAS TRIGGERED -> AWAKE
- * transition that node_on_fd_events would have done after waking. */
+ * fast path activates when the target sits on the same data-loop
+ * thread as the producer: skip the eventfd write + epoll wake and
+ * dispatch the consumer's process inline on the producer's stack.
+ * The state machine is identical: pw_impl_node_dispatch_inline does
+ * the same CAS TRIGGERED -> AWAKE transition that node_on_fd_events
+ * would have done after waking. */
 int pw_impl_node_dispatch_inline(struct pw_node_target *t, uint64_t nsec);
 
 /* called from data-loop decrement the dependency counter of the target and when
@@ -961,6 +960,14 @@ struct pw_impl_node {
 	 * writes these fields. fusion_window.samples is freed in
 	 * pw_impl_node's destroy path. */
 	struct pw_fusion_window fusion_window;
+
+	/* The most recent decision the fusion pass applied to the
+	 * component this node belongs to. Replayed back into the
+	 * cost model on the next scan via
+	 * pw_fusion_graph_set_prev_decision so the hysteresis path
+	 * can suppress flip-flops near Sarkar's threshold. SPLIT
+	 * (the default) means "no prior decision recorded yet". */
+	enum pw_fusion_decision fusion_prev_decision;
 
 
 	void *user_data;                /**< extra user data */
