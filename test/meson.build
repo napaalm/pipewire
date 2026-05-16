@@ -134,6 +134,15 @@ test('test-module-deadline-fusion-validator',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-mbpta',
+    executable('test-module-deadline-mbpta',
+               'test-module-deadline-mbpta.c',
+               '../src/modules/module-deadline/mbpta.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',

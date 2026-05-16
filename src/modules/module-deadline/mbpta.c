@@ -1,0 +1,518 @@
+/*
+ * mbpta.c
+ *
+ * Implementation of the MBPTA estimator declared in mbpta.h.
+ *
+ * Pure data: no PipeWire runtime symbols, no syscalls; safe to
+ * unit-test in isolation. The math follows Cucu-Grosjean et al.
+ * 2012 ECRTS §II-§III directly. Where the paper leaves a
+ * decision open the code picks the conservative side and
+ * comments the choice.
+ *
+ * Copyright (C) 2026 Antonio Napolitano and Francesco Barcherini
+ */
+
+#include <errno.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "mbpta.h"
+
+const char *mbpta_state_name(enum mbpta_state s)
+{
+	switch (s) {
+	case MBPTA_INSUFFICIENT_DATA:   return "insufficient_data";
+	case MBPTA_IID_PENDING:         return "iid_pending";
+	case MBPTA_NON_GUMBEL:          return "non_gumbel";
+	case MBPTA_PENDING_CONVERGENCE: return "pending_convergence";
+	case MBPTA_PWCET_VALID:         return "pwcet_valid";
+	case MBPTA_DRIFT:               return "drift";
+	}
+	return "unknown";
+}
+
+struct mbpta {
+	struct mbpta_config cfg;
+
+	/* Sample ring. samples_total counts every sample ever fed;
+	 * we drop the first `warmup_discard` ones. window_count is
+	 * the live size, capped at sample_window. */
+	uint64_t *samples;
+	uint32_t  head;             /* next write index */
+	uint32_t  window_count;
+	uint64_t  samples_total;
+
+	/* Samples accumulated since last evaluation; triggers
+	 * re-fit when >= n_delta. */
+	uint32_t  samples_since_eval;
+
+	enum mbpta_state state;
+
+	double   ks_stat;
+	double   runs_z;
+	double   crps;
+	uint32_t convergence_streak;
+	uint32_t iid_reject_streak;
+
+	/* Last Gumbel fit. */
+	double   mu;
+	double   sigma;
+	uint64_t pwcet_ns_cached;
+
+	/* Previous block-maxima 1-CDF for CRPS. The series is
+	 * stored sorted ascending, so we can evaluate F_bar at
+	 * common abscissae across rounds. NULL until the first fit
+	 * lands. */
+	double  *prev_bm;
+	uint32_t prev_bm_count;
+};
+
+static int sort_u64_asc(const void *a, const void *b)
+{
+	uint64_t ua = *(const uint64_t *)a;
+	uint64_t ub = *(const uint64_t *)b;
+	return (ua > ub) - (ua < ub);
+}
+
+static int sort_double_asc(const void *a, const void *b)
+{
+	double da = *(const double *)a;
+	double db = *(const double *)b;
+	return (da > db) - (da < db);
+}
+
+mbpta_t *mbpta_create(const struct mbpta_config *cfg)
+{
+	mbpta_t *e;
+
+	if (cfg == NULL)
+		return NULL;
+	if (cfg->sample_window < 2 || cfg->block_size < 2 ||
+			cfg->min_blocks < 2)
+		return NULL;
+	if (cfg->alpha_iid <= 0.0 || cfg->alpha_iid >= 1.0)
+		return NULL;
+	if (cfg->crps_threshold <= 0.0)
+		return NULL;
+	if (cfg->eps_node <= 0.0 || cfg->eps_node >= 1.0)
+		return NULL;
+
+	e = calloc(1, sizeof(*e));
+	if (e == NULL)
+		return NULL;
+	e->cfg = *cfg;
+	e->samples = calloc(cfg->sample_window, sizeof(*e->samples));
+	if (e->samples == NULL) {
+		free(e);
+		return NULL;
+	}
+	e->state = MBPTA_INSUFFICIENT_DATA;
+	return e;
+}
+
+void mbpta_destroy(mbpta_t *e)
+{
+	if (e == NULL)
+		return;
+	free(e->samples);
+	free(e->prev_bm);
+	free(e);
+}
+
+void mbpta_invalidate(mbpta_t *e)
+{
+	if (e == NULL)
+		return;
+	memset(e->samples, 0, e->cfg.sample_window * sizeof(*e->samples));
+	e->head = 0;
+	e->window_count = 0;
+	e->samples_total = 0;
+	e->samples_since_eval = 0;
+	e->state = MBPTA_INSUFFICIENT_DATA;
+	e->ks_stat = 0.0;
+	e->runs_z = 0.0;
+	e->crps = 0.0;
+	e->convergence_streak = 0;
+	e->iid_reject_streak = 0;
+	e->mu = 0.0;
+	e->sigma = 0.0;
+	e->pwcet_ns_cached = 0;
+	free(e->prev_bm);
+	e->prev_bm = NULL;
+	e->prev_bm_count = 0;
+}
+
+/* Two-sample KS statistic on the most recent window split in
+ * halves. Returns D = sup|F1 - F2| over the merged sorted values.
+ * If the window is below the minimum size, returns 0. */
+static double ks_statistic_two_sample(const mbpta_t *e)
+{
+	const uint32_t n = e->window_count;
+	uint32_t m1, m2;
+	uint64_t *h1, *h2;
+	double d_max = 0.0;
+	uint32_t i, j;
+
+	if (n < 4)
+		return 0.0;
+
+	m1 = n / 2;
+	m2 = n - m1;
+	h1 = calloc(m1, sizeof(*h1));
+	h2 = calloc(m2, sizeof(*h2));
+	if (h1 == NULL || h2 == NULL) {
+		free(h1); free(h2);
+		return 0.0;
+	}
+	/* Walk the ring oldest-first. The oldest sample sits at
+	 * (head - window_count + sample_window) mod sample_window;
+	 * subsequent samples follow. We split into the first half
+	 * (h1) and the second half (h2) for the two-sample test. */
+	uint32_t start = (e->head + e->cfg.sample_window - e->window_count)
+		% e->cfg.sample_window;
+	for (i = 0; i < m1; i++)
+		h1[i] = e->samples[(start + i) % e->cfg.sample_window];
+	for (j = 0; j < m2; j++)
+		h2[j] = e->samples[(start + m1 + j) % e->cfg.sample_window];
+
+	qsort(h1, m1, sizeof(*h1), sort_u64_asc);
+	qsort(h2, m2, sizeof(*h2), sort_u64_asc);
+
+	/* Two-pointer sweep over the merge to evaluate the CDFs at
+	 * every distinct value. */
+	i = 0; j = 0;
+	while (i < m1 || j < m2) {
+		double f1 = (double)i / (double)m1;
+		double f2 = (double)j / (double)m2;
+		double d = f1 > f2 ? f1 - f2 : f2 - f1;
+		if (d > d_max)
+			d_max = d;
+		if (i < m1 && (j >= m2 || h1[i] <= h2[j]))
+			i++;
+		else
+			j++;
+	}
+
+	free(h1);
+	free(h2);
+	return d_max;
+}
+
+/* KS critical value at significance alpha for two samples of
+ * size m and n. The Smirnov / Massey approximation:
+ *
+ *   D_crit = c(alpha) * sqrt((m + n) / (m * n))
+ *
+ * with c(0.05) ~ 1.36. */
+static double ks_critical(double alpha, uint32_t m, uint32_t n)
+{
+	double c = 1.36; /* alpha = 0.05 default */
+	if (alpha <= 0.01)
+		c = 1.63;
+	else if (alpha <= 0.025)
+		c = 1.48;
+	else if (alpha <= 0.05)
+		c = 1.36;
+	else if (alpha <= 0.10)
+		c = 1.22;
+	else if (alpha <= 0.20)
+		c = 1.07;
+	return c * sqrt((double)(m + n) / ((double)m * (double)n));
+}
+
+/* Wald-Wolfowitz runs test on sign(x_{i+1} - x_i). Returns Z =
+ * (R - E[R]) / sqrt(Var[R]); reject independence at 5% if |Z| > 1.96. */
+static double runs_z(const mbpta_t *e)
+{
+	const uint32_t n = e->window_count;
+	uint32_t runs = 0;
+	uint32_t m = 0, p = 0;          /* minus / plus counts */
+	int prev_sign = 0;
+	uint32_t i;
+	double er, vr;
+
+	if (n < 4)
+		return 0.0;
+
+	uint32_t start = (e->head + e->cfg.sample_window - e->window_count)
+		% e->cfg.sample_window;
+	uint64_t prev_x = e->samples[start];
+	for (i = 1; i < n; i++) {
+		uint64_t x = e->samples[(start + i) % e->cfg.sample_window];
+		int s = (x > prev_x) ? 1 : (x < prev_x ? -1 : 0);
+		if (s == 1) p++;
+		else if (s == -1) m++;
+		if (s != 0) {
+			if (s != prev_sign) {
+				runs++;
+				prev_sign = s;
+			}
+		}
+		prev_x = x;
+	}
+
+	uint32_t N = p + m;
+	if (N < 2 || p == 0 || m == 0)
+		return 0.0;
+
+	er = 2.0 * (double)p * (double)m / (double)N + 1.0;
+	vr = 2.0 * (double)p * (double)m *
+		(2.0 * (double)p * (double)m - (double)N) /
+		((double)N * (double)N * (double)(N - 1));
+	if (vr <= 0.0)
+		return 0.0;
+	return ((double)runs - er) / sqrt(vr);
+}
+
+/* Build the block-maxima series from the current window. Block
+ * size is e->cfg.block_size; the result has floor(window / block)
+ * elements in `out`. Returns the number of blocks written. */
+static uint32_t build_block_maxima(const mbpta_t *e, double *out, uint32_t cap)
+{
+	uint32_t n_blocks, b, k;
+	uint32_t start = (e->head + e->cfg.sample_window - e->window_count)
+		% e->cfg.sample_window;
+
+	n_blocks = e->window_count / e->cfg.block_size;
+	if (n_blocks > cap)
+		n_blocks = cap;
+
+	for (b = 0; b < n_blocks; b++) {
+		uint64_t mx = 0;
+		for (k = 0; k < e->cfg.block_size; k++) {
+			uint32_t idx = (start + b * e->cfg.block_size + k)
+				% e->cfg.sample_window;
+			if (e->samples[idx] > mx)
+				mx = e->samples[idx];
+		}
+		out[b] = (double)mx;
+	}
+	return n_blocks;
+}
+
+/* Gumbel parameter estimate via QQ-plot linear regression. The
+ * input array `bm` is mutated (sorted ascending). For each
+ * sorted bm[i], the empirical CDF is p_i = (i + 1) / (n + 1);
+ * the standard-Gumbel quantile is q_i = -ln(-ln(p_i)). A least-
+ * squares fit y = mu + sigma * q on (q_i, bm[i]) gives mu =
+ * intercept, sigma = slope. */
+static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
+		double *out_sigma)
+{
+	double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+	uint32_t i;
+
+	*out_mu = 0.0;
+	*out_sigma = 0.0;
+	if (n < 2)
+		return;
+
+	qsort(bm, n, sizeof(*bm), sort_double_asc);
+	for (i = 0; i < n; i++) {
+		double p = (double)(i + 1) / (double)(n + 1);
+		double q = -log(-log(p));
+		sx += q;
+		sy += bm[i];
+		sxx += q * q;
+		sxy += q * bm[i];
+	}
+	double denom = (double)n * sxx - sx * sx;
+	if (denom <= 0.0)
+		return;
+	*out_sigma = ((double)n * sxy - sx * sy) / denom;
+	*out_mu = (sy - *out_sigma * sx) / (double)n;
+}
+
+/* CRPS comparison between two sorted block-maxima series. We use
+ * the discrete approximation
+ *
+ *   CRPS = sum_i (F_prev_bar(x_i) - F_curr_bar(x_i))^2
+ *
+ * evaluated at the union of abscissae from both series, with
+ * F_bar(x) = 1 - F(x). Smaller values indicate the fit has
+ * stabilised. */
+static double crps_between(const double *prev, uint32_t np,
+		const double *curr, uint32_t nc)
+{
+	uint32_t i, j;
+	double sum = 0.0;
+
+	if (np == 0 || nc == 0)
+		return 0.0;
+
+	for (i = 0; i < np; i++) {
+		/* F_prev(prev[i]) = (i + 1) / (np + 1) */
+		double fp = (double)(i + 1) / (double)(np + 1);
+		double fc;
+		/* Empirical F_curr at prev[i]: number of curr values
+		 * <= prev[i], divided by nc. */
+		uint32_t cnt = 0;
+		for (j = 0; j < nc; j++)
+			if (curr[j] <= prev[i])
+				cnt++;
+		fc = (double)cnt / (double)nc;
+		double d = (1.0 - fp) - (1.0 - fc);
+		sum += d * d;
+	}
+	/* Normalise by np so threshold values are comparable across
+	 * runs with different block counts. */
+	return sum / (double)np;
+}
+
+/* Re-evaluate the pipeline. Updates e->state, e->ks_stat,
+ * e->runs_z, e->mu, e->sigma, e->crps, e->convergence_streak,
+ * e->iid_reject_streak, and the pWCET cache. */
+static void mbpta_step(mbpta_t *e)
+{
+	double *bm = NULL;
+	uint32_t n_blocks;
+	double mu = 0.0, sigma = 0.0;
+	bool iid_ok, gumbel_ok = true;
+
+	if (e->window_count < e->cfg.block_size * e->cfg.min_blocks) {
+		e->state = MBPTA_INSUFFICIENT_DATA;
+		return;
+	}
+
+	e->ks_stat = ks_statistic_two_sample(e);
+	e->runs_z = runs_z(e);
+
+	double ks_crit = ks_critical(e->cfg.alpha_iid,
+			e->window_count / 2, e->window_count - e->window_count / 2);
+	bool ks_ok = e->ks_stat <= ks_crit;
+	bool runs_ok = (e->runs_z > -1.96 && e->runs_z < 1.96);
+	iid_ok = ks_ok && runs_ok;
+
+	if (!iid_ok) {
+		e->iid_reject_streak++;
+		if (e->state == MBPTA_PWCET_VALID) {
+			if (e->iid_reject_streak >= e->cfg.n_iid_reject)
+				e->state = MBPTA_DRIFT;
+		} else {
+			e->state = MBPTA_IID_PENDING;
+		}
+		e->convergence_streak = 0;
+		return;
+	}
+	e->iid_reject_streak = 0;
+
+	bm = calloc(e->cfg.sample_window / e->cfg.block_size,
+			sizeof(*bm));
+	if (bm == NULL)
+		return;
+
+	n_blocks = build_block_maxima(e, bm,
+			e->cfg.sample_window / e->cfg.block_size);
+	if (n_blocks < e->cfg.min_blocks) {
+		e->state = MBPTA_INSUFFICIENT_DATA;
+		free(bm);
+		return;
+	}
+
+	gumbel_fit(bm, n_blocks, &mu, &sigma);
+	if (sigma <= 0.0)
+		gumbel_ok = false;
+
+	if (!gumbel_ok) {
+		e->state = MBPTA_NON_GUMBEL;
+		e->convergence_streak = 0;
+		free(bm);
+		return;
+	}
+
+	e->mu = mu;
+	e->sigma = sigma;
+
+	/* CRPS against the previous fit's block-maxima 1-CDF. The
+	 * very first valid fit has no previous; that round just
+	 * stores the series and stays in PENDING_CONVERGENCE. */
+	if (e->prev_bm != NULL && e->prev_bm_count > 0) {
+		e->crps = crps_between(e->prev_bm, e->prev_bm_count,
+				bm, n_blocks);
+		if (e->crps <= e->cfg.crps_threshold) {
+			e->convergence_streak++;
+			if (e->convergence_streak >= e->cfg.n_conv) {
+				e->state = MBPTA_PWCET_VALID;
+				e->pwcet_ns_cached = (uint64_t)(mu - sigma *
+					log(-log(1.0 - e->cfg.eps_node)));
+			} else {
+				e->state = MBPTA_PENDING_CONVERGENCE;
+			}
+		} else {
+			e->convergence_streak = 0;
+			e->state = MBPTA_PENDING_CONVERGENCE;
+		}
+	} else {
+		e->state = MBPTA_PENDING_CONVERGENCE;
+		e->convergence_streak = 0;
+	}
+
+	/* Cache the current block-maxima series for the next CRPS
+	 * comparison. */
+	free(e->prev_bm);
+	e->prev_bm = bm;
+	e->prev_bm_count = n_blocks;
+}
+
+bool mbpta_add_sample(mbpta_t *e, uint64_t sample_ns)
+{
+	if (e == NULL)
+		return false;
+
+	e->samples_total++;
+	if (e->samples_total <= e->cfg.warmup_discard)
+		return false;
+
+	e->samples[e->head] = sample_ns;
+	e->head = (e->head + 1) % e->cfg.sample_window;
+	if (e->window_count < e->cfg.sample_window)
+		e->window_count++;
+
+	e->samples_since_eval++;
+	if (e->samples_since_eval < e->cfg.n_delta)
+		return false;
+
+	e->samples_since_eval = 0;
+	mbpta_step(e);
+	return true;
+}
+
+enum mbpta_state mbpta_state(const mbpta_t *e)
+{
+	return e ? e->state : MBPTA_INSUFFICIENT_DATA;
+}
+
+uint32_t mbpta_sample_count(const mbpta_t *e)
+{
+	return e ? e->window_count : 0;
+}
+
+uint32_t mbpta_block_count(const mbpta_t *e)
+{
+	return e ? (e->window_count / e->cfg.block_size) : 0;
+}
+
+double mbpta_mu(const mbpta_t *e)        { return e ? e->mu : 0.0; }
+double mbpta_sigma(const mbpta_t *e)     { return e ? e->sigma : 0.0; }
+double mbpta_ks_stat(const mbpta_t *e)   { return e ? e->ks_stat : 0.0; }
+double mbpta_runs_z(const mbpta_t *e)    { return e ? e->runs_z : 0.0; }
+double mbpta_crps(const mbpta_t *e)      { return e ? e->crps : 0.0; }
+uint32_t mbpta_convergence_streak(const mbpta_t *e)
+{
+	return e ? e->convergence_streak : 0;
+}
+uint32_t mbpta_iid_reject_streak(const mbpta_t *e)
+{
+	return e ? e->iid_reject_streak : 0;
+}
+
+uint64_t mbpta_pwcet_ns(const mbpta_t *e)
+{
+	if (e == NULL || e->state != MBPTA_PWCET_VALID)
+		return 0;
+	return e->pwcet_ns_cached;
+}
