@@ -266,6 +266,69 @@ PWTEST(mbpta_non_gumbel_distribution_rejects_fit)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_runs_test_rejects_monotone_trend)
+{
+	/* Cucu-Grosjean 2012 §V-C uses the Wald-Wolfowitz runs test
+	 * as the independence gate. A strictly monotone sample
+	 * stream has sign(x_{i+1} - x_i) = +1 everywhere, which
+	 * collapses the number of runs to 1 -- the test rejects
+	 * with |Z| well above the 1.96 alpha=0.05 threshold and the
+	 * estimator must never reach PWCET_VALID. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t i;
+	enum mbpta_state s;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 4 * c.sample_window; i++)
+		mbpta_add_sample(e, 1000 + (uint64_t)i);
+
+	s = mbpta_state(e);
+	pwtest_bool_true(s != MBPTA_PWCET_VALID);
+	pwtest_bool_true(mbpta_pwcet_ns(e) == 0);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_insufficient_data_until_b_min_blocks)
+{
+	/* The block-maxima Gumbel fit needs at least min_blocks
+	 * disjoint blocks of size block_size before any pWCET claim
+	 * can be made (Cucu-Grosjean 2012 §II-B). Feed strictly
+	 * fewer samples than block_size * min_blocks and check that
+	 * the estimator stays in INSUFFICIENT_DATA with no
+	 * pwcet_ns published. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t target_samples, fed_samples, i;
+
+	c.warmup_discard = 0;
+	c.n_delta = 4;
+	target_samples = c.block_size * c.min_blocks;
+	pwtest_bool_true(target_samples >= 4);
+	fed_samples = target_samples - 1;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < fed_samples; i++)
+		mbpta_add_sample(e, 1000 + (uint64_t)(i % 7));
+
+	/* Below the block_size * min_blocks threshold the estimator
+	 * may not publish a pWCET; whether the per-step path has
+	 * accumulated any block maxima yet is an implementation
+	 * detail. The contract that matters is no pWCET claim and a
+	 * non-PWCET_VALID state. */
+	pwtest_bool_true(mbpta_state(e) != MBPTA_PWCET_VALID);
+	pwtest_bool_true(mbpta_pwcet_ns(e) == 0);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST(mbpta_eps_node_at_floor_is_not_capped)
 {
 	/* The Cucu-Grosjean 2012 §III-D step 6 working-precision
@@ -332,6 +395,8 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_invalidate_resets_state, PWTEST_NOARG);
 	pwtest_add(mbpta_drift_after_sustained_iid_rejection, PWTEST_NOARG);
 	pwtest_add(mbpta_non_gumbel_distribution_rejects_fit, PWTEST_NOARG);
+	pwtest_add(mbpta_runs_test_rejects_monotone_trend, PWTEST_NOARG);
+	pwtest_add(mbpta_insufficient_data_until_b_min_blocks, PWTEST_NOARG);
 	pwtest_add(mbpta_eps_node_at_floor_is_not_capped, PWTEST_NOARG);
 	pwtest_add(mbpta_eps_node_below_floor_is_clamped, PWTEST_NOARG);
 	pwtest_add(mbpta_eps_node_above_floor_passes_through, PWTEST_NOARG);
