@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "contracted.h"
+#include "dag.h"
 
 contracted_dag_t *contracted_dag_create(uint64_t period_ns, uint64_t deadline_ns)
 {
@@ -371,4 +372,89 @@ bool contracted_dag_has_cycle(const contracted_dag_t *cg)
 	free(colour);
 	free(stack);
 	return result;
+}
+
+/* --- contracted_dag <-> dag_t bridge --- */
+
+/* Return the leader (lowest-id) member's tid, or -1 on empty
+ * macro-node. The leader convention matches sched_groups: the
+ * lowest-id member acts as the cache anchor and identifies the
+ * shared data-loop TID. */
+static pid_t macro_leader_tid(const contracted_node_t *cn)
+{
+	struct contracted_member *m;
+	struct contracted_member *leader = NULL;
+
+	spa_list_for_each(m, &cn->members, link) {
+		if (leader == NULL || m->id < leader->id)
+			leader = m;
+	}
+	return leader != NULL ? leader->tid : (pid_t)-1;
+}
+
+int contracted_dag_to_dag(const contracted_dag_t *cg,
+		double admission_ceiling, uint32_t num_cpus,
+		const double *relative_capacity,
+		struct dag **out)
+{
+	struct dag *g = NULL;
+	contracted_node_t *cn;
+	contracted_edge_t *ce;
+	int r;
+
+	if (cg == NULL || out == NULL)
+		return -EINVAL;
+	*out = NULL;
+
+	g = dag_create(cg->period_ns, cg->deadline_ns, admission_ceiling,
+			num_cpus, relative_capacity);
+	if (g == NULL)
+		return -errno != 0 ? -errno : -ENOMEM;
+
+	/* One dag_node per macro-node. Real nodes only: the
+	 * deadline-splitter's own fictitious source/sink will be
+	 * added by dag_recalculate as before. */
+	spa_list_for_each(cn, &cg->nodes, link) {
+		uint64_t wcet = contracted_node_effective_wcet(cn);
+		pid_t tid = macro_leader_tid(cn);
+		r = dag_add_node(g, cn->id, wcet, tid, /*fictitious*/ false);
+		if (r < 0) {
+			dag_destroy(g);
+			return r;
+		}
+	}
+	spa_list_for_each(ce, &cg->edges, link) {
+		r = dag_add_edge(g, ce->src->id, ce->dst->id);
+		if (r < 0) {
+			dag_destroy(g);
+			return r;
+		}
+	}
+
+	*out = g;
+	return 0;
+}
+
+int contracted_dag_apply_dag_schedule(contracted_dag_t *cg,
+		const struct dag *g)
+{
+	contracted_node_t *cn;
+
+	if (cg == NULL || g == NULL)
+		return -EINVAL;
+
+	spa_list_for_each(cn, &cg->nodes, link) {
+		/* dag_find_node casts away const because it maintains
+		 * a lazy id-index; the function does not mutate the
+		 * graph topology, only the caches. The const_cast is
+		 * intentional and confined to this bridge. */
+		dag_node_t *dn = dag_find_node((struct dag *)g, cn->id);
+		if (dn == NULL)
+			continue;
+		cn->runtime_budget_ns = dn->wcet;
+		cn->cumulative_deadline_ns = dn->cumulative_deadline;
+		cn->local_deadline_ns = dn->local_deadline;
+		cn->cpu = (dn->cpu == DAG_CPU_INVALID) ? -1 : (int)dn->cpu;
+	}
+	return 0;
 }

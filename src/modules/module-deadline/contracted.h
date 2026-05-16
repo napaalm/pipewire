@@ -276,6 +276,70 @@ int contracted_node_set_overhead(contracted_node_t *cn,
  * as the macro-node's runtime budget input. Returns 0 on NULL. */
 uint64_t contracted_node_effective_wcet(const contracted_node_t *cn);
 
+/*
+ * Bridge between the contracted DAG and the existing scheduling-DAG
+ * analysis. The analysis layer (dag_recalculate -> deadline split ->
+ * worst-fit placement -> EDF feasibility) is the one place the
+ * project pins its proofs; rewriting it on top of contracted_dag_t
+ * directly would either duplicate the implementation or risk
+ * divergence from the unit-tested baseline. The functions below
+ * project the contracted DAG onto a synthesised dag_t -- one
+ * dag_node per macro-node, carrying the macro-node's effective
+ * WCET and leader TID -- so the existing splitter / placer /
+ * feasibility checker operate on the macro-node task set without
+ * change.
+ *
+ * Mapping convention:
+ *   - dag_node::id    = contracted_node::id (the dense index
+ *     contracted_dag_add_node assigned). Every macro-node id is
+ *     unique within a contracted DAG, so the dag_t's id space stays
+ *     consistent.
+ *   - dag_node::wcet  = contracted_node_effective_wcet(macro)
+ *                     = macro.wcet_ns + macro.overhead_ns.
+ *   - dag_node::tid   = the leader member's tid (the lowest-id
+ *     member when iterated). Used by the foreach callback to
+ *     identify the macro-node's data-loop thread.
+ *   - edges           = contracted edges, 1-to-1.
+ *
+ * The synthesised dag_t is owned by the caller and must be freed
+ * with dag_destroy(). The contracted_dag_t is independently owned;
+ * the bridge does not take a reference to it past the build call.
+ */
+struct dag;
+
+/*
+ * Build a fresh dag_t from a contracted DAG. The caller supplies
+ * the global period / deadline (carried through from contracted_dag),
+ * the admission ceiling and CPU configuration (forwarded to
+ * dag_create), and an optional per-CPU relative_capacity vector.
+ *
+ * Returns 0 on success with *out pointing at the new dag_t.
+ * Returns -EINVAL on null arguments, -ENOMEM on allocation failure,
+ * or the dag_t API's error code on rejection (e.g. an invalid
+ * admission ceiling, see dag_create). On failure *out is set to
+ * NULL and any partially-built dag_t is destroyed.
+ */
+int contracted_dag_to_dag(const contracted_dag_t *cg,
+		double admission_ceiling, uint32_t num_cpus,
+		const double *relative_capacity,
+		struct dag **out);
+
+/*
+ * Copy the per-macro-node scheduling parameters (cumulative_deadline,
+ * local_deadline, cpu) from the recalculated dag_t back into the
+ * contracted DAG. The dag_t must have been produced by
+ * contracted_dag_to_dag() against the same contracted DAG and run
+ * through dag_recalculate() since.
+ *
+ * On a missing macro-node id in the dag_t the field is left
+ * untouched; this is intentional so a follow-up call can build a
+ * partial schedule without erasing previously-populated values.
+ *
+ * Returns 0 on success, -EINVAL on null arguments.
+ */
+int contracted_dag_apply_dag_schedule(contracted_dag_t *cg,
+		const struct dag *g);
+
 #ifdef __cplusplus
 }
 #endif

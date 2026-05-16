@@ -21,6 +21,7 @@
 #include "pwtest.h"
 
 #include "../src/modules/module-deadline/contracted.h"
+#include "../src/modules/module-deadline/dag.h"
 
 PWTEST(contracted_create_destroy_null_safe)
 {
@@ -410,6 +411,126 @@ PWTEST(contracted_overhead_set_replaces_not_adds)
 	return PWTEST_PASS;
 }
 
+/* --- bridge tests --- */
+
+/* Build a chain {A,B} -> C contracted DAG, project to dag_t, run
+ * the splitter, copy the schedule back. Verify the macro-node's
+ * fields are populated and that the AB macro-node (with overhead)
+ * sees its effective WCET as its kernel runtime input. */
+PWTEST(contracted_bridge_round_trip)
+{
+	contracted_dag_t *cg;
+	struct dag *g = NULL;
+	int r;
+
+	cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *ab = contracted_dag_add_node(cg);
+	contracted_node_t *c  = contracted_dag_add_node(cg);
+
+	/* AB: two members with WCETs 50 + 30, plus 10ns overhead. */
+	pwtest_int_eq(contracted_node_add_member(ab, 10, 1010, 50), 0);
+	pwtest_int_eq(contracted_node_add_member(ab, 11, 1011, 30), 0);
+	ab->wcet_ns = 80;
+	struct contracted_overhead_components ohc = {
+		.group_dispatch_ns = 10, 0, 0, 0, 0,
+	};
+	pwtest_int_eq(contracted_node_set_overhead(ab, &ohc), 0);
+
+	/* C: singleton, WCET 100, no overhead. */
+	pwtest_int_eq(contracted_node_add_member(c, 12, 1012, 100), 0);
+	c->wcet_ns = 100;
+
+	pwtest_int_eq(contracted_dag_add_edge(cg, ab, c), 0);
+
+	/* Bridge to dag_t and run analysis. */
+	r = contracted_dag_to_dag(cg, 0.95, 1, NULL, &g);
+	pwtest_int_eq(r, 0);
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* AB's dag_node wcet must equal the effective WCET (work +
+	 * overhead). The leader's tid (lowest member id 10) becomes
+	 * the dag_node tid. */
+	dag_node_t *ab_dn = dag_find_node(g, ab->id);
+	pwtest_ptr_notnull(ab_dn);
+	pwtest_int_eq((int)ab_dn->wcet, 90);   /* 50 + 30 + 10 */
+	pwtest_int_eq((int)ab_dn->tid, 1010);
+	pwtest_bool_true(ab_dn->local_deadline > 0);
+	pwtest_bool_true(ab_dn->cumulative_deadline > 0);
+
+	dag_node_t *c_dn = dag_find_node(g, c->id);
+	pwtest_int_eq((int)c_dn->wcet, 100);
+	pwtest_int_eq((int)c_dn->tid, 1012);
+
+	/* Copy results back. */
+	pwtest_int_eq(contracted_dag_apply_dag_schedule(cg, g), 0);
+	pwtest_bool_true(ab->local_deadline_ns > 0);
+	pwtest_bool_true(ab->cumulative_deadline_ns > 0);
+	pwtest_int_eq((int)ab->runtime_budget_ns, 90);
+	pwtest_int_eq((int)ab->local_deadline_ns,
+		      (int)ab_dn->local_deadline);
+	pwtest_int_eq((int)ab->cumulative_deadline_ns,
+		      (int)ab_dn->cumulative_deadline);
+	pwtest_int_eq(ab->cpu, (int)ab_dn->cpu);
+
+	pwtest_bool_true(c->local_deadline_ns > 0);
+	pwtest_int_eq((int)c->runtime_budget_ns, 100);
+
+	/* Edge is preserved: in the dag_t there is exactly one
+	 * incoming edge to C from AB. */
+	dag_edge_t *e;
+	uint32_t c_preds = 0;
+	spa_list_for_each(e, &c_dn->incoming, dst_link) {
+		pwtest_ptr_eq(e->src, ab_dn);
+		c_preds++;
+	}
+	pwtest_int_eq((int)c_preds, 1);
+
+	dag_destroy(g);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_bridge_null_safe)
+{
+	struct dag *g = NULL;
+	pwtest_int_eq(contracted_dag_to_dag(NULL, 0.95, 1, NULL, &g),
+		      -EINVAL);
+	pwtest_int_eq(contracted_dag_to_dag((contracted_dag_t *)0x1,
+				0.95, 1, NULL, NULL), -EINVAL);
+	pwtest_int_eq(contracted_dag_apply_dag_schedule(NULL, NULL), -EINVAL);
+	return PWTEST_PASS;
+}
+
+/* If the dag_t is missing a macro-node id (e.g., because the
+ * caller built a partial schedule), apply_dag_schedule must leave
+ * the contracted node's existing fields alone rather than zero
+ * them. */
+PWTEST(contracted_bridge_missing_node_preserves_fields)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *cn = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(cn, 1, 100, 50), 0);
+	cn->wcet_ns = 50;
+	cn->local_deadline_ns = 12345;
+	cn->cumulative_deadline_ns = 67890;
+	cn->runtime_budget_ns = 50;
+	cn->cpu = 7;
+
+	/* An empty dag_t has no matching macro-node id. */
+	struct dag *g = dag_create(1000, 1000, 0.95, 1, NULL);
+	pwtest_int_eq(contracted_dag_apply_dag_schedule(cg, g), 0);
+	pwtest_int_eq((int)cn->local_deadline_ns, 12345);
+	pwtest_int_eq((int)cn->cumulative_deadline_ns, 67890);
+	pwtest_int_eq((int)cn->runtime_budget_ns, 50);
+	pwtest_int_eq(cn->cpu, 7);
+
+	dag_destroy(g);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -433,6 +554,9 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_overhead_set_rejects_null, PWTEST_NOARG);
 	pwtest_add(contracted_overhead_effective_wcet_null_safe, PWTEST_NOARG);
 	pwtest_add(contracted_overhead_set_replaces_not_adds, PWTEST_NOARG);
+	pwtest_add(contracted_bridge_round_trip, PWTEST_NOARG);
+	pwtest_add(contracted_bridge_null_safe, PWTEST_NOARG);
+	pwtest_add(contracted_bridge_missing_node_preserves_fields, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
