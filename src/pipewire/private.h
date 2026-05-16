@@ -526,6 +526,15 @@ struct pw_node_target {
 	struct pw_impl_node *node;
 	struct pw_node_activation *activation;
 	struct spa_system *system;
+	/* If non-NULL and equal to `system`, the consumer this target
+	 * points at lives on the same data-loop thread as the producer
+	 * that owns this target struct. trigger_target_v1 then bypasses
+	 * the eventfd write + epoll wake and dispatches the consumer's
+	 * process inline on the producer's stack -- §3.5 of
+	 * docs/scheduling-optimizations.md (eventfd coalescing across
+	 * fused boundaries). NULL means "always use the eventfd path"
+	 * and is the safe default; see pw_impl_node_dispatch_inline. */
+	struct spa_system *src_system;
 	int fd;
 	int (*trigger)(struct pw_node_target *t, uint64_t nsec);
 	unsigned int active:1;
@@ -541,6 +550,9 @@ static inline void copy_target(struct pw_node_target *dst, const struct pw_node_
 	dst->system = src->system;
 	dst->fd = src->fd;
 	dst->trigger = src->trigger;
+	/* src_system is NOT copied: it identifies which loop the
+	 * *owner* of the destination target dispatches on, which is set
+	 * by the owner (pw_node_peer_ref) after copy_target returns. */
 }
 
 /* versions:
@@ -686,6 +698,16 @@ static inline uint64_t get_cputime_ns(struct spa_system *system)
 	return SPA_TIMESPEC_TO_NSEC(&ts);
 }
 
+/* called when a producer's data-loop thread observes that its own
+ * process has finished and one of its targets needs to advance. The
+ * fast path (§3.5 of docs/scheduling-optimizations.md): when the
+ * target sits on the same data-loop thread as the producer, skip the
+ * eventfd write + epoll wake and dispatch the consumer's process
+ * inline on the producer's stack. The state machine is identical:
+ * pw_impl_node_dispatch_inline does the same CAS TRIGGERED -> AWAKE
+ * transition that node_on_fd_events would have done after waking. */
+int pw_impl_node_dispatch_inline(struct pw_node_target *t, uint64_t nsec);
+
 /* called from data-loop decrement the dependency counter of the target and when
  * there are no more dependencies, trigger the node. */
 static inline int trigger_target_v1(struct pw_node_target *t, uint64_t nsec)
@@ -703,6 +725,18 @@ static inline int trigger_target_v1(struct pw_node_target *t, uint64_t nsec)
 					PW_NODE_ACTIVATION_NOT_TRIGGERED,
 					PW_NODE_ACTIVATION_TRIGGERED))) {
 			a->signal_time = nsec;
+			/* Same-loop fast path: when src_system was populated
+			 * by pw_node_peer_ref / pw_impl_node_set_data_loop
+			 * to mean "the producer that owns this target lives
+			 * on the same spa_system (and therefore the same OS
+			 * thread) as the consumer it points at", the
+			 * eventfd round-trip is pure overhead -- the next
+			 * thing the producer's epoll iteration would do is
+			 * read the byte we just wrote and call process_node
+			 * on this very thread. Skip both syscalls and
+			 * inline-dispatch instead. */
+			if (t->src_system != NULL && t->src_system == t->system)
+				return pw_impl_node_dispatch_inline(t, nsec);
 			if (SPA_UNLIKELY((r = spa_system_eventfd_write(t->system, t->fd, 1)) < 0)) {
 				pw_log_warn("%p: write failed %s", t->node, spa_strerror(r));
 				res = r;

@@ -154,6 +154,21 @@ test('test-loop',
                link_with: pwtest_lib)
 )
 
+# Same-loop fast path in trigger_target_v1 (§3.5 of
+# docs/scheduling-optimizations.md). The test intercepts
+# pw_impl_node_dispatch_inline through ld's --wrap so the dispatch
+# decision inside the static-inline trigger_target_v1 can be observed
+# without spinning up a real pw_impl_node + spa_node graph (covered
+# instead by live-test/inline-dispatch.sh).
+test('test-trigger-target',
+    executable('test-trigger-target',
+               'test-trigger-target.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_args: [ '-Wl,--wrap=pw_impl_node_dispatch_inline' ],
+               link_with: pwtest_lib)
+)
+
 if get_option('spa-plugins').allowed()
 test('test-context',
     executable('test-context',
