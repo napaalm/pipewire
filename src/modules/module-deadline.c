@@ -1017,9 +1017,10 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
  * Singleton TIDs (n_members == 1) take exactly the same code path
  * as multi-member groups -- the original one-node-one-thread case
  * is just the degenerate single-member group. */
-static void apply_sched_groups(struct impl *impl)
+static void apply_sched_groups(struct impl *impl, struct node *drv)
 {
 	uint32_t i;
+	bool any_failure = false;
 	for (i = 0; i < impl->sched_groups.count; i++) {
 		struct sched_group *g = &impl->sched_groups.entries[i];
 		struct node *anchor;
@@ -1095,8 +1096,18 @@ static void apply_sched_groups(struct impl *impl)
 			anchor->last_applied  = true;
 		} else {
 			anchor->last_applied = false;
+			any_failure = true;
 		}
 	}
+	/* Any kernel-side rejection of the in-process feasibility
+	 * verdict proves the schedule does not meet every deadline
+	 * on every activation -- the kernel's admission test is the
+	 * final authority. Force the driver's published mode to
+	 * SOFT_DEGRADED so the JSON snapshot reflects reality;
+	 * the next reconcile pass re-evaluates and may promote
+	 * back to HARD via the standard hysteresis path. */
+	if (any_failure && drv != NULL && drv->reconcile != NULL)
+		reconcile_state_force_soft(drv->reconcile, "kernel_rejected");
 }
 
 /* Bsearch over impl->nodes_by_id for `id`; returns the array slot
@@ -1713,7 +1724,7 @@ static void recalc_params_sync(struct node *drv)
 
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
-	apply_sched_groups(impl);
+	apply_sched_groups(impl, drv);
 
 	free(followers);
 	free(edges);
@@ -2804,7 +2815,7 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
-	apply_sched_groups(impl);
+	apply_sched_groups(impl, drv);
 
 	free(followers);
 	free(edges);

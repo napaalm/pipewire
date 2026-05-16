@@ -116,6 +116,22 @@ void reconcile_state_feasibility(const reconcile_state_t *state,
 	*out = state->feas;
 }
 
+void reconcile_state_force_soft(reconcile_state_t *state, const char *reason)
+{
+	if (state == NULL)
+		return;
+	if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
+		pw_log_warn("reconcile: external signal (%s) forces "
+			"SOFT_DEGRADED; hard-real-time guarantees dropped",
+			reason ? reason : "unspecified");
+	}
+	state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
+	state->feas.consecutive_hard_passes = 0;
+	if (reason != NULL)
+		snprintf(state->feas.reason, sizeof(state->feas.reason),
+				"%s", reason);
+}
+
 void reconcile_drop(reconcile_state_t *state)
 {
 	if (!state)

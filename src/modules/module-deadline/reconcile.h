@@ -203,6 +203,22 @@ struct reconcile_feasibility {
 void reconcile_state_feasibility(const reconcile_state_t *state,
 		struct reconcile_feasibility *out);
 
+/*
+ * Force the schedule mode to SOFT_DEGRADED with the given
+ * reason. The caller uses this when an out-of-band signal
+ * (e.g. sched_setattr() returning a non-zero errno after
+ * reconcile_apply has already published a HARD classification)
+ * proves the kernel rejected the in-process predicates'
+ * verdict. The next reconcile_apply re-evaluates feasibility
+ * on the macro-dag and may restore HARD via the standard
+ * hysteresis path if the predicates accept; this call is a
+ * one-shot demotion of the published classification.
+ *
+ * NULL state is a no-op. The reason string is copied verbatim
+ * into state->feas.reason (truncated to fit).
+ */
+void reconcile_state_force_soft(reconcile_state_t *state, const char *reason);
+
 #ifdef __cplusplus
 }
 #endif
