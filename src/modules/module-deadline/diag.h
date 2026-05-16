@@ -338,6 +338,93 @@ const char *rt_diag_fusion_reject_reason_name(enum rt_diag_fusion_reject_reason 
 void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s,
 					 FILE *out);
 
+/*
+ * Scheduling-parameters slice.
+ *
+ * One entry per schedulable follower carrying the kernel-facing
+ * SCHED_DEADLINE tuple (runtime, deadline, period, cpu) plus a
+ * "cumulative" deadline kept distinct in the API even though, at
+ * Phase 0, it equals the local deadline. Phase 1's deadline-semantics
+ * refactor populates the two fields independently, at which point
+ * the JSON snapshot already carries the distinction without a schema
+ * change.
+ *
+ * The `applied` field reflects whether sched_setattr has issued at
+ * least once for the follower; an entry with applied=false means the
+ * tuple has been computed by the analysis layer but the syscall has
+ * not yet run (typically a brand-new follower).
+ */
+struct rt_diag_param_node {
+	uint32_t id;
+	pid_t    tid;
+	uint64_t runtime_budget_ns;
+	uint64_t local_deadline_ns;
+	uint64_t cumulative_deadline_ns;
+	uint64_t period_ns;
+	uint32_t cpu;
+	bool     applied;
+};
+
+struct rt_diag_params_snapshot {
+	uint32_t driver_id;
+	uint64_t generation;
+
+	struct rt_diag_param_node *nodes;
+	uint32_t n_nodes;
+	uint32_t cap_nodes;
+};
+
+void rt_diag_params_snapshot_init(struct rt_diag_params_snapshot *s);
+void rt_diag_params_snapshot_fini(struct rt_diag_params_snapshot *s);
+void rt_diag_params_snapshot_reset(struct rt_diag_params_snapshot *s);
+
+int rt_diag_params_snapshot_add_node(struct rt_diag_params_snapshot *s,
+				     const struct rt_diag_param_node *node);
+
+/*
+ * Render to `out` as a stable text block:
+ *
+ *   deadline-diag-params: driver=<id> generation=<g> mode=<mode>
+ *     nodes: <n>
+ *       node id=<i> tid=<t> runtime=<r>ns local_deadline=<ld>ns
+ *           cumulative_deadline=<cd>ns period=<p>ns cpu=<c> applied=<bool>
+ *       ...
+ */
+void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s,
+					 const char *mode,
+					 FILE *out);
+
+/*
+ * Combined JSON document.
+ *
+ * Carries the four diagnostic slices plus the driver-level metadata
+ * (mode, feasibility) in one stable structure. The mode and
+ * feasibility strings are caller-provided so the rendered text does
+ * not pretend to a hard/soft classification that the implementation
+ * cannot yet justify; at Phase 0 the caller passes mode="prototype"
+ * and feasibility_method="none".
+ *
+ * Any sub-snapshot pointer may be NULL; the corresponding section is
+ * still emitted as an empty object so the JSON schema is stable
+ * across configurations.
+ */
+struct rt_diag_combined {
+	uint32_t driver_id;
+	uint64_t generation;
+	uint64_t period_ns;
+	uint64_t deadline_ns;
+	const char *mode;                 /* "prototype" today */
+	const char *feasibility_method;   /* "none" today */
+	const char *feasibility_status;   /* "n/a" today */
+
+	const struct rt_diag_raw_snapshot    *raw;
+	const struct rt_diag_sched_snapshot  *sched;
+	const struct rt_diag_fusion_snapshot *fusion;
+	const struct rt_diag_params_snapshot *params;
+};
+
+void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -704,6 +704,16 @@ struct impl {
 	 * follower's pw_impl_node fusion_prev_decision plus the
 	 * PW_KEY_NODE_LOOP_GROUP property. */
 	bool                  debug_dump_fusion;
+
+	/* Machine-readable combined snapshot. When set to a writable
+	 * filesystem path, the snapshot path emits a single JSON
+	 * document covering raw graph / scheduling DAG / fusion /
+	 * parameters / mode / feasibility, per topology-fingerprint
+	 * change. The write is atomic (temp file + rename) so a
+	 * concurrent reader either sees the previous snapshot or the
+	 * fresh one but never a torn document. NULL or empty string
+	 * disables emission. */
+	char                 *debug_snapshot_json_path;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -766,6 +776,7 @@ static void module_destroy(void *data)
 	free(impl->nodes_by_id);
 	free(impl->relative_capacity);
 	free(impl->relative_capacity_nominal);
+	free(impl->debug_snapshot_json_path);
 	cpu_topology_destroy(&impl->topology);
 	sched_groups_fini(&impl->sched_groups);
 	free(impl);
@@ -1990,6 +2001,331 @@ cleanup:
 	rt_diag_fusion_snapshot_fini(&snap);
 }
 
+/* Populate `snap` with the raw-graph view of `drv`. Mirrors the
+ * walk done by dump_raw_graph_main but stops short of rendering;
+ * the JSON emitter feeds the rt_diag_combined struct from the
+ * resulting snapshots. Returns 0 on success, -ENOMEM on
+ * allocation failure (the caller is expected to abandon the
+ * combined dump rather than emit a partial document). */
+static int populate_raw_snapshot(struct impl *impl SPA_UNUSED,
+		struct node *drv, struct rt_diag_raw_snapshot *snap)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	int r;
+
+	snap->driver_id = dnode->info.id;
+	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+	snap->period_ns = drv->topo.period;
+	snap->deadline_ns = drv->topo.period;
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct rt_diag_raw_node rn;
+		memset(&rn, 0, sizeof(rn));
+		rn.id = n_iter->info.id;
+		rn.driver_id = dnode->info.id;
+		rn.tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		rn.flags = RT_DIAG_RAW_NODE_DATA_LOOP;
+		if (n_iter == dnode)
+			rn.flags |= RT_DIAG_RAW_NODE_DRIVER;
+		if (n_iter->async)
+			rn.flags |= RT_DIAG_RAW_NODE_ASYNC;
+		if (n_iter->remote)
+			rn.flags |= RT_DIAG_RAW_NODE_REMOTE;
+		if (n_iter->exported)
+			rn.flags |= RT_DIAG_RAW_NODE_EXPORTED;
+		if (pw_properties_get_bool(n_iter->properties,
+				PW_KEY_NODE_LOOP_DYNAMIC, false))
+			rn.flags |= RT_DIAG_RAW_NODE_DYNAMIC_LOOP;
+		if (n_iter->name != NULL)
+			snprintf(rn.name, sizeof(rn.name), "%s", n_iter->name);
+		r = rt_diag_raw_snapshot_add_node(snap, &rn);
+		if (r < 0)
+			return r;
+	}
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &n_iter->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				struct rt_diag_raw_edge re = { 0 };
+				if (l->input == NULL || l->input->node == NULL)
+					continue;
+				re.src = n_iter->info.id;
+				re.dst = l->input->node->info.id;
+				if (l->feedback)
+					re.flags |= RT_DIAG_RAW_EDGE_FEEDBACK;
+				if (l->output != NULL && l->output->node != NULL &&
+				    (l->output->node->async ||
+				     l->input->node->async))
+					re.flags |= RT_DIAG_RAW_EDGE_ASYNC;
+				r = rt_diag_raw_snapshot_add_edge(snap, &re);
+				if (r < 0)
+					return r;
+			}
+		}
+	}
+	return 0;
+}
+
+static int populate_sched_snapshot(struct impl *impl SPA_UNUSED,
+		struct node *drv, struct rt_diag_sched_snapshot *snap)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	int r;
+
+	snap->driver_id = dnode->info.id;
+	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+	snap->period_ns = drv->topo.period;
+	snap->deadline_ns = drv->topo.period;
+
+	{
+		struct rt_diag_sched_node sn = { 0 };
+		sn.id = dnode->info.id;
+		sn.tid = pw_properties_get_int32(dnode->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		r = rt_diag_sched_snapshot_add_node(snap, &sn);
+		if (r < 0)
+			return r;
+	}
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		if (n_iter == dnode)
+			continue;
+		if (!sched_dag_follower_in_set(n_iter))
+			continue;
+		struct rt_diag_sched_node sn = { 0 };
+		sn.id = n_iter->info.id;
+		sn.tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		r = rt_diag_sched_snapshot_add_node(snap, &sn);
+		if (r < 0)
+			return r;
+	}
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &n_iter->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				struct pw_impl_node *src, *dst;
+				enum rt_diag_sched_exclude_reason reason;
+
+				if (l->input == NULL || l->input->node == NULL)
+					continue;
+				src = n_iter;
+				dst = l->input->node;
+				reason = sched_dag_edge_reason(l, src, dst);
+				if (reason == RT_DIAG_SCHED_EXC_NONE) {
+					struct rt_diag_sched_edge se = { 0 };
+					se.src = src->info.id;
+					se.dst = dst->info.id;
+					r = rt_diag_sched_snapshot_add_edge(snap, &se);
+				} else {
+					struct rt_diag_sched_excluded_edge xe = { 0 };
+					xe.src = src->info.id;
+					xe.dst = dst->info.id;
+					xe.reason = reason;
+					r = rt_diag_sched_snapshot_add_excluded(snap, &xe);
+				}
+				if (r < 0)
+					return r;
+			}
+		}
+	}
+	return 0;
+}
+
+static int populate_fusion_snapshot(struct impl *impl SPA_UNUSED,
+		struct node *drv, struct rt_diag_fusion_snapshot *snap)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+
+	snap->driver_id = dnode->info.id;
+	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		const char *group_name;
+		enum rt_diag_fusion_verdict verdict;
+		enum rt_diag_fusion_reject_reason reason;
+		int slot;
+		uint32_t g;
+		bool found = false;
+
+		group_name = pw_properties_get(n_iter->properties,
+				PW_KEY_NODE_LOOP_GROUP);
+		verdict = diag_verdict_from_core(n_iter->fusion_prev_decision);
+		reason = (verdict == RT_DIAG_FUSION_FUSE)
+				? RT_DIAG_FUSION_REJ_NONE
+				: RT_DIAG_FUSION_REJ_BELOW_THRESHOLD;
+
+		for (g = 0; g < snap->n_groups && !found; g++) {
+			struct rt_diag_fusion_group *grp = &snap->groups[g];
+			if (group_name != NULL) {
+				char buf2[64];
+				snprintf(buf2, sizeof(buf2), "fusion.%u",
+					 grp->leader_id);
+				if (strcmp(buf2, group_name) == 0) {
+					int r = rt_diag_fusion_snapshot_add_member(
+						snap, g, n_iter->info.id);
+					if (r < 0)
+						return r;
+					found = true;
+				}
+			}
+		}
+		if (!found) {
+			uint32_t leader = n_iter->info.id;
+			if (group_name != NULL &&
+			    strncmp(group_name, "fusion.", 7) == 0) {
+				unsigned long parsed = strtoul(group_name + 7,
+						NULL, 10);
+				if (parsed != 0 && parsed <= UINT32_MAX)
+					leader = (uint32_t)parsed;
+			}
+			slot = rt_diag_fusion_snapshot_begin_group(snap,
+					leader, verdict, reason);
+			if (slot < 0)
+				return slot;
+			int r = rt_diag_fusion_snapshot_add_member(snap,
+					(uint32_t)slot, n_iter->info.id);
+			if (r < 0)
+				return r;
+		}
+	}
+	return 0;
+}
+
+/* The per-follower (runtime, deadline, period, cpu) tuple lives on
+ * struct node's last_applied cache (set by sched_cb on every
+ * successful sched_setattr). Followers that have not yet been
+ * touched by the scheduler report applied=false; their numeric
+ * fields are zero. The cache is written by the worker thread and
+ * read here on the main loop -- the values are aligned uint64_t /
+ * uint32_t fields and the read may see a value one cycle stale, but
+ * never torn on this target. */
+static int populate_params_snapshot(struct impl *impl,
+		struct node *drv, struct rt_diag_params_snapshot *snap)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	int r;
+
+	snap->driver_id = dnode->info.id;
+	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		if (n_iter == dnode)
+			continue;
+		if (!sched_dag_follower_in_set(n_iter))
+			continue;
+
+		struct node *mn = find_node_by_id(impl, n_iter->info.id);
+		struct rt_diag_param_node pn = { 0 };
+		pn.id = n_iter->info.id;
+		pn.tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		if (mn != NULL && mn->last_applied) {
+			pn.runtime_budget_ns = mn->last_runtime;
+			pn.local_deadline_ns = mn->last_deadline;
+			pn.cumulative_deadline_ns = mn->last_deadline;
+			pn.period_ns = mn->last_period;
+			pn.cpu = mn->last_cpu;
+			pn.applied = true;
+		} else {
+			pn.applied = false;
+		}
+		r = rt_diag_params_snapshot_add_node(snap, &pn);
+		if (r < 0)
+			return r;
+	}
+	return 0;
+}
+
+/* Atomic JSON snapshot: render the four diagnostic slices into a
+ * temp file, then rename(2) over the final path so concurrent
+ * readers see either the previous full document or the new one,
+ * never a torn write. Emits nothing when debug.snapshot-json-path
+ * is unset or empty. */
+static void dump_combined_json_main(struct impl *impl, struct node *drv)
+{
+	struct rt_diag_raw_snapshot    raw;
+	struct rt_diag_sched_snapshot  sched;
+	struct rt_diag_fusion_snapshot fusion;
+	struct rt_diag_params_snapshot params;
+	struct rt_diag_combined c = { 0 };
+	struct pw_impl_node *dnode = drv->node;
+	char tmp_path[PATH_MAX];
+	FILE *fp;
+	int n;
+
+	if (impl->debug_snapshot_json_path == NULL ||
+	    impl->debug_snapshot_json_path[0] == '\0')
+		return;
+
+	rt_diag_raw_snapshot_init(&raw);
+	rt_diag_sched_snapshot_init(&sched);
+	rt_diag_fusion_snapshot_init(&fusion);
+	rt_diag_params_snapshot_init(&params);
+
+	if (populate_raw_snapshot(impl, drv, &raw) < 0)
+		goto cleanup;
+	if (populate_sched_snapshot(impl, drv, &sched) < 0)
+		goto cleanup;
+	if (populate_fusion_snapshot(impl, drv, &fusion) < 0)
+		goto cleanup;
+	if (populate_params_snapshot(impl, drv, &params) < 0)
+		goto cleanup;
+
+	c.driver_id = dnode->info.id;
+	c.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+	c.period_ns = drv->topo.period;
+	c.deadline_ns = drv->topo.period;
+	/* "prototype" mode acknowledges that hard / soft-degraded
+	 * classification does not yet exist in the implementation; the
+	 * field is reserved for the eventual transition logic. */
+	c.mode = "prototype";
+	c.feasibility_method = "none";
+	c.feasibility_status = "n/a";
+	c.raw = &raw;
+	c.sched = &sched;
+	c.fusion = &fusion;
+	c.params = &params;
+
+	n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp",
+			impl->debug_snapshot_json_path);
+	if (n < 0 || (size_t)n >= sizeof(tmp_path)) {
+		pw_log_warn("snapshot json path too long: %s",
+				impl->debug_snapshot_json_path);
+		goto cleanup;
+	}
+	fp = fopen(tmp_path, "w");
+	if (fp == NULL) {
+		pw_log_warn("cannot open %s for write: %m", tmp_path);
+		goto cleanup;
+	}
+	rt_diag_render_json(&c, fp);
+	if (fclose(fp) != 0) {
+		pw_log_warn("error finishing %s: %m", tmp_path);
+		(void)unlink(tmp_path);
+		goto cleanup;
+	}
+	if (rename(tmp_path, impl->debug_snapshot_json_path) != 0) {
+		pw_log_warn("cannot rename %s -> %s: %m",
+				tmp_path, impl->debug_snapshot_json_path);
+		(void)unlink(tmp_path);
+	}
+
+cleanup:
+	rt_diag_raw_snapshot_fini(&raw);
+	rt_diag_sched_snapshot_fini(&sched);
+	rt_diag_fusion_snapshot_fini(&fusion);
+	rt_diag_params_snapshot_fini(&params);
+}
+
 /* Main-loop context: walk the driver's follower list and the
  * follower ports/links to capture a self-contained topology snapshot
  * that the worker can consume without further main-loop access. */
@@ -2130,6 +2466,8 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 				dump_sched_graph_main(drv->impl, drv);
 			if (drv->impl != NULL && drv->impl->debug_dump_fusion)
 				dump_fusion_main(drv->impl, drv);
+			if (drv->impl != NULL)
+				dump_combined_json_main(drv->impl, drv);
 		}
 	}
 	SPA_ATOMIC_STORE(t->pending, 0);
@@ -2743,6 +3081,17 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (impl->debug_dump_fusion)
 		pw_log_info("debug.dump-fusion = true (fusion-decision"
 				" diagnostic dumps will be logged on topology change)");
+	{
+		const char *jp = pw_properties_get(props, "debug.snapshot-json-path");
+		if (jp != NULL && jp[0] != '\0') {
+			impl->debug_snapshot_json_path = strdup(jp);
+			if (impl->debug_snapshot_json_path == NULL)
+				pw_log_warn("strdup of snapshot json path failed: %m");
+			else
+				pw_log_info("debug.snapshot-json-path = %s",
+					impl->debug_snapshot_json_path);
+		}
+	}
 
 	impl->recalc_persistent = pw_properties_get_bool(props, "recalc.persistent", true);
 	impl->wcet_recalc_threshold = 0.01;

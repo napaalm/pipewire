@@ -444,6 +444,235 @@ PWTEST(diag_fusion_verdict_and_reason_names)
 	return PWTEST_PASS;
 }
 
+/* --- scheduling-parameters slice tests --- */
+
+PWTEST(diag_params_init_zeroes)
+{
+	struct rt_diag_params_snapshot s;
+	memset(&s, 0xcc, sizeof(s));
+	rt_diag_params_snapshot_init(&s);
+	pwtest_ptr_null(s.nodes);
+	pwtest_int_eq((int)s.n_nodes, 0);
+	pwtest_int_eq((int)s.cap_nodes, 0);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_params_null_safe)
+{
+	rt_diag_params_snapshot_init(NULL);
+	rt_diag_params_snapshot_fini(NULL);
+	rt_diag_params_snapshot_reset(NULL);
+	rt_diag_params_snapshot_render_text(NULL, "x", stderr);
+	pwtest_int_eq(rt_diag_params_snapshot_add_node(NULL, NULL), -EINVAL);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_params_render_text_golden)
+{
+	struct rt_diag_params_snapshot s;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	const char expected[] =
+		"deadline-diag-params: driver=63 generation=4 mode=prototype\n"
+		"  nodes: 2\n"
+		"    node id=37 tid=302370 runtime=85494ns local_deadline=21333333ns"
+		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true\n"
+		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
+		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false\n";
+
+	rt_diag_params_snapshot_init(&s);
+	s.driver_id = 63;
+	s.generation = 4;
+
+	struct rt_diag_param_node n = { 0 };
+	n.id = 37; n.tid = 302370;
+	n.runtime_budget_ns = 85494; n.local_deadline_ns = 21333333;
+	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
+	n.cpu = 4; n.applied = true;
+	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
+	n.id = 38; n.tid = 302371;
+	n.runtime_budget_ns = 42620; n.local_deadline_ns = 21333333;
+	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
+	n.cpu = 5; n.applied = false;
+	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_params_snapshot_render_text(&s, "prototype", fp);
+	fclose(fp);
+	pwtest_str_eq(buf, expected);
+
+	free(buf);
+	rt_diag_params_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
+/* --- combined JSON renderer tests --- */
+
+PWTEST(diag_json_null_inputs)
+{
+	rt_diag_render_json(NULL, stderr);
+	struct rt_diag_combined c = { 0 };
+	rt_diag_render_json(&c, NULL);
+	/* No crash, no output. */
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_json_empty_combined)
+{
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	const char expected[] =
+		"{\"module\":\"module-deadline\","
+		"\"driver_id\":0,\"generation\":0,\"period_ns\":0,"
+		"\"deadline_ns\":0,\"mode\":\"prototype\","
+		"\"feasibility\":{\"method\":\"none\",\"status\":\"n/a\"},"
+		"\"raw_graph\":{\"nodes\":[],\"edges\":[]},"
+		"\"scheduling_dag\":{\"nodes\":[],\"edges\":[],\"excluded_edges\":[]},"
+		"\"fusion\":{\"groups\":[]},"
+		"\"parameters\":{\"nodes\":[]}}\n";
+
+	struct rt_diag_combined c = { 0 };
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_render_json(&c, fp);
+	fclose(fp);
+	pwtest_str_eq(buf, expected);
+
+	free(buf);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_json_full_golden)
+{
+	struct rt_diag_raw_snapshot raw;
+	struct rt_diag_sched_snapshot sched;
+	struct rt_diag_fusion_snapshot fusion;
+	struct rt_diag_params_snapshot params;
+	struct rt_diag_combined c = { 0 };
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	int g0;
+	const char expected[] =
+		"{\"module\":\"module-deadline\","
+		"\"driver_id\":63,\"generation\":3,\"period_ns\":21333333,"
+		"\"deadline_ns\":21333333,\"mode\":\"prototype\","
+		"\"feasibility\":{\"method\":\"none\",\"status\":\"n/a\"},"
+		"\"raw_graph\":{\"nodes\":["
+		"{\"id\":63,\"driver_id\":63,\"tid\":302388,\"flags\":[\"driver\",\"data_loop\"],\"name\":\"alsa-sink\"}"
+		"],\"edges\":[{\"src\":38,\"dst\":63,\"flags\":[]}]},"
+		"\"scheduling_dag\":{\"nodes\":[{\"id\":63,\"tid\":302388}],"
+		"\"edges\":[{\"src\":38,\"dst\":63}],"
+		"\"excluded_edges\":[{\"src\":76,\"dst\":37,\"reason\":\"async\"}]},"
+		"\"fusion\":{\"groups\":[{\"leader\":63,\"verdict\":\"split\","
+		"\"reason\":\"below_threshold\",\"members\":[63]}]},"
+		"\"parameters\":{\"nodes\":[{\"id\":63,\"tid\":302388,"
+		"\"runtime_ns\":85494,\"local_deadline_ns\":21333333,"
+		"\"cumulative_deadline_ns\":21333333,\"period_ns\":21333333,"
+		"\"cpu\":4,\"applied\":true}]}}\n";
+
+	rt_diag_raw_snapshot_init(&raw);
+	rt_diag_sched_snapshot_init(&sched);
+	rt_diag_fusion_snapshot_init(&fusion);
+	rt_diag_params_snapshot_init(&params);
+
+	struct rt_diag_raw_node rn = { 0 };
+	rn.id = 63; rn.driver_id = 63; rn.tid = 302388;
+	rn.flags = RT_DIAG_RAW_NODE_DRIVER | RT_DIAG_RAW_NODE_DATA_LOOP;
+	strcpy(rn.name, "alsa-sink");
+	pwtest_int_eq(rt_diag_raw_snapshot_add_node(&raw, &rn), 0);
+
+	struct rt_diag_raw_edge re = { 0 };
+	re.src = 38; re.dst = 63;
+	pwtest_int_eq(rt_diag_raw_snapshot_add_edge(&raw, &re), 0);
+
+	struct rt_diag_sched_node sn = { 0 };
+	sn.id = 63; sn.tid = 302388;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_node(&sched, &sn), 0);
+
+	struct rt_diag_sched_edge se = { 0 };
+	se.src = 38; se.dst = 63;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_edge(&sched, &se), 0);
+
+	struct rt_diag_sched_excluded_edge xe = { 0 };
+	xe.src = 76; xe.dst = 37; xe.reason = RT_DIAG_SCHED_EXC_ASYNC;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_excluded(&sched, &xe), 0);
+
+	g0 = rt_diag_fusion_snapshot_begin_group(&fusion, 63,
+			RT_DIAG_FUSION_SPLIT,
+			RT_DIAG_FUSION_REJ_BELOW_THRESHOLD);
+	pwtest_int_eq(g0, 0);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&fusion,
+				(uint32_t)g0, 63), 0);
+
+	struct rt_diag_param_node pn = { 0 };
+	pn.id = 63; pn.tid = 302388;
+	pn.runtime_budget_ns = 85494; pn.local_deadline_ns = 21333333;
+	pn.cumulative_deadline_ns = 21333333; pn.period_ns = 21333333;
+	pn.cpu = 4; pn.applied = true;
+	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
+
+	c.driver_id = 63;
+	c.generation = 3;
+	c.period_ns = 21333333;
+	c.deadline_ns = 21333333;
+	c.mode = "prototype";
+	c.feasibility_method = "none";
+	c.feasibility_status = "n/a";
+	c.raw = &raw;
+	c.sched = &sched;
+	c.fusion = &fusion;
+	c.params = &params;
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_render_json(&c, fp);
+	fclose(fp);
+	pwtest_str_eq(buf, expected);
+
+	free(buf);
+	rt_diag_raw_snapshot_fini(&raw);
+	rt_diag_sched_snapshot_fini(&sched);
+	rt_diag_fusion_snapshot_fini(&fusion);
+	rt_diag_params_snapshot_fini(&params);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_json_escapes_strings)
+{
+	struct rt_diag_raw_snapshot raw;
+	struct rt_diag_combined c = { 0 };
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+
+	/* Cover every escape branch: quote, backslash, control char,
+	 * embedded newline. */
+	rt_diag_raw_snapshot_init(&raw);
+	struct rt_diag_raw_node rn = { 0 };
+	rn.id = 1;
+	/* "weird\name\twith\"quotes" */
+	strcpy(rn.name, "a\"b\\c\td\ne");
+	pwtest_int_eq(rt_diag_raw_snapshot_add_node(&raw, &rn), 0);
+
+	c.raw = &raw;
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_render_json(&c, fp);
+	fclose(fp);
+
+	/* Spot-check the escaped name field. */
+	pwtest_bool_true(strstr(buf, "\"name\":\"a\\\"b\\\\c\\td\\ne\"") != NULL);
+
+	free(buf);
+	rt_diag_raw_snapshot_fini(&raw);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_diag)
 {
 	pwtest_add(diag_raw_init_zeroes, PWTEST_NOARG);
@@ -463,6 +692,13 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_fusion_add_member_out_of_range, PWTEST_NOARG);
 	pwtest_add(diag_fusion_verdict_and_reason_names, PWTEST_NOARG);
 	pwtest_add(diag_fusion_render_text_golden, PWTEST_NOARG);
+	pwtest_add(diag_params_init_zeroes, PWTEST_NOARG);
+	pwtest_add(diag_params_null_safe, PWTEST_NOARG);
+	pwtest_add(diag_params_render_text_golden, PWTEST_NOARG);
+	pwtest_add(diag_json_null_inputs, PWTEST_NOARG);
+	pwtest_add(diag_json_empty_combined, PWTEST_NOARG);
+	pwtest_add(diag_json_full_golden, PWTEST_NOARG);
+	pwtest_add(diag_json_escapes_strings, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

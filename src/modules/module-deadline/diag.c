@@ -481,3 +481,292 @@ void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s
 		fputc('\n', out);
 	}
 }
+
+/* --- scheduling-parameters slice --- */
+
+void rt_diag_params_snapshot_init(struct rt_diag_params_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_params_snapshot_fini(struct rt_diag_params_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	free(s->nodes);
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_params_snapshot_reset(struct rt_diag_params_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	s->n_nodes = 0;
+	s->driver_id = 0;
+	s->generation = 0;
+}
+
+int rt_diag_params_snapshot_add_node(struct rt_diag_params_snapshot *s,
+				     const struct rt_diag_param_node *node)
+{
+	if (s == NULL || node == NULL)
+		return -EINVAL;
+	if (s->n_nodes == s->cap_nodes) {
+		int r = grow_array((void **)&s->nodes, &s->cap_nodes,
+				   (uint32_t)sizeof(*s->nodes),
+				   RT_DIAG_INITIAL_NODES);
+		if (r < 0)
+			return r;
+	}
+	s->nodes[s->n_nodes++] = *node;
+	return 0;
+}
+
+void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s,
+					 const char *mode, FILE *out)
+{
+	uint32_t i;
+
+	if (s == NULL || out == NULL)
+		return;
+	if (mode == NULL)
+		mode = "prototype";
+
+	fprintf(out,
+		"deadline-diag-params: driver=%u generation=%llu mode=%s\n",
+		s->driver_id, (unsigned long long)s->generation, mode);
+	fprintf(out, "  nodes: %u\n", s->n_nodes);
+	for (i = 0; i < s->n_nodes; i++) {
+		const struct rt_diag_param_node *n = &s->nodes[i];
+		fprintf(out,
+			"    node id=%u tid=%d runtime=%lluns local_deadline=%lluns"
+			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s\n",
+			n->id, (int)n->tid,
+			(unsigned long long)n->runtime_budget_ns,
+			(unsigned long long)n->local_deadline_ns,
+			(unsigned long long)n->cumulative_deadline_ns,
+			(unsigned long long)n->period_ns,
+			n->cpu,
+			n->applied ? "true" : "false");
+	}
+}
+
+/* --- combined JSON renderer --- */
+
+static void json_write_escaped(FILE *out, const char *s)
+{
+	if (s == NULL) {
+		fputs("\"\"", out);
+		return;
+	}
+	fputc('"', out);
+	for (; *s != '\0'; s++) {
+		unsigned char c = (unsigned char)*s;
+		switch (c) {
+		case '"':  fputs("\\\"", out); break;
+		case '\\': fputs("\\\\", out); break;
+		case '\b': fputs("\\b", out);  break;
+		case '\f': fputs("\\f", out);  break;
+		case '\n': fputs("\\n", out);  break;
+		case '\r': fputs("\\r", out);  break;
+		case '\t': fputs("\\t", out);  break;
+		default:
+			if (c < 0x20)
+				fprintf(out, "\\u%04x", c);
+			else
+				fputc((int)c, out);
+		}
+	}
+	fputc('"', out);
+}
+
+static void json_write_flags(FILE *out, uint32_t flags,
+			     const struct flag_name *table, size_t n)
+{
+	bool first = true;
+	size_t i;
+
+	fputc('[', out);
+	for (i = 0; i < n; i++) {
+		if ((flags & table[i].bit) == 0u)
+			continue;
+		if (!first)
+			fputc(',', out);
+		fputc('"', out);
+		fputs(table[i].name, out);
+		fputc('"', out);
+		first = false;
+	}
+	fputc(']', out);
+}
+
+static void json_write_raw_section(FILE *out, const struct rt_diag_raw_snapshot *s)
+{
+	uint32_t i;
+
+	fputs("{\"nodes\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_nodes; i++) {
+			const struct rt_diag_raw_node *n = &s->nodes[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out,
+				"{\"id\":%u,\"driver_id\":%u,\"tid\":%d,",
+				n->id, n->driver_id, (int)n->tid);
+			fputs("\"flags\":", out);
+			json_write_flags(out, n->flags, raw_node_flags,
+					 sizeof(raw_node_flags) /
+					 sizeof(raw_node_flags[0]));
+			fputs(",\"name\":", out);
+			json_write_escaped(out, n->name);
+			fputc('}', out);
+		}
+	}
+	fputs("],\"edges\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_edges; i++) {
+			const struct rt_diag_raw_edge *e = &s->edges[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out,
+				"{\"src\":%u,\"dst\":%u,\"flags\":",
+				e->src, e->dst);
+			json_write_flags(out, e->flags, raw_edge_flags,
+					 sizeof(raw_edge_flags) /
+					 sizeof(raw_edge_flags[0]));
+			fputc('}', out);
+		}
+	}
+	fputs("]}", out);
+}
+
+static void json_write_sched_section(FILE *out, const struct rt_diag_sched_snapshot *s)
+{
+	uint32_t i;
+
+	fputs("{\"nodes\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_nodes; i++) {
+			const struct rt_diag_sched_node *n = &s->nodes[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out, "{\"id\":%u,\"tid\":%d}",
+				n->id, (int)n->tid);
+		}
+	}
+	fputs("],\"edges\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_edges; i++) {
+			const struct rt_diag_sched_edge *e = &s->edges[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out, "{\"src\":%u,\"dst\":%u}", e->src, e->dst);
+		}
+	}
+	fputs("],\"excluded_edges\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_excluded; i++) {
+			const struct rt_diag_sched_excluded_edge *e = &s->excluded_edges[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out, "{\"src\":%u,\"dst\":%u,\"reason\":\"%s\"}",
+				e->src, e->dst,
+				rt_diag_sched_exclude_reason_name(e->reason));
+		}
+	}
+	fputs("]}", out);
+}
+
+static void json_write_fusion_section(FILE *out, const struct rt_diag_fusion_snapshot *s)
+{
+	uint32_t i, j;
+
+	fputs("{\"groups\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_groups; i++) {
+			const struct rt_diag_fusion_group *g = &s->groups[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out,
+				"{\"leader\":%u,\"verdict\":\"%s\",\"reason\":\"%s\",\"members\":[",
+				g->leader_id,
+				rt_diag_fusion_verdict_name(g->verdict),
+				rt_diag_fusion_reject_reason_name(g->reject_reason));
+			for (j = 0; j < g->n_members; j++) {
+				if (j > 0)
+					fputc(',', out);
+				fprintf(out, "%u", g->members[j]);
+			}
+			fputs("]}", out);
+		}
+	}
+	fputs("]}", out);
+}
+
+static void json_write_params_section(FILE *out, const struct rt_diag_params_snapshot *s)
+{
+	uint32_t i;
+
+	fputs("{\"nodes\":[", out);
+	if (s != NULL) {
+		for (i = 0; i < s->n_nodes; i++) {
+			const struct rt_diag_param_node *n = &s->nodes[i];
+			if (i > 0)
+				fputc(',', out);
+			fprintf(out,
+				"{\"id\":%u,\"tid\":%d,\"runtime_ns\":%llu,"
+				"\"local_deadline_ns\":%llu,"
+				"\"cumulative_deadline_ns\":%llu,"
+				"\"period_ns\":%llu,\"cpu\":%u,"
+				"\"applied\":%s}",
+				n->id, (int)n->tid,
+				(unsigned long long)n->runtime_budget_ns,
+				(unsigned long long)n->local_deadline_ns,
+				(unsigned long long)n->cumulative_deadline_ns,
+				(unsigned long long)n->period_ns,
+				n->cpu,
+				n->applied ? "true" : "false");
+		}
+	}
+	fputs("]}", out);
+}
+
+void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out)
+{
+	if (c == NULL || out == NULL)
+		return;
+
+	const char *mode = c->mode != NULL ? c->mode : "prototype";
+	const char *feas_method = c->feasibility_method != NULL
+		? c->feasibility_method : "none";
+	const char *feas_status = c->feasibility_status != NULL
+		? c->feasibility_status : "n/a";
+
+	fputs("{\"module\":\"module-deadline\",", out);
+	fprintf(out, "\"driver_id\":%u,", c->driver_id);
+	fprintf(out, "\"generation\":%llu,",
+		(unsigned long long)c->generation);
+	fprintf(out, "\"period_ns\":%llu,",
+		(unsigned long long)c->period_ns);
+	fprintf(out, "\"deadline_ns\":%llu,",
+		(unsigned long long)c->deadline_ns);
+	fputs("\"mode\":", out);
+	json_write_escaped(out, mode);
+	fputs(",\"feasibility\":{\"method\":", out);
+	json_write_escaped(out, feas_method);
+	fputs(",\"status\":", out);
+	json_write_escaped(out, feas_status);
+	fputc('}', out);
+	fputs(",\"raw_graph\":", out);
+	json_write_raw_section(out, c->raw);
+	fputs(",\"scheduling_dag\":", out);
+	json_write_sched_section(out, c->sched);
+	fputs(",\"fusion\":", out);
+	json_write_fusion_section(out, c->fusion);
+	fputs(",\"parameters\":", out);
+	json_write_params_section(out, c->params);
+	fputc('}', out);
+	fputc('\n', out);
+}
