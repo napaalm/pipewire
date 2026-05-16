@@ -597,8 +597,10 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			n->mbpta_convergence_streak,
 			n->mbpta_iid_reject_streak);
 		diag_fprintf_double(out, 16, n->mbpta_effective_eps_node);
-		fprintf(out, " mbpta_eps_capped=%s\n",
-			n->mbpta_eps_node_capped ? "true" : "false");
+		fprintf(out, " mbpta_eps_capped=%s mbpta_last_invalidation=%s\n",
+			n->mbpta_eps_node_capped ? "true" : "false",
+			n->mbpta_last_invalidation_reason[0] != '\0'
+				? n->mbpta_last_invalidation_reason : "none");
 	}
 }
 
@@ -866,8 +868,14 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				n->mbpta_iid_reject_streak);
 			diag_fprintf_double(out, 16,
 					n->mbpta_effective_eps_node);
-			fprintf(out, ",\"eps_node_capped\":%s}}",
+			fprintf(out,
+				",\"eps_node_capped\":%s,"
+				"\"last_invalidation_reason\":",
 				n->mbpta_eps_node_capped ? "true" : "false");
+			json_write_escaped(out,
+				n->mbpta_last_invalidation_reason[0] != '\0'
+				? n->mbpta_last_invalidation_reason : "none");
+			fputs("}}", out);
 		}
 	}
 	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is

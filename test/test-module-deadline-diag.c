@@ -483,7 +483,8 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
-		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false\n"
+		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false"
+		" mbpta_last_invalidation=none\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
 		" budget_kind=bootstrap_fallback budget_samples=0"
@@ -491,7 +492,8 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
-		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true\n";
+		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true"
+		" mbpta_last_invalidation=period\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -515,6 +517,9 @@ PWTEST(diag_params_render_text_golden)
 	n.budget_sample_count = 0;
 	n.mbpta_effective_eps_node = 1.0e-16;
 	n.mbpta_eps_node_capped = true;
+	snprintf(n.mbpta_last_invalidation_reason,
+		sizeof(n.mbpta_last_invalidation_reason), "%s",
+		"period");
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 
 	fp = open_memstream(&buf, &len);
@@ -607,7 +612,8 @@ PWTEST(diag_json_full_golden)
 		"\"convergence_streak\":4,"
 		"\"iid_reject_streak\":0,"
 		"\"effective_eps_node\":0.0000000010000000,"
-		"\"eps_node_capped\":false}}],"
+		"\"eps_node_capped\":false,"
+		"\"last_invalidation_reason\":\"fusion_group\"}}],"
 		"\"pwcet_path_coverage_note\":\""
 		"pWCET claims do not extend to untriggered branches; "
 		"the result is only valid for paths actually observed "
@@ -667,6 +673,9 @@ PWTEST(diag_json_full_golden)
 	pn.mbpta_iid_reject_streak = 0;
 	pn.mbpta_effective_eps_node = 1.0e-9;
 	pn.mbpta_eps_node_capped = false;
+	snprintf(pn.mbpta_last_invalidation_reason,
+		sizeof(pn.mbpta_last_invalidation_reason), "%s",
+		"fusion_group");
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;

@@ -447,6 +447,14 @@ struct rt_diag_param_node {
 	 * runtime probabilistic guarantee in effect is visible. */
 	double   mbpta_effective_eps_node;
 	bool     mbpta_eps_node_capped;
+
+	/* Last invalidation reason recorded by the estimator
+	 * (mbpta.h enum mbpta_invalidation_reason, stringified).
+	 * Empty string when the estimator has never been
+	 * invalidated. Surfacing it gives an operator a direct
+	 * cause-of-rebuild signal when a follower's estimator keeps
+	 * dropping back to INSUFFICIENT_DATA. */
+	char     mbpta_last_invalidation_reason[32];
 };
 
 struct rt_diag_params_snapshot {
