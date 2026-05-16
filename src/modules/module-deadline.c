@@ -895,10 +895,30 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline,
 	ret = sched_setattr(tid, &attr, 0);
 
 	if (ret) {
+		/* sched_setattr failure means the kernel rejected the
+		 * tuple we computed -- and per Linux's
+		 * sched-deadline.rst, the kernel's admission test is
+		 * the final authority on whether the schedule is
+		 * realisable. Any hard-real-time claim derived from
+		 * the in-process feasibility predicates is therefore
+		 * suspect for this period until the next reconcile
+		 * either re-validates the tuple or drops the
+		 * follower's last_applied cache. The caller in
+		 * apply_sched_groups clears last_applied on rc != 0;
+		 * here we log the errno + the offending tuple so the
+		 * downstream investigation has the full data. */
 		if (errno == EINVAL)
-			pw_log_warn("invalid DEADLINE attributes for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
+			pw_log_warn("sched_setattr rejected DEADLINE tuple"
+				" for tid %d (errno=EINVAL, r=%lu d=%lu p=%lu);"
+				" hard guarantees from in-process predicates"
+				" no longer apply for this period",
+				tid, runtime, deadline, period);
 		else
-			pw_log_error("failed to set DEADLINE attributes for tid %d: %s", tid, strerror(errno));
+			pw_log_error("sched_setattr failed for tid %d"
+				" (errno=%d %s, r=%lu d=%lu p=%lu);"
+				" hard guarantees dropped for this period",
+				tid, errno, strerror(errno),
+				runtime, deadline, period);
 	}
 	else
 		pw_log_debug("set DEADLINE scheduling for tid %d: r:%lu d:%lu p:%lu", tid, runtime, deadline, period);
@@ -3234,7 +3254,18 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	impl->sched_reclaim = pw_properties_get_bool(props,
 			"sched.reclaim", true);
-	pw_log_info("sched.reclaim = %s",
+	/* Per Linux sched-deadline.rst, SCHED_FLAG_RECLAIM (GRUB)
+	 * is a runtime efficiency feature that redistributes
+	 * unused per-task bandwidth to peers; it does not relax
+	 * the kernel's admission test or the per-task budget.
+	 * The in-process feasibility predicates (Baruah 1990
+	 * density + DBF) make NO assumption about reclaim, so a
+	 * schedule that passes them passes equally with
+	 * sched.reclaim=false. Reclaim is therefore an
+	 * optimisation, not part of the guarantee. */
+	pw_log_info("sched.reclaim = %s (optimisation; the kernel"
+			" admission test and the in-process feasibility"
+			" check both ignore the GRUB reclaim flag)",
 			impl->sched_reclaim ? "true" : "false");
 
 	impl->sketch_window_size = WCET_DEFAULT_WINDOW_SIZE;
