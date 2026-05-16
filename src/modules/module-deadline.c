@@ -974,24 +974,22 @@ static void apply_sched_groups(struct impl *impl)
 
 		impl->sched_calls_total++;
 
-		/* Pick the kernel-API deadline:
-		 *   - singleton (n_members == 1): leader's local_deadline,
-		 *     which is the un-fused node's splitter slice and the
-		 *     correct relative-deadline value;
-		 *   - multi-member: the maximum cumulative deadline across
-		 *     the fused thread's members. This is a conservative
-		 *     stopgap (it may exceed the chain's actual relative
-		 *     budget) pending the contracted-DAG re-assignment that
-		 *     will derive a proper local deadline for the macro-node.
-		 *     Clamp to the period so the kernel SCHED_DEADLINE
-		 *     contract `deadline <= period` is always satisfied. */
-		if (g->n_members <= 1) {
-			kernel_deadline = g->leader_local_deadline;
-		} else {
-			kernel_deadline = g->max_cumulative_deadline;
-			if (kernel_deadline > g->period)
-				kernel_deadline = g->period;
-		}
+		/* The kernel-API deadline is the leader's local_deadline.
+		 * Every member of a fused thread now reports the same
+		 * macro-node local_deadline (the contracted-DAG analysis
+		 * computes one deadline per macro-node and the per-follower
+		 * sched_cb invocations all carry that value), so the
+		 * accumulator's leader_local_deadline field carries the
+		 * correct kernel-relative quantity verbatim. The period
+		 * clamp is defensive: the contracted analysis already
+		 * enforces local_deadline <= period before reaching this
+		 * point, and the splitter never produces a value above the
+		 * period, but leaving the check here preserves the kernel
+		 * SCHED_DEADLINE contract locally. max_cumulative_deadline
+		 * is retained on the accumulator for diagnostic use only. */
+		kernel_deadline = g->leader_local_deadline;
+		if (kernel_deadline > g->period)
+			kernel_deadline = g->period;
 
 		/* Pre-syscall validation. SCHED_DEADLINE requires
 		 *   0 < runtime <= deadline <= period.

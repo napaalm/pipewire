@@ -8,6 +8,7 @@
 
 #include "reconcile.h"
 #include "dag.h"
+#include "contracted.h"
 
 #include <pipewire/log.h>
 
@@ -305,6 +306,241 @@ static bool wcet_drift_significant(reconcile_state_t *state,
 	return (diff / maxv) > state->recalc_threshold;
 }
 
+/* Build a contracted DAG that mirrors `state_dag`'s topology plus
+ * group assignment: every node with the same non-zero group_id
+ * collapses into one macro-node; nodes with group_id == 0 form
+ * singletons. The macro-node's wcet_ns is the sum of members'
+ * wcet (which already carries the reconcile-side 1.05 safety
+ * margin). Edges between members of the same macro-node disappear
+ * as internal; external edges are inherited and deduplicated.
+ *
+ * Returns 0 on success with *out populated, -1 on failure (*out
+ * stays NULL, errno is set). Caller owns the resulting
+ * contracted_dag_t and frees it with contracted_dag_destroy.
+ */
+static int reconcile_build_contracted_from_dag(dag_t *state_dag,
+		uint64_t period_ns, uint64_t deadline_ns,
+		contracted_dag_t **out)
+{
+	struct contracted_member_input *members = NULL;
+	struct contracted_edge_input *edges = NULL;
+	uint32_t *groups = NULL;
+	uint32_t n_members = 0, n_edges = 0;
+	dag_node_t *n;
+	dag_edge_t *e;
+	int r;
+
+	if (state_dag == NULL || out == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	*out = NULL;
+
+	/* First pass: count real (non-fictitious) nodes and edges. */
+	spa_list_for_each(n, &state_dag->nodes, link) {
+		if (!n->fictitious)
+			n_members++;
+	}
+	spa_list_for_each(e, &state_dag->edges, link) {
+		if (!e->src->fictitious && !e->dst->fictitious)
+			n_edges++;
+	}
+
+	if (n_members == 0)
+		return contracted_dag_build(period_ns, deadline_ns,
+				NULL, NULL, 0, NULL, 0, out);
+
+	members = calloc(n_members, sizeof(*members));
+	groups = calloc(n_members, sizeof(*groups));
+	if (members == NULL || groups == NULL) {
+		r = -ENOMEM;
+		goto fail;
+	}
+	if (n_edges > 0) {
+		edges = calloc(n_edges, sizeof(*edges));
+		if (edges == NULL) {
+			r = -ENOMEM;
+			goto fail;
+		}
+	}
+
+	/* Second pass: fill the arrays. */
+	{
+		uint32_t i = 0;
+		spa_list_for_each(n, &state_dag->nodes, link) {
+			if (n->fictitious)
+				continue;
+			members[i].id = n->id;
+			members[i].tid = n->tid;
+			members[i].wcet_ns = n->wcet;
+			groups[i] = n->group_id;
+			i++;
+		}
+	}
+	{
+		uint32_t i = 0;
+		spa_list_for_each(e, &state_dag->edges, link) {
+			if (e->src->fictitious || e->dst->fictitious)
+				continue;
+			edges[i].src_id = e->src->id;
+			edges[i].dst_id = e->dst->id;
+			i++;
+		}
+	}
+
+	r = contracted_dag_build(period_ns, deadline_ns,
+			members, groups, n_members,
+			edges, n_edges, out);
+
+fail:
+	free(members);
+	free(groups);
+	free(edges);
+	if (r < 0) {
+		errno = -r;
+		return -1;
+	}
+	return 0;
+}
+
+/* Locate the macro-node owning the original member `follower_id` by
+ * scanning every macro-node's member list. n_members is small in
+ * practice (a few dozen at most per driver). */
+static contracted_node_t *contracted_owner(contracted_dag_t *cg,
+		uint32_t follower_id)
+{
+	contracted_node_t *cn;
+	struct contracted_member *m;
+
+	spa_list_for_each(cn, &cg->nodes, link) {
+		spa_list_for_each(m, &cn->members, link) {
+			if (m->id == follower_id)
+				return cn;
+		}
+	}
+	return NULL;
+}
+
+/* Return the lowest-id member of a macro-node (the leader the
+ * sched_groups accumulator anchors on). */
+static const struct contracted_member *macro_leader(const contracted_node_t *cn)
+{
+	struct contracted_member *m;
+	const struct contracted_member *leader = NULL;
+	spa_list_for_each(m, &cn->members, link) {
+		if (leader == NULL || m->id < leader->id)
+			leader = m;
+	}
+	return leader;
+}
+
+/* Run the contracted-DAG analysis on top of `state_dag` and emit
+ * one sched_cb per real follower carrying the macro-node's
+ * (cumulative_deadline, local_deadline, cpu). The macro-node's
+ * residual overhead is folded into the leader follower's reported
+ * runtime so the downstream per-TID accumulator's sum_runtime
+ * lands at the macro-node's effective WCET.
+ *
+ * If the fusion partition is non-convex (a member of group A
+ * appears on a path between two members of group B), the
+ * contracted DAG develops a cycle. This is structurally unsound
+ * and Sarkar 1989 §5.3 explicitly forbids it; the soundness
+ * validator that lands later in this implementation cycle will
+ * reject such partitions at the upstream cost model. Until that
+ * lands, the dispatcher logs the cycle and falls back to a
+ * per-original-node emission on state_dag so the existing
+ * prototype's permissive behaviour is preserved for graphs the
+ * cost model has not yet learned to reject.
+ *
+ * Returns 0 on success, -1 on a non-recoverable failure (errno set).
+ */
+static int reconcile_dispatch_contracted(reconcile_state_t *state,
+		dag_t *state_dag, uint64_t period_ns,
+		reconcile_sched_cb_t sched_cb, void *sched_data)
+{
+	contracted_dag_t *cg = NULL;
+	struct dag *macro_dag = NULL;
+	dag_node_t *n;
+	int r;
+
+	r = reconcile_build_contracted_from_dag(state_dag, period_ns,
+			period_ns, &cg);
+	if (r < 0)
+		return -1;
+
+	if (contracted_dag_has_cycle(cg)) {
+		pw_log_warn("reconcile: fusion partition is non-convex "
+			    "(contracted DAG has a cycle); falling back to "
+			    "per-node deadline split. The soundness validator "
+			    "will reject this partition once it lands.");
+		contracted_dag_destroy(cg);
+		return dag_foreach_node(state_dag, sched_cb, sched_data);
+	}
+
+	r = contracted_dag_to_dag(cg, state->cpu_utilization,
+			state->n_cpus, state->relative_capacity, &macro_dag);
+	if (r < 0) {
+		contracted_dag_destroy(cg);
+		errno = -r;
+		return -1;
+	}
+
+	if (dag_recalculate(macro_dag) < 0) {
+		int e = errno;
+		pw_log_warn("reconcile: contracted-DAG recalculate failed "
+			    "(%m); falling back to per-node deadline split.");
+		dag_destroy(macro_dag);
+		contracted_dag_destroy(cg);
+		errno = e;
+		return dag_foreach_node(state_dag, sched_cb, sched_data);
+	}
+
+	contracted_dag_apply_dag_schedule(cg, macro_dag);
+
+	/* Per-follower emission. For each real node in state_dag, look
+	 * up its owning macro-node and emit sched_cb with the macro's
+	 * (cumulative_deadline, local_deadline, cpu). Runtime: each
+	 * follower reports its own wcet so sched_groups.sum_runtime
+	 * aggregates to sum_of_members; the macro's overhead is folded
+	 * into the leader's report so the final sum equals the
+	 * macro-node's effective WCET. */
+	spa_list_for_each(n, &state_dag->nodes, link) {
+		contracted_node_t *cn;
+		const struct contracted_member *leader;
+		uint64_t runtime;
+		uint32_t cpu;
+
+		if (n->fictitious)
+			continue;
+		cn = contracted_owner(cg, n->id);
+		if (cn == NULL)
+			continue;
+		leader = macro_leader(cn);
+
+		runtime = n->wcet;
+		if (leader != NULL && leader->id == n->id)
+			runtime += cn->overhead_ns;
+
+		cpu = (cn->cpu < 0) ? 0u : (uint32_t)cn->cpu;
+
+		sched_cb(sched_data, n->id, n->tid, runtime,
+				cn->cumulative_deadline_ns,
+				cn->local_deadline_ns,
+				period_ns, cpu);
+	}
+
+	dag_destroy(macro_dag);
+	contracted_dag_destroy(cg);
+	/* state_dag's own deadlines are intentionally not recomputed
+	 * (the contracted analysis is the authority now), but its
+	 * dirty bit is cleared so the steady-state idempotency
+	 * contract -- "a no-op reconcile pass leaves the cached DAG
+	 * marked clean" -- still holds for instrumentation that
+	 * watches state_dag->dirty. */
+	state_dag->dirty = false;
+	return 0;
+}
+
 /* Persistent path: keep state->dag across calls, update only the
  * deltas. The DAG's own dirty bit (set when a mutation actually
  * changes the stored value) drives the recalc inside
@@ -389,7 +625,15 @@ static int reconcile_apply_persistent(reconcile_state_t *state,
 		return -1;
 	}
 
-	if (dag_foreach_node(state->dag, sched_cb, sched_data) < 0) {
+	/* Run the macro-node analysis on the contracted DAG derived
+	 * from state->dag (topology + WCETs + group ids), then emit
+	 * sched_cb per real follower with the macro-node's
+	 * (cumulative_deadline, local_deadline, cpu). state->dag is
+	 * kept as the topology / WCET cache; its own deadline split
+	 * is no longer the authority and is intentionally not
+	 * recalculated here. */
+	if (reconcile_dispatch_contracted(state, state->dag,
+				topo->period, sched_cb, sched_data) < 0) {
 		dag_destroy(state->dag);
 		state->dag = NULL;
 		state->dag_period = 0;
@@ -429,13 +673,8 @@ static int reconcile_apply_legacy(reconcile_state_t *state,
 		return -1;
 	}
 
-	if (dag_recalculate(dag) < 0) {
-		dag_destroy(dag);
-		state->consecutive_failures++;
-		return -1;
-	}
-
-	if (dag_foreach_node(dag, sched_cb, sched_data) < 0) {
+	if (reconcile_dispatch_contracted(state, dag, topo->period,
+				sched_cb, sched_data) < 0) {
 		dag_destroy(dag);
 		state->consecutive_failures++;
 		return -1;
