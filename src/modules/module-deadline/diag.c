@@ -870,7 +870,17 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				n->mbpta_eps_node_capped ? "true" : "false");
 		}
 	}
-	fputs("]}", out);
+	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is
+	 * extrapolated from samples drawn from paths actually
+	 * executed in the sample window. Branches that never fired
+	 * in-window are not covered by the fit; an operator reading
+	 * the snapshot must know the claim's scope. Surface the
+	 * disclaimer alongside the per-node pWCET values so it
+	 * travels with the data. */
+	fputs("],\"pwcet_path_coverage_note\":\""
+	      "pWCET claims do not extend to untriggered branches; "
+	      "the result is only valid for paths actually observed "
+	      "in the sample window (Cucu-Grosjean 2012 SIV).\"}", out);
 }
 
 void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out)

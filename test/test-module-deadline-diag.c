@@ -552,7 +552,11 @@ PWTEST(diag_json_empty_combined)
 		"\"raw_graph\":{\"nodes\":[],\"edges\":[]},"
 		"\"scheduling_dag\":{\"nodes\":[],\"edges\":[],\"excluded_edges\":[]},"
 		"\"fusion\":{\"groups\":[]},"
-		"\"parameters\":{\"nodes\":[]},"
+		"\"parameters\":{\"nodes\":[],"
+		"\"pwcet_path_coverage_note\":\""
+		"pWCET claims do not extend to untriggered branches; "
+		"the result is only valid for paths actually observed "
+		"in the sample window (Cucu-Grosjean 2012 SIV).\"},"
 		"\"peer_dispatch\":{\"inline_armed\":0,\"eventfd_path\":0}}\n";
 
 	struct rt_diag_combined c = { 0 };
@@ -603,7 +607,11 @@ PWTEST(diag_json_full_golden)
 		"\"convergence_streak\":4,"
 		"\"iid_reject_streak\":0,"
 		"\"effective_eps_node\":0.0000000010000000,"
-		"\"eps_node_capped\":false}}]},"
+		"\"eps_node_capped\":false}}],"
+		"\"pwcet_path_coverage_note\":\""
+		"pWCET claims do not extend to untriggered branches; "
+		"the result is only valid for paths actually observed "
+		"in the sample window (Cucu-Grosjean 2012 SIV).\"},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
