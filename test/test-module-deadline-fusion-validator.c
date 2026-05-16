@@ -296,6 +296,120 @@ PWTEST(fusion_pred_closure_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
+/* --- precedence convexity predicate (Phase 3.3) --- */
+
+PWTEST(fusion_convex_singleton_accepts)
+{
+	uint32_t members[] = { 1 };
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_precedence_convex_accept(
+				members, 1, NULL, 0, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C, F = {A, B, C}. Every edge is internal, no
+ * paths leave the group. Convex. */
+PWTEST(fusion_convex_chain_full_accepts)
+{
+	uint32_t members[] = { 1, 2, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_precedence_convex_accept(
+				members, 3, edges, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Diamond A -> B -> D and A -> C -> D, F = {A, D}. Walk from A
+ * reaches B (outside), B reaches D (inside) -> non-convex. */
+PWTEST(fusion_convex_diamond_top_and_bottom_rejects)
+{
+	uint32_t members[] = { 1, 4 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 }, { 2, 4 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_precedence_convex_accept(
+				members, 2, edges, 4, &r));
+	pwtest_int_eq(r, FUSION_REJ_NON_CONVEX);
+	return PWTEST_PASS;
+}
+
+/* Diamond, F = {A, B, D}. From A, the only external successor is
+ * C; C's successor is D (inside) -> non-convex (because path
+ * A -> C -> D leaves and re-enters). */
+PWTEST(fusion_convex_diamond_three_of_four_rejects)
+{
+	uint32_t members[] = { 1, 2, 4 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 }, { 2, 4 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_precedence_convex_accept(
+				members, 3, edges, 4, &r));
+	pwtest_int_eq(r, FUSION_REJ_NON_CONVEX);
+	return PWTEST_PASS;
+}
+
+/* Diamond, F = {A, B, C, D} (whole graph). Every successor is
+ * inside F; convex. */
+PWTEST(fusion_convex_diamond_full_accepts)
+{
+	uint32_t members[] = { 1, 2, 3, 4 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 }, { 2, 4 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_precedence_convex_accept(
+				members, 4, edges, 4, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Fork from A: A -> B, A -> C. F = {A, B, C}. From A, both
+ * successors are in F (internal); no external traversal needed.
+ * Convex. */
+PWTEST(fusion_convex_fork_full_accepts)
+{
+	uint32_t members[] = { 1, 2, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_precedence_convex_accept(
+				members, 3, edges, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C -> D, F = {A, C}. A's external successor is
+ * B; B reaches C (inside) -> non-convex. Equivalent to the
+ * prototype's TID-aliased pattern that triggers the contracted
+ * cycle-detection fallback today. */
+PWTEST(fusion_convex_chain_skip_middle_rejects)
+{
+	uint32_t members[] = { 1, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_precedence_convex_accept(
+				members, 2, edges, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_NON_CONVEX);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_convex_null_member_ids_rejects)
+{
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_precedence_convex_accept(
+				NULL, 2, NULL, 0, &r));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -318,6 +432,14 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_pred_closure_join_member_pred_accepts, PWTEST_NOARG);
 	pwtest_add(fusion_pred_closure_no_sources_rejects_external_pred, PWTEST_NOARG);
 	pwtest_add(fusion_pred_closure_null_member_ids_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_convex_singleton_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_convex_chain_full_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_convex_diamond_top_and_bottom_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_convex_diamond_three_of_four_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_convex_diamond_full_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_convex_fork_full_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_convex_chain_skip_middle_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_convex_null_member_ids_rejects, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

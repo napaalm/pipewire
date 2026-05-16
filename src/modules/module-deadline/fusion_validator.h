@@ -180,6 +180,35 @@ bool fusion_validator_predecessor_closure_accept(
 		const uint32_t *source_ids, uint32_t n_sources,
 		enum fusion_reject_reason *out_reason);
 
+/*
+ * Precedence convexity predicate.
+ *
+ * A fusion group F is precedence-convex iff for every pair of
+ * members u, v in F, every in-period path from u to v is fully
+ * contained in F. Equivalently, no path from one member to
+ * another leaves F (passes through a non-member) and re-enters
+ * F. Sarkar 1989 §5.3 introduces the notion as a soundness
+ * requirement for macro-actor formation: contracting a non-
+ * convex group creates a cycle in the contracted DAG (the
+ * non-member round trip becomes macro -> outside -> macro), and
+ * the deadline-splitter cannot operate on a cyclic graph.
+ *
+ * Implementation: for every member u in F, walk the in-period
+ * successors of u that are NOT in F, then continue walking those
+ * out-of-group descendants. If the walk ever re-enters F, the
+ * candidate is rejected with FUSION_REJ_NON_CONVEX. The cost is
+ * O(|F| * (V + E)) which is well within the scheduling-DAG
+ * sizes the audio path produces.
+ *
+ * Returns true with *out_reason = NONE on accept, false with
+ * *out_reason = NON_CONVEX on reject. n_members <= 1 trivially
+ * accepts.
+ */
+bool fusion_validator_precedence_convex_accept(
+		const uint32_t *member_ids, uint32_t n_members,
+		const struct fusion_edge_input *edges, uint32_t n_edges,
+		enum fusion_reject_reason *out_reason);
+
 /* Stable lower_snake_case token for a given rejection reason.
  * Unknown values render as "unknown". */
 const char *fusion_reject_reason_name(enum fusion_reject_reason r);
