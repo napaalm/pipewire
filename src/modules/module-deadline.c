@@ -1092,7 +1092,6 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		 * graph runs without the kernel admission test it
 		 * promises. */
 		if (g->sum_runtime == 0 || kernel_deadline == 0 ||
-		    g->sum_runtime > kernel_deadline ||
 		    kernel_deadline > g->period) {
 			pw_log_warn("sched: invalid params for tid=%d "
 					"runtime=%" PRIu64 " deadline=%" PRIu64
@@ -1107,6 +1106,35 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 				anchor->last_applied = false;
 			any_failure = true;
 			continue;
+		}
+
+		/* Soft-degraded throttling cap. When the analysis
+		 * publishes a tuple with runtime > deadline (typically a
+		 * follower whose measured WCET overshot its splitter
+		 * slice), the kernel would reject the syscall. Rather
+		 * than silently skipping -- which leaves the previous
+		 * params in place and provides no soft redistribution
+		 * floor -- ship the smallest valid value: a runtime of
+		 * 95 % of the local deadline. The follower then runs on
+		 * CBS but at a budget below its observed demand, so it
+		 * may be throttled and miss deadlines. This is exactly
+		 * the operator-visible "throttling risk is expected"
+		 * behaviour the soft objective calls for. The
+		 * any_failure flag below routes the mode through
+		 * reconcile_state_force_soft so the snapshot reflects
+		 * that the hard claim is no longer valid. */
+		if (g->sum_runtime > kernel_deadline) {
+			uint64_t capped = (uint64_t)((double)kernel_deadline
+					* 0.95);
+			if (capped == 0)
+				capped = 1;
+			pw_log_warn("sched: throttling tid=%d "
+				"runtime %" PRIu64 " -> %" PRIu64
+				" to fit deadline %" PRIu64 " (soft cap)",
+				(int)g->tid, g->sum_runtime, capped,
+				kernel_deadline);
+			g->sum_runtime = capped;
+			any_failure = true;
 		}
 
 		anchor = find_node_by_id(impl, g->leader_id);
