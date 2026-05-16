@@ -2804,10 +2804,21 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 				dump_sched_graph_main(drv->impl, drv);
 			if (drv->impl != NULL && drv->impl->debug_dump_fusion)
 				dump_fusion_main(drv->impl, drv);
-			if (drv->impl != NULL)
-				dump_combined_json_main(drv->impl, drv);
 		}
 	}
+	/* Combined JSON snapshot fires every snapshot tick, not just
+	 * on topology fingerprint change. The per-node parameters
+	 * (last_runtime / last_deadline / last_period / last_cpu)
+	 * advance whenever the worker's apply_sched_groups runs, even
+	 * when topology is stable -- a quantum change, a WCET drift,
+	 * a fusion-group leader flip all update follower state
+	 * without bumping the fingerprint. Gating the snapshot on
+	 * fingerprint change left the JSON pinned to whichever
+	 * per-node values were live at the last structural change,
+	 * which trivially diverges from /proc/<tid>/sched within a
+	 * cycle and makes the snapshot useless for cross-checks. */
+	if (drv->impl != NULL && t->ok)
+		dump_combined_json_main(drv->impl, drv);
 	SPA_ATOMIC_STORE(t->pending, 0);
 	return 0;
 }
