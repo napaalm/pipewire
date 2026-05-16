@@ -1367,6 +1367,90 @@ PWTEST(reconcile_mode_hysteresis_promotes_after_n_passes)
 	return PWTEST_PASS;
 }
 
+/* Property-based test: for a family of randomly-generated chain
+ * topologies (varying length, WCETs, periods) every sched_cb tuple
+ * fired by reconcile_apply must satisfy the kernel SCHED_DEADLINE
+ * contract `0 < runtime <= deadline <= period`. The chain family is
+ * deliberately small (length 2..6) and the WCETs are scaled to
+ * stay below period/(2N) so the entire suite always lands in HARD
+ * mode -- the goal is to pin the kernel-API constraints, not the
+ * feasibility transitions (those have dedicated tests). */
+PWTEST(reconcile_property_random_chains_satisfy_kernel_contract)
+{
+	uint32_t seed = 0xC7F2A91Du;
+	uint32_t trial;
+	uint32_t total_violations = 0;
+	const uint32_t trials = 200;
+
+	for (trial = 0; trial < trials; trial++) {
+		struct topo5 t;
+		reconcile_state_t *s = make_state_persistent(0.01);
+		struct cb_ctx cb = { 0 };
+		reconcile_topo_t rt;
+		uint32_t n_followers, n_edges, i;
+		uint64_t period;
+
+		pwtest_ptr_notnull(s);
+
+		/* Cheap deterministic LCG so the trial set is
+		 * reproducible across runs. */
+		seed = seed * 1103515245u + 12345u;
+		n_followers = 2 + (seed % 5);
+		seed = seed * 1103515245u + 12345u;
+		period = 100000u + (uint64_t)(seed % 1900000u);
+
+		for (i = 0; i < n_followers; i++) {
+			seed = seed * 1103515245u + 12345u;
+			t.followers[i].id  = 10 + i;
+			t.followers[i].tid = 100 + i;
+			t.followers[i].wcet =
+				1000u + (seed % (uint32_t)(period /
+					(n_followers * 4 + 1)));
+		}
+		n_edges = n_followers - 1;
+		for (i = 0; i < n_edges; i++) {
+			t.edges[i] = (reconcile_edge_t){
+				.src = 10 + i, .dst = 10 + i + 1
+			};
+		}
+
+		rt.followers = t.followers;
+		rt.n_followers = n_followers;
+		rt.edges = t.edges;
+		rt.n_edges = n_edges;
+		rt.period = period;
+		rt.generation = trial + 1;
+
+		pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+		/* Only count violations on HARD-mode trials: in soft-
+		 * degraded mode the analysis is allowed to publish a
+		 * tuple that fails the kernel contract (apply_sched_groups
+		 * catches it and routes through force_soft, see
+		 * reconcile_invalid_params_demotes_to_soft_degraded).
+		 * The property under test here is the hard-mode
+		 * invariant: when reconcile claims feasibility, every
+		 * follower it stamps must satisfy
+		 * 0 < runtime <= local_deadline <= period. */
+		struct reconcile_feasibility feas;
+		reconcile_state_feasibility(s, &feas);
+		if (feas.mode == RECONCILE_MODE_HARD) {
+			for (i = 0; i < cb.calls; i++) {
+				uint64_t r = cb.last[i].runtime;
+				uint64_t d = cb.last[i].deadline;
+				uint64_t p = cb.last[i].period;
+				if (!(r > 0 && r <= d && d <= p))
+					total_violations++;
+			}
+		}
+
+		reconcile_fini(s);
+	}
+
+	pwtest_int_eq((int)total_violations, 0);
+	return PWTEST_PASS;
+}
+
 /* apply_sched_groups detects a published runtime > local_deadline
  * tuple before issuing sched_setattr: shipping that tuple would
  * see the kernel reject it anyway. Per the operator-facing
@@ -1480,6 +1564,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_singleton_fusion_leader_equals_follower_id,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_invalid_params_demotes_to_soft_degraded,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_property_random_chains_satisfy_kernel_contract,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
