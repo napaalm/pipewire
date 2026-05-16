@@ -1852,37 +1852,94 @@ error_exit:
  *
  * Brief sequencing argument:
  *
- *   1. allocate new_fd on new_loop->system
- *   2. unprepare on old_loop (synchronous via pw_loop_invoke)
- *        -> after this, no more dispatches on old_loop for this node
- *   3. for each peer P that has cached our old (system, fd),
- *      pw_loop_invoke on P's owning loop to update P->target to the
- *      new (system, fd) -- runs on P's loop so no trigger is in flight
- *   4. update node->source.fd / node->rt.target.{system,fd} /
- *      node->data_loop atomically from the main loop
- *   5. close old_fd on old_loop->system
- *   6. prepare on new_loop (synchronous)
- *        -> drains any peer writes that landed on new_fd between
- *           step 3 and step 6 (those triggers are LOST -- the affected
- *           cycles are late but the graph recovers on the next driver
- *           wake)
- *   7. refresh PW_KEY_NODE_LOOP_TID by running do_gettid on new_loop
+ *   1. (non-remote only) unprepare on old_loop (synchronous via
+ *      pw_loop_invoke) -> after this, no more dispatches on
+ *      old_loop for this node. Remote proxies skip this step --
+ *      see "remote-node activation preservation" below for why.
+ *   2. for each peer P that has cached our old system, pw_loop_invoke
+ *      on P's owning loop to update P->target.system -- runs on P's
+ *      loop so no trigger is in flight while the pointer flips
+ *   3. update node->rt.target.system / node->data_loop atomically from
+ *      the main loop
+ *   4. (non-remote only) prepare on new_loop (synchronous) ->
+ *      for non-remote nodes the source is re-added to the new
+ *      loop's epoll set. do_node_prepare drains the eventfd once
+ *      before adding, so any peer write that landed during the
+ *      migration window is consumed; the affected cycle is
+ *      reported as a missed wake by the driver's per-target reset
+ *      on the next cycle and the graph recovers from there.
+ *   5. emit data_loop_changed so listeners can rebind their own
+ *      loop-tied resources (notably client-node.c's wake-back
+ *      source on impl->data_source).
+ *   6. refresh PW_KEY_NODE_LOOP_TID by running do_gettid on new_loop
  *
- * Lost-triggers detail: PipeWire's trigger_target_v1 writes to a
- * shared eventfd; the consumer is expected to be in spa_loop. During
- * the migration window the consumer is absent. eventfd counters
- * accumulate; do_node_prepare reads the eventfd once at re-arm time,
- * draining the counter. The driver's next cycle re-triggers everyone
- * cleanly, so steady-state continues. The user should expect at most
- * a few late cycles per relocated node, never a stuck graph.
+ * fd lifetime across migration
+ * ----------------------------
+ *
+ * The eventfd backing node->source.fd is kept open across migration.
+ * The earlier design closed the old fd and allocated a new one on
+ * new_loop->system; that was unnecessary -- the fd is a counter, not
+ * a per-loop resource, and the spa_loop_*_source pair already handles
+ * the epoll-set membership move via do_node_unprepare /
+ * do_node_prepare. Keeping the fd has two payoffs:
+ *
+ *   - Remote-proxy migration becomes free of protocol coordination.
+ *     client_node_resource_transport published node->source.fd to
+ *     the client via SCM_RIGHTS; the client's dup keeps working as
+ *     long as the underlying eventfd exists. The previous
+ *     close-and-recreate forced a protocol round-trip to publish the
+ *     new fd and was the load-bearing reason fusion_node_eligible
+ *     refused remote nodes. With the fd preserved, that refusal can
+ *     be lifted (see context.c::fusion_node_eligible).
+ *
+ * *   - The peer fd-update invoke shrinks to a system-pointer write.
+ *     Inbound peers no longer have to flip an int fd value -- only
+ *     the spa_system handle, which is what trigger_target_v1 uses
+ *     to dispatch eventfd_write through the new loop's system
+ *     implementation. The peer's target.fd is the same kernel fd as
+ *     before, so the write hits the same eventfd object.
+ *
+ * Remote-node activation preservation
+ * -----------------------------------
+ *
+ * For non-remote nodes the do_node_unprepare / do_node_prepare pair
+ * around the migration is what removes node->source from the old
+ * loop's epoll set and re-adds it on the new loop. As a side effect
+ * it also resets the activation status: do_node_unprepare XCHGs the
+ * status to INACTIVE, do_node_prepare sets it back to FINISHED. The
+ * window between the two is racy: any producer trying to trigger
+ * the node during that window sees status=INACTIVE, its
+ * NOT_TRIGGERED->TRIGGERED CAS in trigger_target_v1 fails, and the
+ * cycle is silently dropped. For locally-owned nodes this is
+ * acceptable -- the next driver cycle resets all targets to
+ * NOT_TRIGGERED and the graph recovers, costing one missed cycle
+ * per migration.
+ *
+ * For remote-proxy nodes the same trick would land a perceptible
+ * xrun on the *other* side of the protocol: the client process is
+ * waiting for an eventfd wake that we suppressed by failing the
+ * CAS, and it cannot tell the difference between "trigger lost in
+ * migration" and "graph genuinely paused this cycle". Skipping
+ * do_node_unprepare / do_node_prepare for remote nodes preserves
+ * the activation status across migration -- the proxy's source
+ * was never on a daemon-side loop anyway (do_node_prepare's
+ * `if (!this->remote)` guard), so the only thing those calls did
+ * was the status flip and the symmetric target_list deactivate /
+ * activate. Skipping both keeps producers triggering the proxy
+ * uninterrupted; the wake-back source on the daemon side is
+ * relocated separately by the data_loop_changed listener in
+ * client-node.c, which is the one resource on the daemon that
+ * actually moves loops for a remote proxy.
  */
 
-/* Payload of the peer fd-update invoke. Lives on the caller's stack;
- * pw_loop_invoke with block=true copies it into the invoke ringbuffer
- * before returning, so a stack lifetime is safe. */
+/* Payload of the peer system-update invoke. Lives on the caller's
+ * stack; pw_loop_invoke with block=true copies it into the invoke
+ * ringbuffer before returning, so a stack lifetime is safe. The
+ * peer's target.fd does not move across migration -- see the
+ * fd-lifetime block in the file header above -- so only the system
+ * pointer is carried. */
 struct peer_target_update {
 	struct spa_system *system;
-	int fd;
 };
 
 static int do_update_peer_target(struct spa_loop *loop, bool async, uint32_t seq,
@@ -1891,11 +1948,10 @@ static int do_update_peer_target(struct spa_loop *loop, bool async, uint32_t seq
 	struct pw_node_peer *peer = user_data;
 	const struct peer_target_update *u = data;
 
-	pw_log_debug("peer %p: target.fd %d -> %d, system %p -> %p",
-			peer, peer->target.fd, u->fd, peer->target.system, u->system);
+	pw_log_debug("peer %p: target.system %p -> %p (fd %d unchanged)",
+			peer, peer->target.system, u->system, peer->target.fd);
 
 	peer->target.system = u->system;
-	peer->target.fd = u->fd;
 	return 0;
 }
 
@@ -1915,13 +1971,12 @@ static int do_update_peer_target(struct spa_loop *loop, bool async, uint32_t seq
  * every cached fd.
  */
 static int update_inbound_peers(struct pw_impl_node *node,
-		struct spa_system *new_system, int new_fd)
+		struct spa_system *new_system)
 {
 	struct pw_context *context = node->context;
 	struct pw_impl_node *other;
 	struct peer_target_update upd = {
 		.system = new_system,
-		.fd = new_fd,
 	};
 
 	spa_list_for_each(other, &context->node_list, link) {
@@ -1941,18 +1996,9 @@ SPA_EXPORT
 int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_loop)
 {
 	struct pw_loop *old_loop;
-	struct spa_system *old_system, *new_system;
-	int old_fd, new_fd;
-	int res;
+	struct spa_system *new_system;
 
 	if (node == NULL || new_loop == NULL)
-		return -EINVAL;
-
-	/* Relocating a remote stand-in is meaningless: the real
-	 * data-loop thread is in another process. The caller should
-	 * route the request to that process via the existing protocol
-	 * if it ever needs to. */
-	if (node->remote)
 		return -EINVAL;
 
 	old_loop = node->data_loop;
@@ -1967,87 +2013,85 @@ int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_lo
 	    new_loop == node->context->main_loop)
 		return -EINVAL;
 
-	old_system = node->rt.target.system;
-	old_fd = node->source.fd;
 	new_system = new_loop->system;
 
-	new_fd = spa_system_eventfd_create(new_system,
-			SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
-	if (new_fd < 0) {
-		res = -errno;
-		pw_log_warn("%p: eventfd_create failed on new loop: %m", node);
-		return res;
-	}
+	pw_log_info("%p: relocating from loop:'%s' to loop:'%s' "
+			"(remote=%d fd=%d kept across migration)",
+			node, old_loop->name, new_loop->name,
+			node->remote, node->source.fd);
 
-	pw_log_info("%p: relocating from loop:'%s' to loop:'%s' (fd %d -> %d)",
-			node, old_loop->name, new_loop->name, old_fd, new_fd);
+	/* 1. quiesce the source on the old loop. For !remote nodes this
+	 *    removes node->source from old_loop's epoll set and does a
+	 *    full state-machine reset (status -> INACTIVE, targets
+	 *    deactivated). For remote proxies we SKIP this step
+	 *    entirely:
+	 *
+	 *      - The source was never added to the daemon-side loop
+	 *        (do_node_prepare's `if (!this->remote)` guard), so
+	 *        there is no epoll entry to remove.
+	 *      - The activation status drop to INACTIVE would close a
+	 *        window in which producers' trigger_target_v1 would
+	 *        fail the NOT_TRIGGERED -> TRIGGERED CAS (status is
+	 *        INACTIVE during the window) and silently drop
+	 *        triggers. The pre-existing contract accepted this
+	 *        cycle loss for locally-owned nodes (the producer is
+	 *        on the same machine and the next driver cycle
+	 *        resets everyone), but for remote proxies the
+	 *        consequence is an audible xrun on the *other* end
+	 *        of the protocol -- the client side is waiting for
+	 *        a wake that never comes for that cycle.
+	 *      - The target_list deactivate/reactivate pair around
+	 *        unprepare/prepare is a no-op for the migrated remote
+	 *        node since target.fd does not move; we keep peers
+	 *        active across the migration so any in-flight trigger
+	 *        the driver has already issued lands cleanly. */
+	if (!node->remote)
+		pw_loop_invoke(old_loop, do_node_unprepare, 1, NULL, 0, true, node);
 
-	/* 2. quiesce the source on the old loop */
-	pw_loop_invoke(old_loop, do_node_unprepare, 1, NULL, 0, true, node);
+	/* 2. publish the new spa_system to inbound peers. The fd does
+	 *    not move (see the fd-lifetime block in this file's header),
+	 *    so trigger_target_v1's spa_system_eventfd_write will hit
+	 *    the same kernel eventfd; only the routing of the write
+	 *    through the new loop's system implementation flips. */
+	update_inbound_peers(node, new_system);
 
-	/* 3. point every inbound peer at the new fd before we
-	 *    invalidate the old fd. */
-	update_inbound_peers(node, new_system, new_fd);
-
-	/* 3b. Trigger forwarding (xrun-safety): between step 2 and
-	 *     step 3 the old fd is still observable by peers whose view
-	 *     update has not yet propagated, and any trigger they
-	 *     issued during that window left a non-zero eventfd counter
-	 *     on the now-unread old fd. Drain it once now (the source
-	 *     has been removed in step 2, so we are the only reader)
-	 *     and re-issue the same count on the new fd. This way every
-	 *     in-flight trigger lands on the new loop's eventfd; the
-	 *     subsequent do_node_prepare (step 6) consumes it as part
-	 *     of its routine read-once-to-clear, and no driver cycle is
-	 *     lost across the migration. The pre-existing "lost
-	 *     triggers" window from this function's original
-	 *     implementation is therefore closed -- which was the
-	 *     observable cause of xruns during chain consolidation. */
-	{
-		uint64_t pending = 0;
-		int rr = spa_system_eventfd_read(old_system, old_fd, &pending);
-		if (rr == 0 && pending > 0) {
-			int wr = spa_system_eventfd_write(new_system, new_fd,
-					pending);
-			if (wr < 0)
-				pw_log_warn("%p: migration trigger forward "
-						"failed (count=%"PRIu64"): %s",
-						node, pending, spa_strerror(wr));
-			else
-				pw_log_debug("%p: migration forwarded "
-						"%"PRIu64" pending trigger(s)",
-						node, pending);
-		}
-		/* -EAGAIN is the steady-state case (no pending counter)
-		 * and is silently accepted. Other errors are unlikely
-		 * (the fd is owned by us and was non-blocking when
-		 * created); log them but do not fail the migration --
-		 * the worst case here is one missed wake-up that the
-		 * next driver cycle recovers from, which is the
-		 * pre-existing contract this fix tightens. */
-	}
-
-	/* 4. flip the node's own bookkeeping */
-	node->source.fd = new_fd;
+	/* 3. flip the node's own bookkeeping. node->source.fd and
+	 *    node->rt.target.fd are NOT touched -- they point at the
+	 *    same eventfd as before; only the system handle is swapped
+	 *    so subsequent eventfd reads (the drain in do_node_prepare,
+	 *    notably) go through new_loop's spa_system. */
 	node->rt.target.system = new_system;
-	node->rt.target.fd = new_fd;
 	node->data_loop = new_loop;
 
-	/* 5. close the now-orphaned old fd */
-	spa_system_close(old_system, old_fd);
+	/* 4. re-arm the source on the new loop. Mirror of step 1:
+	 *    skipped for remote proxies because step 1 also skipped
+	 *    the symmetric unprepare. The proxy's rt.prepared stays
+	 *    true throughout migration; its activation status keeps
+	 *    whatever value it held before the migration; producers'
+	 *    triggers go through uninterrupted via the same kernel
+	 *    eventfd. */
+	if (!node->remote)
+		pw_loop_invoke(new_loop, do_node_prepare, 1, NULL, 0, true, node);
 
-	/* 6. re-arm the source on the new loop. Note: do_node_prepare
-	 *    only adds the source when !rt.prepared, but we just
-	 *    cleared rt.prepared via do_node_unprepare in step 2, so
-	 *    this always re-adds. */
-	pw_loop_invoke(new_loop, do_node_prepare, 1, NULL, 0, true, node);
+	/* 5. notify listeners that the data_loop has been swapped.
+	 *    Fires BEFORE info_changed: listeners use this hook to
+	 *    rebind loop-tied resources they registered themselves
+	 *    (notably the client-node-impl's wake-back source, which
+	 *    sits on impl->data_loop, NOT node->source). Doing it
+	 *    here -- after do_node_prepare on the new loop has
+	 *    returned -- ensures the listener can pw_loop_invoke on
+	 *    both old and new loops without re-entering the migration
+	 *    that is still in flight. */
+	pw_impl_node_emit_data_loop_changed(node, old_loop, new_loop);
 
-	/* 7. refresh the published TID. Skip for remote nodes -- the
-	 *    relocation primitive is only ever called on locally owned
-	 *    nodes (fusion_node_eligible excludes remote) so this guard
-	 *    is defensive, but it keeps the invariant from the create
-	 *    path: PW_KEY_NODE_LOOP_TID names the thread that runs the
-	 *    process callback, which for remote nodes lives elsewhere. */
+	/* 6. refresh the published TID for locally-owned nodes only.
+	 *    Remote proxies' real TID lives in the client process and
+	 *    is published by that process via PW_KEY_NODE_LOOP_TID; the
+	 *    daemon's loop TID would mislead consumers about which
+	 *    thread runs the callback. Match the create-path invariant
+	 *    here (see node_initialized's gettid handling and 265ba39f0
+	 *    "context, impl-node: keep remote-node proxies on a shared
+	 *    data loop"). */
 	if (!node->remote)
 		pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
 				node->properties);

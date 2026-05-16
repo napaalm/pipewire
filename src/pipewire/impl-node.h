@@ -29,7 +29,7 @@ struct pw_impl_port;
 
 /** Node events, listen to them with \ref pw_impl_node_add_listener */
 struct pw_impl_node_events {
-#define PW_VERSION_IMPL_NODE_EVENTS	0
+#define PW_VERSION_IMPL_NODE_EVENTS	1
 	uint32_t version;
 
 	/** the node is destroyed */
@@ -73,6 +73,24 @@ struct pw_impl_node_events {
 	void (*peer_added) (void *data, struct pw_impl_node *peer);
 	/** a peer was removed */
 	void (*peer_removed) (void *data, struct pw_impl_node *peer);
+
+	/**
+	 * The node's data_loop has changed. Fires after
+	 * pw_impl_node_set_data_loop has finished the relocation,
+	 * before info_changed (so listeners can rebind loop-tied
+	 * resources before the public info advertises the new loop).
+	 *
+	 * Available in PW_VERSION_IMPL_NODE_EVENTS >= 1.
+	 *
+	 * Use cases: a listener that registered a spa_source on the
+	 * node's previous data_loop (notably the client-node-impl
+	 * wake-back source, which sits separately from node->source
+	 * and is bound to impl->data_loop) must remove it from the
+	 * old loop and add it to the new one. Listeners that did not
+	 * touch a loop can ignore the event.
+	 */
+	void (*data_loop_changed) (void *data, struct pw_loop *old_loop,
+			struct pw_loop *new_loop);
 };
 
 struct pw_impl_node_rt_events {

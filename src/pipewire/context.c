@@ -1047,25 +1047,39 @@ struct pw_loop *pw_context_acquire_node_loop(struct pw_context *context, struct 
 	const char *name, *klass, *group;
 	struct pw_data_loop *loop;
 
-	/* Dynamic data loops are only meaningful for nodes whose
-	 * processing thread the *current* process owns end-to-end.
-	 * Remote nodes (the server's view of a client-node proxy)
-	 * never run user code on the data loop -- the eventfd
-	 * dispatcher is all that lives there -- so giving each
-	 * proxy its own thread costs a pthread per connected stream
-	 * for no scheduling benefit and quickly hits the kernel's
-	 * per-process resource limits under load (pipewire-pulse,
-	 * pipewire-alsa and pipewire-jack each opening one
-	 * client-node per stream). The owning process's pw_impl_node
-	 * still gets its own dynamic loop and publishes its TID via
-	 * PW_KEY_NODE_LOOP_TID, which propagates to the proxy
-	 * properties and is what downstream consumers use. */
-	if (!impl->dynamic_data_loops || remote)
-		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
-
 	name = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_NAME) : NULL;
 	klass = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
 	group = props ? pw_properties_get(props, PW_KEY_NODE_LOOP_GROUP) : NULL;
+
+	/* Dynamic data loops are only meaningful for nodes whose
+	 * processing thread the *current* process owns end-to-end.
+	 * Remote nodes (the server's view of a client-node proxy)
+	 * never run user code on their data loop -- the eventfd
+	 * dispatcher is all that lives there -- so giving each
+	 * proxy its own private dynamic loop would cost a pthread
+	 * per connected stream for no scheduling benefit and quickly
+	 * hit the kernel's per-process resource limits under load
+	 * (pipewire-pulse, pipewire-alsa and pipewire-jack each open
+	 * one client-node per stream, see 265ba39f0).
+	 *
+	 * BUT: when the subgraph-fusion pass explicitly sets
+	 * PW_KEY_NODE_LOOP_GROUP on a proxy to co-locate it with
+	 * other group members, we DO route through the dynamic-loop
+	 * path -- group membership is the whole point of the
+	 * acquisition. The dynamic-loop allocator already ref-counts
+	 * per group, so multiple proxies that all want the same
+	 * group land on the same loop (one pthread per group rather
+	 * than per proxy); the 265ba39f0 budget concern is preserved
+	 * because remote proxies WITHOUT a group still take the
+	 * static-pool path below.
+	 *
+	 * This routing is what makes Solution C usable from the
+	 * fusion pass: the pass stamps a desired group on the
+	 * proxy's properties and reacquires the loop; without this
+	 * branch the desired group would be silently discarded and
+	 * the proxy would never leave its initial static-pool loop. */
+	if (!impl->dynamic_data_loops || (remote && group == NULL))
+		return pw_context_acquire_loop(context, props ? &props->dict : NULL);
 
 	loop = acquire_dynamic_data_loop(impl, name, klass, group);
 	if (loop) {
@@ -1739,15 +1753,19 @@ static uint32_t find_best_rate(const uint32_t *rates, uint32_t n_rates, uint32_t
  *   - Link eligible iff prepared && !feedback && neither endpoint is
  *     async (async ports carry one cycle of buffer slack and are not
  *     a precedence constraint in-period).
- *   - Node eligible iff not remote, not exported, not a driver, and
- *     currently parked on a dynamic data loop (not the main loop, not
- *     a static loop).
- *
- * The "remote" exclusion is load-bearing: nodes that go through the
- * client-node protocol share an eventfd with the protocol layer.
- * Closing and re-creating that fd on the server side would leave the
- * protocol with a dangling reference. The relocation is therefore
- * restricted to nodes that own their data-loop thread end-to-end.
+ *   - Node eligible iff not exported, not a driver, and currently
+ *     parked on a dynamic data loop (not the main loop, not a static
+ *     loop). Remote-proxy nodes ARE eligible: the relocation
+ *     primitive pw_impl_node_set_data_loop now keeps the eventfd
+ *     open across migration, so the client-node protocol layer's
+ *     reference to it stays valid (see the fd-lifetime block above
+ *     pw_impl_node_set_data_loop in impl-node.c). What this fuses
+ *     on the daemon side is only the routing of the wake -- the
+ *     actual processing thread for a remote proxy lives in the
+ *     client process and is whatever loop the client put it on.
+ *     The §3.5 inline-dispatch fast path correctly continues to opt
+ *     out for remote endpoints because process_node on a proxy is a
+ *     stub (client-node.c::impl_node_process); see pw_node_peer_ref.
  *
  * Fusion semantics
  * ----------------
@@ -1850,7 +1868,13 @@ static inline bool fusion_node_eligible(struct pw_context *context,
 {
 	if (node == NULL)
 		return false;
-	if (node->remote || node->exported || node->driver)
+	/* Remote proxies are now eligible. exported nodes are still
+	 * excluded because their process callback also runs out-of-
+	 * process and the relocation would not change where the work
+	 * happens. Drivers are excluded because the worst-fit placer
+	 * keeps them on their own data loop (each driver is the root
+	 * of a separate scheduling DAG). */
+	if (node->exported || node->driver)
 		return false;
 	if (node->data_loop == NULL || node->data_loop == context->main_loop)
 		return false;

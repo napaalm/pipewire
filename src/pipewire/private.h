@@ -765,6 +765,7 @@ void pw_node_peer_unref(struct pw_node_peer *peer);
 #define pw_impl_node_emit_driver_changed(n,o,d)		pw_impl_node_emit(n, driver_changed, 0, o, d)
 #define pw_impl_node_emit_peer_added(n,p)		pw_impl_node_emit(n, peer_added, 0, p)
 #define pw_impl_node_emit_peer_removed(n,p)		pw_impl_node_emit(n, peer_removed, 0, p)
+#define pw_impl_node_emit_data_loop_changed(n,o,nl)	pw_impl_node_emit(n, data_loop_changed, 1, o, nl)
 
 #define pw_impl_node_rt_emit(o,m,v,...) spa_hook_list_call(&o->rt_listener_list, struct pw_impl_node_rt_events, m, v, ##__VA_ARGS__)
 #define pw_impl_node_rt_emit_drained(n)			pw_impl_node_rt_emit(n, drained, 0)

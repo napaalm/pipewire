@@ -1712,6 +1712,78 @@ static void node_port_removed(void *data, struct pw_impl_port *port)
 	clear_port(impl, p);
 }
 
+/* Trivial spa_loop callbacks used by node_data_loop_changed to move
+ * impl->data_source between loops. spa_loop_*_source must run on the
+ * owning loop's thread; pw_loop_invoke(..., block=true) gives us the
+ * synchronisation. */
+static int do_remove_data_source(struct spa_loop *loop, bool async,
+		uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct spa_source *source = user_data;
+	spa_loop_remove_source(loop, source);
+	return 0;
+}
+
+static int do_add_data_source(struct spa_loop *loop, bool async,
+		uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct spa_source *source = user_data;
+	spa_loop_add_source(loop, source);
+	return 0;
+}
+
+/* The proxy node's data_loop was just swapped (typically by the
+ * subgraph-fusion pass relocating a remote proxy onto a shared
+ * dynamic data loop). The proxy carries two loop-bound resources:
+ *
+ *   - node->source: the "daemon -> client" eventfd. For remote
+ *     nodes this is NOT registered on any daemon-side loop (see
+ *     do_node_prepare's `if (!this->remote)` guard); the client
+ *     side has the fd via SCM_RIGHTS and listens on its own loop.
+ *     pw_impl_node_set_data_loop's design keeps the kernel fd open
+ *     across migration, so the client's dup stays valid. Nothing
+ *     to do here for it.
+ *
+ *   - impl->data_source: the "client -> daemon" wake-back. The
+ *     client writes to this fd when it has finished a cycle; the
+ *     daemon's data loop reads it and emits rt_complete on the
+ *     proxy node. This source IS registered on a loop (set in
+ *     node_initialized via spa_loop_add_source on impl->data_loop)
+ *     and that loop is the proxy node's data_loop. When the proxy
+ *     migrates, the source must follow, or rt_complete would fire
+ *     on the wrong thread (stale loop) and downstream rt-listeners
+ *     would observe a thread mismatch against node->data_loop.
+ *
+ * We're called from the main thread (pw_impl_node_set_data_loop
+ * itself runs there). spa_loop_*_source must run inside the
+ * owning-loop's thread, so dispatch each leg via a blocking
+ * pw_loop_invoke. The old loop is quiesced of this node's other
+ * sources at this point but is still running for any unrelated
+ * activity it carries -- the invoke serialises against that. */
+static void node_data_loop_changed(void *data, struct pw_loop *old_loop,
+		struct pw_loop *new_loop)
+{
+	struct impl *impl = data;
+
+	if (impl->data_source.fd < 0)
+		return;
+
+	pw_log_info("%p: rebinding wake-back source fd %d from loop '%s' to '%s'",
+			impl, impl->data_source.fd,
+			old_loop ? old_loop->name : "<none>",
+			new_loop->name);
+
+	if (old_loop != NULL)
+		pw_loop_invoke(old_loop, do_remove_data_source, SPA_ID_INVALID,
+				NULL, 0, true, &impl->data_source);
+
+	impl->data_loop = new_loop->loop;
+	impl->data_system = new_loop->system;
+
+	pw_loop_invoke(new_loop, do_add_data_source, SPA_ID_INVALID,
+			NULL, 0, true, &impl->data_source);
+}
+
 static const struct pw_impl_node_events node_events = {
 	PW_VERSION_IMPL_NODE_EVENTS,
 	.free = node_free,
@@ -1721,6 +1793,7 @@ static const struct pw_impl_node_events node_events = {
 	.port_removed = node_port_removed,
 	.peer_added = node_peer_added,
 	.peer_removed = node_peer_removed,
+	.data_loop_changed = node_data_loop_changed,
 };
 
 static const struct pw_resource_events resource_events = {
