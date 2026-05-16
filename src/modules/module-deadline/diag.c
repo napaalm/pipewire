@@ -11,12 +11,36 @@
  */
 
 #include <errno.h>
+#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "diag.h"
+
+/* JSON requires '.' as the decimal separator (RFC 8259 §6); the
+ * text snapshot is consumed by tooling that expects the same.
+ * snprintf honours LC_NUMERIC, so a daemon launched under e.g.
+ * it_IT would otherwise emit "0,041" and break every downstream
+ * parser. Format every floating-point value through this helper:
+ * it rounds with the active locale and then rewrites the decimal
+ * marker, which avoids the (non-portable, non-thread-friendly)
+ * uselocale dance. */
+static void diag_fprintf_double(FILE *out, int precision, double v)
+{
+	char buf[64];
+	int n = snprintf(buf, sizeof(buf), "%.*f", precision, v);
+	if (n < 0 || (size_t)n >= sizeof(buf)) {
+		fputs("0", out);
+		return;
+	}
+	for (char *p = buf; *p != '\0'; p++) {
+		if (*p == ',')
+			*p = '.';
+	}
+	fputs(buf, out);
+}
 
 /* Initial allocation when the first node/edge lands. Both arrays
  * grow geometrically (doubling) so amortised cost is O(1) per add.
@@ -544,7 +568,8 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			"    node id=%u tid=%d runtime=%lluns local_deadline=%lluns"
 			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s"
 			" budget_kind=%s budget_samples=%llu"
-			" mbpta_state=%s mbpta_pwcet=%lluns mbpta_blocks=%u\n",
+			" mbpta_state=%s mbpta_pwcet=%lluns mbpta_blocks=%u"
+			" mbpta_mu=",
 			n->id, (int)n->tid,
 			(unsigned long long)n->runtime_budget_ns,
 			(unsigned long long)n->local_deadline_ns,
@@ -557,6 +582,19 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			rt_diag_mbpta_state_name(n->mbpta_state),
 			(unsigned long long)n->mbpta_pwcet_ns,
 			n->mbpta_block_count);
+		diag_fprintf_double(out, 0, n->mbpta_mu);
+		fputs(" mbpta_sigma=", out);
+		diag_fprintf_double(out, 0, n->mbpta_sigma);
+		fputs(" mbpta_ks=", out);
+		diag_fprintf_double(out, 6, n->mbpta_ks_stat);
+		fputs(" mbpta_runs_z=", out);
+		diag_fprintf_double(out, 6, n->mbpta_runs_z);
+		fputs(" mbpta_crps=", out);
+		diag_fprintf_double(out, 6, n->mbpta_crps);
+		fprintf(out,
+			" mbpta_conv=%u mbpta_iid_reject=%u\n",
+			n->mbpta_convergence_streak,
+			n->mbpta_iid_reject_streak);
 	}
 }
 
@@ -793,7 +831,8 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				"\"applied\":%s,\"budget_kind\":\"%s\","
 				"\"budget_samples\":%llu,"
 				"\"mbpta\":{\"state\":\"%s\","
-				"\"pwcet_ns\":%llu,\"blocks\":%u}}",
+				"\"pwcet_ns\":%llu,\"blocks\":%u,"
+				"\"mu\":",
 				n->id, (int)n->tid,
 				(unsigned long long)n->runtime_budget_ns,
 				(unsigned long long)n->local_deadline_ns,
@@ -806,6 +845,20 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				rt_diag_mbpta_state_name(n->mbpta_state),
 				(unsigned long long)n->mbpta_pwcet_ns,
 				n->mbpta_block_count);
+			diag_fprintf_double(out, 0, n->mbpta_mu);
+			fputs(",\"sigma\":", out);
+			diag_fprintf_double(out, 0, n->mbpta_sigma);
+			fputs(",\"ks_stat\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_ks_stat);
+			fputs(",\"runs_z\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_runs_z);
+			fputs(",\"crps\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_crps);
+			fprintf(out,
+				",\"convergence_streak\":%u,"
+				"\"iid_reject_streak\":%u}}",
+				n->mbpta_convergence_streak,
+				n->mbpta_iid_reject_streak);
 		}
 	}
 	fputs("]}", out);

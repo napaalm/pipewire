@@ -479,11 +479,17 @@ PWTEST(diag_params_render_text_golden)
 		"    node id=37 tid=302370 runtime=85494ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true"
 		" budget_kind=empirical_quantile budget_samples=128"
-		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0\n"
+		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
+		" mbpta_mu=0 mbpta_sigma=0"
+		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
+		" mbpta_conv=0 mbpta_iid_reject=0\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
 		" budget_kind=bootstrap_fallback budget_samples=0"
-		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0\n";
+		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
+		" mbpta_mu=0 mbpta_sigma=0"
+		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
+		" mbpta_conv=0 mbpta_iid_reject=0\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -584,7 +590,12 @@ PWTEST(diag_json_full_golden)
 		"\"cpu\":4,\"applied\":true,"
 		"\"budget_kind\":\"empirical_quantile\","
 		"\"budget_samples\":512,"
-		"\"mbpta\":{\"state\":\"pwcet_valid\",\"pwcet_ns\":91234,\"blocks\":50}}]},"
+		"\"mbpta\":{\"state\":\"pwcet_valid\",\"pwcet_ns\":91234,\"blocks\":50,"
+		"\"mu\":120000,\"sigma\":3500,"
+		"\"ks_stat\":0.041000,\"runs_z\":-0.230000,"
+		"\"crps\":0.072000,"
+		"\"convergence_streak\":4,"
+		"\"iid_reject_streak\":0}}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -631,6 +642,13 @@ PWTEST(diag_json_full_golden)
 	pn.mbpta_state = RT_DIAG_MBPTA_PWCET_VALID;
 	pn.mbpta_pwcet_ns = 91234;
 	pn.mbpta_block_count = 50;
+	pn.mbpta_mu = 120000.0;
+	pn.mbpta_sigma = 3500.0;
+	pn.mbpta_ks_stat = 0.041;
+	pn.mbpta_runs_z = -0.23;
+	pn.mbpta_crps = 0.072;
+	pn.mbpta_convergence_streak = 4;
+	pn.mbpta_iid_reject_streak = 0;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;

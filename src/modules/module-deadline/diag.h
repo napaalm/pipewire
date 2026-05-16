@@ -420,6 +420,24 @@ struct rt_diag_param_node {
 	enum rt_diag_mbpta_state mbpta_state;
 	uint64_t mbpta_pwcet_ns;
 	uint32_t mbpta_block_count;
+	/* MBPTA fit diagnostics. The first three are the most
+	 * recent statistical-test outcomes (Kolmogorov-Smirnov
+	 * statistic on the two-sample identical-distribution test;
+	 * Wald-Wolfowitz Z on the independence test;
+	 * continuous-rank-probability-score between successive
+	 * Gumbel fits); the last two are the per-fit Gumbel
+	 * location and scale parameters
+	 * (Cucu-Grosjean 2012 §II-A). The values are read
+	 * verbatim from mbpta_ks_stat / mbpta_runs_z / mbpta_crps /
+	 * mbpta_mu / mbpta_sigma. All zero until the first re-eval
+	 * round runs. */
+	double   mbpta_ks_stat;
+	double   mbpta_runs_z;
+	double   mbpta_crps;
+	double   mbpta_mu;
+	double   mbpta_sigma;
+	uint32_t mbpta_convergence_streak;
+	uint32_t mbpta_iid_reject_streak;
 };
 
 struct rt_diag_params_snapshot {

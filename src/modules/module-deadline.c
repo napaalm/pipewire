@@ -2451,6 +2451,15 @@ static int populate_params_snapshot(struct impl *impl,
 				(enum rt_diag_mbpta_state)mbpta_state(mn->mbpta);
 			pn.mbpta_pwcet_ns = mbpta_pwcet_ns(mn->mbpta);
 			pn.mbpta_block_count = mbpta_block_count(mn->mbpta);
+			pn.mbpta_mu = mbpta_mu(mn->mbpta);
+			pn.mbpta_sigma = mbpta_sigma(mn->mbpta);
+			pn.mbpta_ks_stat = mbpta_ks_stat(mn->mbpta);
+			pn.mbpta_runs_z = mbpta_runs_z(mn->mbpta);
+			pn.mbpta_crps = mbpta_crps(mn->mbpta);
+			pn.mbpta_convergence_streak =
+				mbpta_convergence_streak(mn->mbpta);
+			pn.mbpta_iid_reject_streak =
+				mbpta_iid_reject_streak(mn->mbpta);
 		} else {
 			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
 			pn.mbpta_pwcet_ns = 0;
