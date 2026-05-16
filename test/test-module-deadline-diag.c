@@ -477,9 +477,11 @@ PWTEST(diag_params_render_text_golden)
 		"deadline-diag-params: driver=63 generation=4 mode=prototype\n"
 		"  nodes: 2\n"
 		"    node id=37 tid=302370 runtime=85494ns local_deadline=21333333ns"
-		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true\n"
+		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true"
+		" budget_kind=empirical_quantile budget_samples=128\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
-		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false\n";
+		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
+		" budget_kind=bootstrap_fallback budget_samples=0\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -490,11 +492,15 @@ PWTEST(diag_params_render_text_golden)
 	n.runtime_budget_ns = 85494; n.local_deadline_ns = 21333333;
 	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
 	n.cpu = 4; n.applied = true;
+	n.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
+	n.budget_sample_count = 128;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 	n.id = 38; n.tid = 302371;
 	n.runtime_budget_ns = 42620; n.local_deadline_ns = 21333333;
 	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
 	n.cpu = 5; n.applied = false;
+	n.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+	n.budget_sample_count = 0;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 
 	fp = open_memstream(&buf, &len);
@@ -573,7 +579,9 @@ PWTEST(diag_json_full_golden)
 		"\"parameters\":{\"nodes\":[{\"id\":63,\"tid\":302388,"
 		"\"runtime_ns\":85494,\"local_deadline_ns\":21333333,"
 		"\"cumulative_deadline_ns\":21333333,\"period_ns\":21333333,"
-		"\"cpu\":4,\"applied\":true}]},"
+		"\"cpu\":4,\"applied\":true,"
+		"\"budget_kind\":\"empirical_quantile\","
+		"\"budget_samples\":512}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -615,6 +623,8 @@ PWTEST(diag_json_full_golden)
 	pn.runtime_budget_ns = 85494; pn.local_deadline_ns = 21333333;
 	pn.cumulative_deadline_ns = 21333333; pn.period_ns = 21333333;
 	pn.cpu = 4; pn.applied = true;
+	pn.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
+	pn.budget_sample_count = 512;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;
@@ -684,6 +694,23 @@ PWTEST(diag_peer_dispatch_null_safe)
 	return PWTEST_PASS;
 }
 
+PWTEST(diag_budget_kind_names_stable)
+{
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_DETERMINISTIC_WCET),
+		      "deterministic_wcet");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_PWCET),
+		      "pwcet");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_EMPIRICAL_QUANTILE),
+		      "empirical_quantile");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK),
+		      "bootstrap_fallback");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_MANUAL_OVERRIDE),
+		      "manual_override");
+	pwtest_str_eq(rt_diag_budget_kind_name((enum rt_diag_budget_kind)999),
+		      "unknown");
+	return PWTEST_PASS;
+}
+
 PWTEST(diag_json_escapes_strings)
 {
 	struct rt_diag_raw_snapshot raw;
@@ -744,6 +771,7 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_json_escapes_strings, PWTEST_NOARG);
 	pwtest_add(diag_peer_dispatch_render_text, PWTEST_NOARG);
 	pwtest_add(diag_peer_dispatch_null_safe, PWTEST_NOARG);
+	pwtest_add(diag_budget_kind_names_stable, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

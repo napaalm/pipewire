@@ -2300,6 +2300,25 @@ static int populate_params_snapshot(struct impl *impl,
 		} else {
 			pn.applied = false;
 		}
+		/* Budget provenance. The current estimator is the
+		 * Dunning & Ertl 2019 t-digest sliding-window quantile
+		 * sketch: when it has collected enough samples to leave
+		 * the bootstrap-min-samples gate, the runtime budget
+		 * comes from the configured quantile (an empirical
+		 * quantile, not a pWCET); otherwise the node runs on
+		 * the bootstrap fallback. Calling either a "WCET"
+		 * would conflate provenance with magnitude, which
+		 * Cucu-Grosjean et al. 2012 explicitly warns against. */
+		if (mn != NULL && mn->sketch_ready) {
+			uint32_t count = wcet_sketch_count(&mn->sketch);
+			pn.budget_sample_count = count;
+			pn.budget_kind = count >= impl->sketch_min_samples
+				? RT_DIAG_BUDGET_EMPIRICAL_QUANTILE
+				: RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+		} else {
+			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+			pn.budget_sample_count = 0;
+		}
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
 			return r;

@@ -354,6 +354,38 @@ void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s
  * tuple has been computed by the analysis layer but the syscall has
  * not yet run (typically a brand-new follower).
  */
+/*
+ * Per-node runtime-budget provenance.
+ *
+ * A SCHED_DEADLINE `runtime` value is only as strong a guarantee
+ * as the estimator that produced it. A deterministic WCET from
+ * static analysis or a manufacturer's datasheet supports a hard
+ * timing claim; a measurement-based pWCET with stated exceedance
+ * probability supports a probabilistic claim; an empirical p-
+ * quantile from a streaming sketch supports a soft-real-time
+ * claim only; a bootstrap fallback (used while a new node has not
+ * yet accumulated enough samples for a real estimate) supports
+ * neither. Calling any of those a "WCET" without qualification --
+ * which the prototype's t-digest p95 currently does -- is the
+ * provenance bug Cucu-Grosjean et al. 2012 warns about: a raw
+ * percentile is not a WCET and pretending it is silently
+ * weakens every downstream feasibility claim.
+ *
+ * The kinds below mirror Cucu-Grosjean 2012 (pWCET), Dunning &
+ * Ertl 2019 (empirical quantile via t-digest), and the
+ * deterministic / manual-override / bootstrap cases that
+ * complete the taxonomy. Tokens are lower_snake_case.
+ */
+enum rt_diag_budget_kind {
+	RT_DIAG_BUDGET_DETERMINISTIC_WCET = 0,
+	RT_DIAG_BUDGET_PWCET              = 1,
+	RT_DIAG_BUDGET_EMPIRICAL_QUANTILE = 2,
+	RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK = 3,
+	RT_DIAG_BUDGET_MANUAL_OVERRIDE    = 4,
+};
+
+const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k);
+
 struct rt_diag_param_node {
 	uint32_t id;
 	pid_t    tid;
@@ -363,6 +395,8 @@ struct rt_diag_param_node {
 	uint64_t period_ns;
 	uint32_t cpu;
 	bool     applied;
+	enum rt_diag_budget_kind budget_kind;
+	uint64_t budget_sample_count;
 };
 
 struct rt_diag_params_snapshot {

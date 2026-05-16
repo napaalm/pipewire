@@ -542,14 +542,17 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 		const struct rt_diag_param_node *n = &s->nodes[i];
 		fprintf(out,
 			"    node id=%u tid=%d runtime=%lluns local_deadline=%lluns"
-			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s\n",
+			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s"
+			" budget_kind=%s budget_samples=%llu\n",
 			n->id, (int)n->tid,
 			(unsigned long long)n->runtime_budget_ns,
 			(unsigned long long)n->local_deadline_ns,
 			(unsigned long long)n->cumulative_deadline_ns,
 			(unsigned long long)n->period_ns,
 			n->cpu,
-			n->applied ? "true" : "false");
+			n->applied ? "true" : "false",
+			rt_diag_budget_kind_name(n->budget_kind),
+			(unsigned long long)n->budget_sample_count);
 	}
 }
 
@@ -705,6 +708,18 @@ static void json_write_fusion_section(FILE *out, const struct rt_diag_fusion_sna
 	fputs("]}", out);
 }
 
+const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k)
+{
+	switch (k) {
+	case RT_DIAG_BUDGET_DETERMINISTIC_WCET: return "deterministic_wcet";
+	case RT_DIAG_BUDGET_PWCET:              return "pwcet";
+	case RT_DIAG_BUDGET_EMPIRICAL_QUANTILE: return "empirical_quantile";
+	case RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK: return "bootstrap_fallback";
+	case RT_DIAG_BUDGET_MANUAL_OVERRIDE:    return "manual_override";
+	}
+	return "unknown";
+}
+
 void rt_diag_peer_dispatch_init(struct rt_diag_peer_dispatch *s)
 {
 	if (s == NULL)
@@ -758,14 +773,17 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				"\"local_deadline_ns\":%llu,"
 				"\"cumulative_deadline_ns\":%llu,"
 				"\"period_ns\":%llu,\"cpu\":%u,"
-				"\"applied\":%s}",
+				"\"applied\":%s,\"budget_kind\":\"%s\","
+				"\"budget_samples\":%llu}",
 				n->id, (int)n->tid,
 				(unsigned long long)n->runtime_budget_ns,
 				(unsigned long long)n->local_deadline_ns,
 				(unsigned long long)n->cumulative_deadline_ns,
 				(unsigned long long)n->period_ns,
 				n->cpu,
-				n->applied ? "true" : "false");
+				n->applied ? "true" : "false",
+				rt_diag_budget_kind_name(n->budget_kind),
+				(unsigned long long)n->budget_sample_count);
 		}
 	}
 	fputs("]}", out);
