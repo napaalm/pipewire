@@ -1451,6 +1451,96 @@ PWTEST(reconcile_property_random_chains_satisfy_kernel_contract)
 	return PWTEST_PASS;
 }
 
+/* Property-based test extended to the fork, join, and diamond
+ * graph families (Phase 11.2 plan instructions). For each family
+ * we generate 60 random instances and assert the hard-mode
+ * kernel contract `0 < runtime <= local_deadline <= period`. The
+ * underlying mechanism is identical to the chain property test;
+ * only the edge layout changes between families. WCETs stay
+ * bounded so the workload always lands in HARD. */
+PWTEST(reconcile_property_random_shapes_satisfy_kernel_contract)
+{
+	uint32_t seed = 0xB5C9E227u;
+	uint32_t shape, trial;
+	uint32_t total_violations = 0;
+	const uint32_t trials_per_shape = 60;
+	const uint32_t n_shapes = 3; /* fork / join / diamond */
+
+	for (shape = 0; shape < n_shapes; shape++) {
+	for (trial = 0; trial < trials_per_shape; trial++) {
+		reconcile_state_t *s = make_state_persistent(0.01);
+		struct cb_ctx cb = { 0 };
+		reconcile_topo_t rt;
+		reconcile_follower_t fol[5];
+		reconcile_edge_t edges[5];
+		uint32_t n_followers = 0, n_edges = 0, i;
+		uint64_t period;
+		struct reconcile_feasibility feas;
+
+		pwtest_ptr_notnull(s);
+		seed = seed * 1103515245u + 12345u;
+		period = 200000u + (uint64_t)(seed % 1800000u);
+
+		switch (shape) {
+		case 0: /* fork: 1 -> 2, 1 -> 3 */
+			n_followers = 3;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			n_edges = 2;
+			break;
+		case 1: /* join: 1 -> 3, 2 -> 3 */
+			n_followers = 3;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			edges[1] = (reconcile_edge_t){ .src = 11, .dst = 12 };
+			n_edges = 2;
+			break;
+		case 2: /* diamond: 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4 */
+			n_followers = 4;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			edges[2] = (reconcile_edge_t){ .src = 11, .dst = 13 };
+			edges[3] = (reconcile_edge_t){ .src = 12, .dst = 13 };
+			n_edges = 4;
+			break;
+		}
+
+		for (i = 0; i < n_followers; i++) {
+			seed = seed * 1103515245u + 12345u;
+			fol[i].id  = 10 + i;
+			fol[i].tid = 100 + i;
+			fol[i].wcet = 1000u + (seed %
+				(uint32_t)(period / (n_followers * 6 + 1)));
+		}
+
+		rt.followers = fol;
+		rt.n_followers = n_followers;
+		rt.edges = edges;
+		rt.n_edges = n_edges;
+		rt.period = period;
+		rt.generation = (uint64_t)trial + 1 +
+			(uint64_t)shape * 1000;
+
+		pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+		reconcile_state_feasibility(s, &feas);
+		if (feas.mode == RECONCILE_MODE_HARD) {
+			for (i = 0; i < cb.calls; i++) {
+				uint64_t r = cb.last[i].runtime;
+				uint64_t d = cb.last[i].deadline;
+				uint64_t p = cb.last[i].period;
+				if (!(r > 0 && r <= d && d <= p))
+					total_violations++;
+			}
+		}
+
+		reconcile_fini(s);
+	}
+	}
+
+	pwtest_int_eq((int)total_violations, 0);
+	return PWTEST_PASS;
+}
+
 /* apply_sched_groups detects a published runtime > local_deadline
  * tuple before issuing sched_setattr: shipping that tuple would
  * see the kernel reject it anyway. Per the operator-facing
@@ -1566,6 +1656,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_invalid_params_demotes_to_soft_degraded,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_property_random_chains_satisfy_kernel_contract,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_property_random_shapes_satisfy_kernel_contract,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
