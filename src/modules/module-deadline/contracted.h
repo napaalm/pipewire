@@ -152,6 +152,66 @@ int contracted_dag_add_edge(contracted_dag_t *cg,
  * forever. */
 bool contracted_dag_has_cycle(const contracted_dag_t *cg);
 
+/*
+ * Build a contracted DAG from a flat description of an original
+ * scheduling graph plus a group assignment.
+ *
+ * Inputs:
+ *   - period_ns, deadline_ns: global timing carried through
+ *     unchanged on the output contracted_dag_t.
+ *   - members[]: array of (id, tid, wcet_ns) tuples. Each entry
+ *     describes one original scheduling node.
+ *   - group_id[]: parallel to members[]. group_id[i] == 0 means
+ *     "node i has no fusion group; it forms a singleton
+ *     macro-node". Any non-zero group_id is a fusion-group
+ *     identifier; nodes with the same non-zero group_id are
+ *     placed in the same macro-node. The group ids are caller-
+ *     defined; the builder only uses them for equivalence.
+ *   - n_members: length of members[] and group_id[].
+ *   - edges[]: array of (src_id, dst_id) tuples describing every
+ *     original scheduling edge. Edges with both endpoints in the
+ *     same macro-node are dropped as internal; every other edge
+ *     becomes a contracted edge between the two distinct
+ *     macro-nodes the endpoints belong to, deduplicated.
+ *   - n_edges: length of edges[].
+ *
+ * Output:
+ *   - On success, *out is a freshly-allocated contracted_dag_t
+ *     whose nodes carry their member lists, their summed WCET
+ *     (sum of members' wcet_ns; overhead_ns left at zero for the
+ *     caller to update if a measurement is available), and the
+ *     correctly-contracted edge set. Return value is 0.
+ *
+ * Failure modes:
+ *   - -EINVAL on NULL outputs or on duplicate ids in members[].
+ *   - -ENOMEM on allocation failure.
+ *   - -ENOTRECOVERABLE when an edge references an id absent from
+ *     members[] (a defensive guard against caller bugs; the
+ *     builder cannot infer the missing macro-node).
+ *
+ * The builder does not run the cycle check; the caller is
+ * expected to call contracted_dag_has_cycle() and tear the
+ * contracted DAG down if it returns true.
+ */
+struct contracted_member_input {
+	uint32_t id;
+	pid_t    tid;
+	uint64_t wcet_ns;
+};
+
+struct contracted_edge_input {
+	uint32_t src_id;
+	uint32_t dst_id;
+};
+
+int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
+		const struct contracted_member_input *members,
+		const uint32_t *group_id,
+		uint32_t n_members,
+		const struct contracted_edge_input *edges,
+		uint32_t n_edges,
+		contracted_dag_t **out);
+
 #ifdef __cplusplus
 }
 #endif

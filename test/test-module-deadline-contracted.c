@@ -161,6 +161,178 @@ PWTEST(contracted_cycle_detected)
 	return PWTEST_PASS;
 }
 
+/* --- builder tests --- */
+
+/* Chain A -> B -> C with fusion {A, B} produces a 2-node
+ * contracted DAG {AB, C} with one edge AB -> C and macro WCET
+ * for AB equal to W_A + W_B (overhead left at 0). */
+PWTEST(contracted_builder_chain_fuse_first_two)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+		{ 2, 1002, 20 },
+		{ 3, 1003, 30 },
+	};
+	uint32_t groups[] = { 7, 7, 0 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 2 },
+		{ 2, 3 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 3,
+			edges, 2, &cg), 0);
+	pwtest_ptr_notnull(cg);
+	pwtest_int_eq((int)cg->n_nodes, 2);
+	pwtest_int_eq((int)cg->n_edges, 1);
+	pwtest_bool_false(contracted_dag_has_cycle(cg));
+
+	/* Find the fused macro-node (2 members) and the singleton. */
+	contracted_node_t *ab = NULL, *c = NULL;
+	contracted_node_t *cn;
+	spa_list_for_each(cn, &cg->nodes, link) {
+		if (cn->n_members == 2)
+			ab = cn;
+		else if (cn->n_members == 1)
+			c = cn;
+	}
+	pwtest_ptr_notnull(ab);
+	pwtest_ptr_notnull(c);
+
+	/* Members of AB are nodes 1 and 2; member of C is node 3. */
+	pwtest_int_eq((int)ab->wcet_ns, 30);
+	pwtest_int_eq((int)c->wcet_ns, 30);
+	pwtest_bool_true(ab->is_fusion_group);
+	pwtest_bool_false(c->is_fusion_group);
+
+	/* The contracted edge runs AB -> C, not C -> AB. */
+	contracted_edge_t *ce;
+	uint32_t ab_succs = 0;
+	spa_list_for_each(ce, &ab->succs, src_link) {
+		pwtest_ptr_eq(ce->dst, c);
+		ab_succs++;
+	}
+	pwtest_int_eq((int)ab_succs, 1);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+/* Internal edges (between members of the same group) disappear;
+ * the dropped count matches the count of within-group edges. */
+PWTEST(contracted_builder_drops_internal_edges)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+		{ 2, 1002, 20 },
+		{ 3, 1003, 30 },
+	};
+	uint32_t groups[] = { 7, 7, 7 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 2 },
+		{ 2, 3 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 3,
+			edges, 2, &cg), 0);
+	pwtest_int_eq((int)cg->n_nodes, 1);
+	pwtest_int_eq((int)cg->n_edges, 0);
+	contracted_node_t *cn = spa_list_first(&cg->nodes,
+			contracted_node_t, link);
+	pwtest_int_eq((int)cn->n_members, 3);
+	pwtest_int_eq((int)cn->wcet_ns, 60);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+/* Two original edges A -> X and B -> X with {A, B} fused dedupe
+ * to a single AB -> X edge. */
+PWTEST(contracted_builder_deduplicates_parallel_external_edges)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+		{ 2, 1002, 20 },
+		{ 3, 1003, 30 },
+	};
+	uint32_t groups[] = { 7, 7, 0 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 3 },
+		{ 2, 3 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 3,
+			edges, 2, &cg), 0);
+	pwtest_int_eq((int)cg->n_nodes, 2);
+	pwtest_int_eq((int)cg->n_edges, 1);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_builder_singletons_only)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+		{ 2, 1002, 20 },
+	};
+	uint32_t groups[] = { 0, 0 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 2 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 2,
+			edges, 1, &cg), 0);
+	pwtest_int_eq((int)cg->n_nodes, 2);
+	pwtest_int_eq((int)cg->n_edges, 1);
+	contracted_node_t *cn;
+	spa_list_for_each(cn, &cg->nodes, link)
+		pwtest_int_eq((int)cn->n_members, 1);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_builder_rejects_duplicate_ids)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+		{ 1, 1002, 20 },
+	};
+	uint32_t groups[] = { 0, 0 };
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 2,
+			NULL, 0, &cg), -EINVAL);
+	pwtest_ptr_null(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_builder_rejects_dangling_edge)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 },
+	};
+	uint32_t groups[] = { 0 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 99 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 1,
+			edges, 1, &cg), -ENOTRECOVERABLE);
+	pwtest_ptr_null(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -173,6 +345,12 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_self_loop_rejected, PWTEST_NOARG);
 	pwtest_add(contracted_acyclic_chain_passes, PWTEST_NOARG);
 	pwtest_add(contracted_cycle_detected, PWTEST_NOARG);
+	pwtest_add(contracted_builder_chain_fuse_first_two, PWTEST_NOARG);
+	pwtest_add(contracted_builder_drops_internal_edges, PWTEST_NOARG);
+	pwtest_add(contracted_builder_deduplicates_parallel_external_edges, PWTEST_NOARG);
+	pwtest_add(contracted_builder_singletons_only, PWTEST_NOARG);
+	pwtest_add(contracted_builder_rejects_duplicate_ids, PWTEST_NOARG);
+	pwtest_add(contracted_builder_rejects_dangling_edge, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

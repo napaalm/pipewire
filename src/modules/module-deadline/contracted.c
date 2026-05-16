@@ -178,6 +178,142 @@ static bool dfs_has_cycle(const contracted_dag_t *cg,
 	return false;
 }
 
+/* Resolve a member id to its 0-based owner index by linear scan.
+ * The input arrays are small (a single driver's follower set
+ * rarely exceeds a few dozen entries), so the n^2 cost stays in
+ * the noise next to the placer's own work; if the audio graph
+ * ever grows to where this matters, a sorted index can be added
+ * without changing the API. */
+static int find_member_idx(const struct contracted_member_input *members,
+		uint32_t n_members, uint32_t id, uint32_t *out_idx)
+{
+	uint32_t i;
+	for (i = 0; i < n_members; i++) {
+		if (members[i].id == id) {
+			*out_idx = i;
+			return 0;
+		}
+	}
+	return -ENOTRECOVERABLE;
+}
+
+int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
+		const struct contracted_member_input *members,
+		const uint32_t *group_id,
+		uint32_t n_members,
+		const struct contracted_edge_input *edges,
+		uint32_t n_edges,
+		contracted_dag_t **out)
+{
+	contracted_dag_t *cg = NULL;
+	contracted_node_t **owner = NULL; /* owner[i] = macro-node containing
+					   * the i-th original member */
+	uint32_t i;
+	int r = 0;
+
+	if (out == NULL || (n_members > 0 && (members == NULL || group_id == NULL)))
+		return -EINVAL;
+	if (n_edges > 0 && edges == NULL)
+		return -EINVAL;
+
+	/* Duplicate-id guard: catches caller bugs early instead of
+	 * letting them surface as a silently wrong group assignment. */
+	for (i = 0; i < n_members; i++) {
+		uint32_t j;
+		for (j = i + 1; j < n_members; j++) {
+			if (members[i].id == members[j].id)
+				return -EINVAL;
+		}
+	}
+
+	cg = contracted_dag_create(period_ns, deadline_ns);
+	if (cg == NULL)
+		return -ENOMEM;
+
+	owner = calloc(n_members, sizeof(*owner));
+	if (n_members > 0 && owner == NULL) {
+		r = -ENOMEM;
+		goto fail;
+	}
+
+	/* First pass: every member with group_id == 0 gets its own
+	 * singleton macro-node. */
+	for (i = 0; i < n_members; i++) {
+		if (group_id[i] != 0)
+			continue;
+		owner[i] = contracted_dag_add_node(cg);
+		if (owner[i] == NULL) {
+			r = -ENOMEM;
+			goto fail;
+		}
+		if ((r = contracted_node_add_member(owner[i],
+				members[i].id, members[i].tid,
+				members[i].wcet_ns)) < 0)
+			goto fail;
+		owner[i]->wcet_ns += members[i].wcet_ns;
+	}
+
+	/* Second pass: cluster members with matching non-zero
+	 * group_ids. The first occurrence of each group_id mints a
+	 * fresh macro-node; subsequent occurrences fold into it. */
+	for (i = 0; i < n_members; i++) {
+		uint32_t gid = group_id[i];
+		uint32_t j;
+		contracted_node_t *cn = NULL;
+		if (gid == 0)
+			continue;
+		for (j = 0; j < i; j++) {
+			if (group_id[j] == gid) {
+				cn = owner[j];
+				break;
+			}
+		}
+		if (cn == NULL) {
+			cn = contracted_dag_add_node(cg);
+			if (cn == NULL) {
+				r = -ENOMEM;
+				goto fail;
+			}
+		}
+		if ((r = contracted_node_add_member(cn,
+				members[i].id, members[i].tid,
+				members[i].wcet_ns)) < 0)
+			goto fail;
+		cn->wcet_ns += members[i].wcet_ns;
+		owner[i] = cn;
+	}
+
+	/* Edge contraction. Each original edge becomes either an
+	 * internal-and-dropped edge or a contracted edge between two
+	 * distinct macro-nodes; add_edge dedupes parallel copies. */
+	for (i = 0; i < n_edges; i++) {
+		uint32_t s_idx, d_idx;
+		contracted_node_t *src, *dst;
+		if ((r = find_member_idx(members, n_members,
+				edges[i].src_id, &s_idx)) < 0)
+			goto fail;
+		if ((r = find_member_idx(members, n_members,
+				edges[i].dst_id, &d_idx)) < 0)
+			goto fail;
+		src = owner[s_idx];
+		dst = owner[d_idx];
+		if (src == dst)
+			continue;
+		if ((r = contracted_dag_add_edge(cg, src, dst)) < 0)
+			goto fail;
+	}
+
+	free(owner);
+	*out = cg;
+	return 0;
+
+fail:
+	free(owner);
+	contracted_dag_destroy(cg);
+	*out = NULL;
+	return r;
+}
+
 bool contracted_dag_has_cycle(const contracted_dag_t *cg)
 {
 	uint8_t *colour;
