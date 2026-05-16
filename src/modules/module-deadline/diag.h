@@ -435,6 +435,13 @@ struct rt_diag_param_node {
 	double   mbpta_ks_pvalue;
 	double   mbpta_runs_z;
 	double   mbpta_runs_pvalue;
+	/* ET test on the GEV shape parameter k. mbpta_gev_shape_k is
+	 * the PWM estimator's point estimate; mbpta_et_pvalue is the
+	 * two-sided p-value for H_0: k = 0 (Gumbel sub-family of
+	 * GEV). The estimator routes to NON_GUMBEL when the p-value
+	 * falls below the configured alpha_et. */
+	double   mbpta_et_pvalue;
+	double   mbpta_gev_shape_k;
 	double   mbpta_crps;
 	double   mbpta_mu;
 	double   mbpta_sigma;

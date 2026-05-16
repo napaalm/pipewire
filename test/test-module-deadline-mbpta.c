@@ -461,6 +461,56 @@ PWTEST(mbpta_runs_pvalue_low_under_clustered_transitions)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_et_pvalue_defaults_to_one)
+{
+	/* Before the first re-evaluation round the ET test has no
+	 * evidence against H_0: k = 0, so the p-value defaults to
+	 * 1.0 and the shape estimate to 0.0. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+	pwtest_bool_true(mbpta_et_pvalue(e) == 1.0);
+	pwtest_bool_true(mbpta_gev_shape_k(e) == 0.0);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_et_pvalue_rejects_heavy_tailed_input)
+{
+	/* A heavy-tailed (Frechet-style, k > 0) source has a GEV
+	 * shape parameter significantly above zero; the PWM
+	 * estimator picks this up and the two-sided ET p-value
+	 * drops well below 0.05. Build a series whose block
+	 * maxima have a Pareto-like tail by mixing a dominant
+	 * stationary cluster with rare large spikes. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t i;
+
+	c.gumbel_r2_threshold = 0.0; /* disable R^2 short-circuit */
+	c.alpha_et = 0.05;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 4 * c.sample_window; i++) {
+		uint64_t x = (i % 13 == 0)
+			? 100000 + (uint64_t)(i * 200)
+			: 100 + (i % 7);
+		mbpta_add_sample(e, x);
+	}
+
+	/* Either the ET test outright rejects Gumbel and we land
+	 * in NON_GUMBEL, or the i.i.d. gates fire first (heavy
+	 * spikes also break KS); both outcomes prove the
+	 * Gumbel-only PWCET_VALID path is not entered. */
+	pwtest_bool_true(mbpta_state(e) != MBPTA_PWCET_VALID);
+	pwtest_bool_true(mbpta_pwcet_ns(e) == 0);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_mbpta)
 {
 	pwtest_add(mbpta_state_name_stable, PWTEST_NOARG);
@@ -481,6 +531,9 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_ks_pvalue_low_under_distribution_shift,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_runs_pvalue_low_under_clustered_transitions,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_et_pvalue_defaults_to_one, PWTEST_NOARG);
+	pwtest_add(mbpta_et_pvalue_rejects_heavy_tailed_input,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;

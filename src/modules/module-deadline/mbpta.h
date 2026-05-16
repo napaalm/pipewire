@@ -117,18 +117,28 @@ struct mbpta_config {
 	double   crps_threshold;
 	double   eps_node;
 	uint32_t n_iid_reject;
-	/* Goodness-of-fit threshold on the QQ-plot's coefficient of
-	 * determination R^2. The full Cucu-Grosjean 2012 §II-A
-	 * pipeline runs the exponential-tail (ET) test from Gomes
-	 * & Pestana to decide whether the block-maxima series
-	 * falls in the Gumbel sub-family of GEV. This
-	 * implementation stands in a weaker check on the linearity
-	 * of the QQ regression: a Gumbel-distributed series fits a
-	 * straight line on the QQ plot, so a low R^2 is evidence
-	 * the distribution is not Gumbel. R^2 below
-	 * `gumbel_r2_threshold` lands the estimator in NON_GUMBEL.
-	 * Default 0.90; the formal ET test is reserved for a
-	 * future landing. */
+	/* Two complementary gates decide whether the block-maxima
+	 * series is admissible as Gumbel (Cucu-Grosjean 2012 §II-A):
+	 *
+	 *   * `alpha_et`            -- significance level for the
+	 *     formal ET test on the GEV shape parameter k. The test
+	 *     uses Hosking-Wallis (1985) probability-weighted
+	 *     moments to estimate k from the block-maxima series and
+	 *     rejects H_0: k = 0 (Gumbel sub-family of GEV) when the
+	 *     two-sided p-value drops below alpha_et.
+	 *     Default 0.05.
+	 *
+	 *   * `gumbel_r2_threshold` -- a weaker, complementary check
+	 *     on the linearity of the QQ regression: a Gumbel series
+	 *     hugs a straight line on the QQ plot, so a low R^2 is
+	 *     evidence the distribution is not Gumbel. Kept alongside
+	 *     the ET test as a fast sanity gate -- a high-skew tail
+	 *     can fail QQ linearity even before the PWM-based shape
+	 *     estimator stabilises. R^2 below the threshold lands
+	 *     the estimator in NON_GUMBEL just as an ET rejection
+	 *     would. Default 0.90.
+	 */
+	double   alpha_et;
 	double   gumbel_r2_threshold;
 };
 
@@ -188,6 +198,15 @@ double mbpta_ks_stat(const mbpta_t *e);
 double mbpta_ks_pvalue(const mbpta_t *e);
 double mbpta_runs_z(const mbpta_t *e);
 double mbpta_runs_pvalue(const mbpta_t *e);
+/* Exponential-tail test on the GEV shape parameter k. The PWM
+ * estimator k_hat (Hosking & Wallis 1985) is reported via
+ * mbpta_gev_shape_k; the two-sided p-value for H_0: k = 0 (Gumbel
+ * sub-family) is reported via mbpta_et_pvalue. Both default to
+ * (1.0, 0.0) on a fresh estimator. The estimator routes to
+ * NON_GUMBEL when the p-value falls below the configured
+ * alpha_et. */
+double mbpta_et_pvalue(const mbpta_t *e);
+double mbpta_gev_shape_k(const mbpta_t *e);
 double mbpta_crps(const mbpta_t *e);
 uint32_t mbpta_convergence_streak(const mbpta_t *e);
 uint32_t mbpta_iid_reject_streak(const mbpta_t *e);

@@ -92,6 +92,8 @@ struct mbpta {
 	double   ks_pvalue;
 	double   runs_z;
 	double   runs_pvalue;
+	double   et_pvalue;
+	double   gev_shape_k;
 	double   crps;
 	uint32_t convergence_streak;
 	uint32_t iid_reject_streak;
@@ -141,6 +143,8 @@ mbpta_t *mbpta_create(const struct mbpta_config *cfg)
 	if (cfg->gumbel_r2_threshold < 0.0 ||
 	    cfg->gumbel_r2_threshold > 1.0)
 		return NULL;
+	if (cfg->alpha_et < 0.0 || cfg->alpha_et >= 1.0)
+		return NULL;
 
 	e = calloc(1, sizeof(*e));
 	if (e == NULL)
@@ -154,6 +158,7 @@ mbpta_t *mbpta_create(const struct mbpta_config *cfg)
 	e->state = MBPTA_INSUFFICIENT_DATA;
 	e->ks_pvalue = 1.0;
 	e->runs_pvalue = 1.0;
+	e->et_pvalue = 1.0;
 	return e;
 }
 
@@ -181,6 +186,8 @@ void mbpta_invalidate_with_reason(mbpta_t *e,
 	e->ks_pvalue = 1.0;
 	e->runs_z = 0.0;
 	e->runs_pvalue = 1.0;
+	e->et_pvalue = 1.0;
+	e->gev_shape_k = 0.0;
 	e->crps = 0.0;
 	e->convergence_streak = 0;
 	e->iid_reject_streak = 0;
@@ -456,6 +463,76 @@ static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
 	*out_r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
 }
 
+/* Exponential-tail (ET) test on the block-maxima series.
+ * Cucu-Grosjean 2012 §II-A gates the Gumbel fit on an ET test that
+ * decides whether the GEV shape parameter k is consistent with 0
+ * (Gumbel sub-family) or significantly non-zero (Frechet for k > 0,
+ * reversed Weibull for k < 0). This implementation uses the
+ * Hosking & Wallis (1985) probability-weighted-moment (PWM)
+ * estimator for k, which is the standard reference in regional-
+ * frequency analysis and the form Gomes & Pestana cite:
+ *
+ *     b_r = (1/n) * sum_{i=1..n} ( prod_{j=1..r} (i - j) /
+ *                                  prod_{j=1..r} (n - j) ) * M_(i)
+ *
+ *   tau   = (b_2 - b_1) / (b_1 - b_0)            (L-skewness)
+ *   c     = 2 / (3 + tau) - ln(2) / ln(3)
+ *   k_hat = 7.8590 * c + 2.9554 * c^2            (Hosking 1985 eq. 8)
+ *
+ * Under H_0: k = 0, k_hat is asymptotically N(0, 0.5633 / n)
+ * (Hosking & Wallis 1985, Table 2), so the two-sided p-value is
+ *   z   = k_hat * sqrt(n / 0.5633)
+ *   p   = erfc(|z| / sqrt(2))
+ *
+ * Returns the p-value and writes the shape estimate via the
+ * out parameter. Degenerate input (n < 8, denominators that
+ * vanish) returns p=1.0 and k_hat=0.0 -- no evidence against H_0.
+ *
+ * Caller must pass a sorted ascending block-maxima series; the
+ * Gumbel fit path already sorts it. */
+static double et_test_pwm(const double *bm_sorted, uint32_t n,
+		double *out_k_hat)
+{
+	double b0 = 0.0, b1 = 0.0, b2 = 0.0;
+	double tau, c, k_hat, z;
+	uint32_t i;
+
+	*out_k_hat = 0.0;
+	if (n < 8 || bm_sorted == NULL)
+		return 1.0;
+
+	for (i = 0; i < n; i++) {
+		double x = bm_sorted[i];
+		double w0 = 1.0 / (double)n;
+		double w1, w2;
+		if (n < 2)
+			return 1.0;
+		w1 = ((double)i) / ((double)n * (double)(n - 1));
+		if (n < 3) {
+			b0 += w0 * x;
+			b1 += w1 * x;
+			continue;
+		}
+		w2 = ((double)i * (double)(i - 1)) /
+			((double)n * (double)(n - 1) * (double)(n - 2));
+		b0 += w0 * x;
+		b1 += w1 * x;
+		b2 += w2 * x;
+	}
+
+	if ((b1 - b0) == 0.0)
+		return 1.0;
+	tau = (b2 - b1) / (b1 - b0);
+
+	c = 2.0 / (3.0 + tau) - log(2.0) / log(3.0);
+	k_hat = 7.8590 * c + 2.9554 * c * c;
+	*out_k_hat = k_hat;
+
+	z = k_hat * sqrt((double)n / 0.5633);
+	if (z < 0.0) z = -z;
+	return erfc(z / sqrt(2.0));
+}
+
 /* CRPS comparison between two sorted block-maxima series. We use
  * the discrete approximation
  *
@@ -557,6 +634,14 @@ static void mbpta_step(mbpta_t *e)
 	if (r2 < e->cfg.gumbel_r2_threshold)
 		gumbel_ok = false;
 
+	/* gumbel_fit sorts bm in place; et_test_pwm needs a sorted
+	 * ascending series, so the call can read the same buffer. */
+	double k_hat = 0.0;
+	e->et_pvalue = et_test_pwm(bm, n_blocks, &k_hat);
+	e->gev_shape_k = k_hat;
+	if (e->cfg.alpha_et > 0.0 && e->et_pvalue < e->cfg.alpha_et)
+		gumbel_ok = false;
+
 	if (!gumbel_ok) {
 		e->state = MBPTA_NON_GUMBEL;
 		e->convergence_streak = 0;
@@ -644,6 +729,8 @@ double mbpta_ks_stat(const mbpta_t *e)   { return e ? e->ks_stat : 0.0; }
 double mbpta_ks_pvalue(const mbpta_t *e) { return e ? e->ks_pvalue : 1.0; }
 double mbpta_runs_z(const mbpta_t *e)    { return e ? e->runs_z : 0.0; }
 double mbpta_runs_pvalue(const mbpta_t *e) { return e ? e->runs_pvalue : 1.0; }
+double mbpta_et_pvalue(const mbpta_t *e) { return e ? e->et_pvalue : 1.0; }
+double mbpta_gev_shape_k(const mbpta_t *e) { return e ? e->gev_shape_k : 0.0; }
 double mbpta_crps(const mbpta_t *e)      { return e ? e->crps : 0.0; }
 uint32_t mbpta_convergence_streak(const mbpta_t *e)
 {

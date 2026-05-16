@@ -663,6 +663,7 @@ struct impl {
 	double   mbpta_eps_node;
 	uint32_t mbpta_n_iid_reject;
 	double   mbpta_gumbel_r2_threshold;
+	double   mbpta_alpha_et;
 	bool     mbpta_accept_probabilistic_hard;
 
 	/* Persistent-DAG path on the worker (default). When false the
@@ -1511,6 +1512,7 @@ static void apply_sample(struct impl *impl, struct node *n,
 			.eps_node       = impl->mbpta_eps_node,
 			.n_iid_reject   = impl->mbpta_n_iid_reject,
 			.gumbel_r2_threshold = impl->mbpta_gumbel_r2_threshold,
+			.alpha_et       = impl->mbpta_alpha_et,
 		};
 		n->mbpta = mbpta_create(&c);
 		if (n->mbpta == NULL)
@@ -2495,6 +2497,8 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_ks_pvalue = mbpta_ks_pvalue(mn->mbpta);
 			pn.mbpta_runs_z = mbpta_runs_z(mn->mbpta);
 			pn.mbpta_runs_pvalue = mbpta_runs_pvalue(mn->mbpta);
+			pn.mbpta_et_pvalue = mbpta_et_pvalue(mn->mbpta);
+			pn.mbpta_gev_shape_k = mbpta_gev_shape_k(mn->mbpta);
 			pn.mbpta_crps = mbpta_crps(mn->mbpta);
 			pn.mbpta_convergence_streak =
 				mbpta_convergence_streak(mn->mbpta);
@@ -3442,6 +3446,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->mbpta_eps_node          = 1e-9;
 	impl->mbpta_n_iid_reject      = 3;
 	impl->mbpta_gumbel_r2_threshold = 0.90;
+	impl->mbpta_alpha_et          = 0.05;
 	impl->mbpta_accept_probabilistic_hard = false;
 
 	if ((s = pw_properties_get(props, "deadline.mbpta.sample_window")) != NULL) {
@@ -3498,6 +3503,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		char *end; double v = strtod(s, &end);
 		if (end != s && v >= 0.0 && v <= 1.0)
 			impl->mbpta_gumbel_r2_threshold = v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.alpha_et")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v >= 0.0 && v < 1.0)
+			impl->mbpta_alpha_et = v;
 	}
 	impl->mbpta_accept_probabilistic_hard = pw_properties_get_bool(props,
 			"deadline.mbpta.accept_probabilistic_hard", false);

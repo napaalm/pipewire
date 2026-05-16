@@ -483,6 +483,7 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
 		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
+		" mbpta_et_p=0.000000 mbpta_k=0.000000"
 		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false"
@@ -494,6 +495,7 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
 		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
+		" mbpta_et_p=0.000000 mbpta_k=0.000000"
 		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true"
@@ -613,6 +615,7 @@ PWTEST(diag_json_full_golden)
 		"\"mu\":120000,\"sigma\":3500,"
 		"\"ks_stat\":0.041000,\"ks_pvalue\":0.500000,"
 		"\"runs_z\":-0.230000,\"runs_pvalue\":0.818000,"
+		"\"et_pvalue\":0.612000,\"gev_shape_k\":0.012500,"
 		"\"crps\":0.072000,"
 		"\"convergence_streak\":4,"
 		"\"iid_reject_streak\":0,"
@@ -675,6 +678,8 @@ PWTEST(diag_json_full_golden)
 	pn.mbpta_ks_pvalue = 0.5;
 	pn.mbpta_runs_z = -0.23;
 	pn.mbpta_runs_pvalue = 0.818;
+	pn.mbpta_et_pvalue = 0.612;
+	pn.mbpta_gev_shape_k = 0.0125;
 	pn.mbpta_crps = 0.072;
 	pn.mbpta_convergence_streak = 4;
 	pn.mbpta_iid_reject_streak = 0;
