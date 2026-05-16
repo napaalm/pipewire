@@ -171,6 +171,131 @@ PWTEST(fusion_validator_reason_name_stability)
 	return PWTEST_PASS;
 }
 
+/* --- predecessor closure predicate (Phase 3.2 fallback) --- */
+
+PWTEST(fusion_pred_closure_empty_group_accepts)
+{
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_predecessor_closure_accept(
+				NULL, 0, NULL, 0, NULL, 0, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C, candidate F = {A, B}, sources = {A}.
+ * B's only incoming edge is A -> B; A is in F, so the edge is
+ * internal. F is accepted. */
+PWTEST(fusion_pred_closure_chain_prefix_accepts)
+{
+	uint32_t members[]    = { 1, 2 };
+	uint32_t sources[]    = { 1 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_predecessor_closure_accept(
+				members, 2, edges, 2, sources, 1, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C, candidate F = {B, C}, sources = {A}.
+ * B's incoming is A -> B; A is NOT in F. A IS a source, so
+ * accepted. */
+PWTEST(fusion_pred_closure_chain_suffix_with_source_pred_accepts)
+{
+	uint32_t members[]    = { 2, 3 };
+	uint32_t sources[]    = { 1 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_predecessor_closure_accept(
+				members, 2, edges, 2, sources, 1, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C -> D, candidate F = {C, D}, sources = {A}.
+ * C's incoming is B -> C; B is NOT in F and NOT a source. The
+ * group would have to wait for B mid-job; reject with
+ * WOULD_SELF_SUSPEND. */
+PWTEST(fusion_pred_closure_chain_mid_with_non_source_pred_rejects)
+{
+	uint32_t members[]    = { 3, 4 };
+	uint32_t sources[]    = { 1 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_predecessor_closure_accept(
+				members, 2, edges, 3, sources, 1, &r));
+	pwtest_int_eq(r, FUSION_REJ_WOULD_SELF_SUSPEND);
+	return PWTEST_PASS;
+}
+
+/* Join A -> C, B -> C, candidate F = {B, C}, sources = {A, B}.
+ * C's incoming includes A -> C; A is NOT in F. A IS a source, so
+ * accepted. (B is in F so its edge is internal.) */
+PWTEST(fusion_pred_closure_join_with_source_pred_accepts)
+{
+	uint32_t members[]    = { 2, 3 };
+	uint32_t sources[]    = { 1, 2 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 3 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_predecessor_closure_accept(
+				members, 2, edges, 2, sources, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Join A -> C, B -> C, candidate F = {B, C}, sources = {A}.
+ * (B is NOT a source -- imagine it has an upstream of its own.)
+ * Same shape as the previous test but A is the only declared
+ * source. B is in F so its predecessor situation does not matter;
+ * A -> C must still be accepted because A is a source. */
+PWTEST(fusion_pred_closure_join_member_pred_accepts)
+{
+	uint32_t members[]    = { 2, 3 };
+	uint32_t sources[]    = { 1 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 3 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_predecessor_closure_accept(
+				members, 2, edges, 2, sources, 1, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* No sources declared (n_sources == 0) -- any external predecessor
+ * is rejected. */
+PWTEST(fusion_pred_closure_no_sources_rejects_external_pred)
+{
+	uint32_t members[]    = { 2 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_predecessor_closure_accept(
+				members, 1, edges, 1, NULL, 0, &r));
+	pwtest_int_eq(r, FUSION_REJ_WOULD_SELF_SUSPEND);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_pred_closure_null_member_ids_rejects)
+{
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_false(fusion_validator_predecessor_closure_accept(
+				NULL, 1, NULL, 0, NULL, 0, &r));
+	/* No useful reason on this defensive failure, but the
+	 * return value must be false and the caller must not be
+	 * fooled into accepting the group. */
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -185,6 +310,14 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_validator_remote_zero_tid_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_validator_returns_first_failing_predicate, PWTEST_NOARG);
 	pwtest_add(fusion_validator_reason_name_stability, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_empty_group_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_chain_prefix_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_chain_suffix_with_source_pred_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_chain_mid_with_non_source_pred_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_join_with_source_pred_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_join_member_pred_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_no_sources_rejects_external_pred, PWTEST_NOARG);
+	pwtest_add(fusion_pred_closure_null_member_ids_rejects, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

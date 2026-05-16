@@ -126,6 +126,60 @@ bool fusion_validator_accept(const struct fusion_candidate_member *members,
 		uint32_t n_members,
 		enum fusion_reject_reason *out_reason);
 
+/*
+ * Strict predecessor closure -- the Phase 3.2 fallback for the
+ * release-barrier predicate.
+ *
+ * A fused group F must not begin executing one internal member
+ * and then block waiting for another internal member's external
+ * predecessor; doing so turns the macro-node into a self-suspending
+ * task and breaks the EDF feasibility analysis (Chen et al.
+ * 2019 §III on suspension-aware analysis). The sound long-term fix
+ * is a macro-node release barrier that gates the group's wake-up
+ * on every external predecessor completing -- a runtime mechanism
+ * that lands later. Until then, strict predecessor closure is the
+ * safe structural shortcut documented by the plan's fallback:
+ *
+ *   Accept F iff every in-period predecessor of every member
+ *   either belongs to F itself or is an original graph source
+ *   (a DAG node with no incoming in-period edges; released
+ *   together with the driver activation).
+ *
+ * The check is more conservative than a release barrier -- it
+ * rejects some fusions a barrier would accept -- but it
+ * guarantees that nothing inside F ever has to wait for external
+ * work mid-job, so the macro-node is non-self-suspending by
+ * construction.
+ *
+ * Inputs:
+ *   - member_ids[]: the ids of every member of the candidate
+ *     group F (length n_members).
+ *   - edges[]: every in-period edge of the surrounding scheduling
+ *     DAG (length n_edges). The validator scans for incoming
+ *     edges to every member of F.
+ *   - source_ids[]: the ids of every node that is a source in
+ *     the surrounding scheduling DAG (i.e. has no incoming
+ *     in-period edges). length n_sources. A NULL source list
+ *     with n_sources == 0 means "no sources known"; the
+ *     predicate then rejects any external predecessor.
+ *
+ * Returns true with *out_reason = NONE on accept, false with
+ * *out_reason = WOULD_SELF_SUSPEND on reject.
+ *
+ * n_members == 0 trivially accepts (an empty group has no
+ * incoming edges to check).
+ */
+struct fusion_edge_input {
+	uint32_t src_id;
+	uint32_t dst_id;
+};
+
+bool fusion_validator_predecessor_closure_accept(
+		const uint32_t *member_ids, uint32_t n_members,
+		const struct fusion_edge_input *edges, uint32_t n_edges,
+		const uint32_t *source_ids, uint32_t n_sources,
+		enum fusion_reject_reason *out_reason);
+
 /* Stable lower_snake_case token for a given rejection reason.
  * Unknown values render as "unknown". */
 const char *fusion_reject_reason_name(enum fusion_reject_reason r);

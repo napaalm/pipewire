@@ -81,6 +81,61 @@ bool fusion_validator_accept(const struct fusion_candidate_member *members,
 	return true;
 }
 
+static bool id_in_set(const uint32_t *set, uint32_t n, uint32_t id)
+{
+	uint32_t i;
+	for (i = 0; i < n; i++) {
+		if (set[i] == id)
+			return true;
+	}
+	return false;
+}
+
+bool fusion_validator_predecessor_closure_accept(
+		const uint32_t *member_ids, uint32_t n_members,
+		const struct fusion_edge_input *edges, uint32_t n_edges,
+		const uint32_t *source_ids, uint32_t n_sources,
+		enum fusion_reject_reason *out_reason)
+{
+	enum fusion_reject_reason ignore = FUSION_REJ_NONE;
+	uint32_t i;
+
+	if (out_reason == NULL)
+		out_reason = &ignore;
+	*out_reason = FUSION_REJ_NONE;
+
+	if (n_members == 0)
+		return true;
+	if (member_ids == NULL)
+		return false;
+
+	/* For every in-period edge that ends inside F, check whether
+	 * the source is also in F or is a graph source. The first
+	 * external non-source predecessor we hit is the rejection
+	 * cause -- the group would have to wait for that node mid-job. */
+	for (i = 0; i < n_edges; i++) {
+		const struct fusion_edge_input *e = &edges[i];
+		bool dst_in_f = id_in_set(member_ids, n_members, e->dst_id);
+		bool src_in_f;
+
+		if (!dst_in_f)
+			continue;
+
+		src_in_f = id_in_set(member_ids, n_members, e->src_id);
+		if (src_in_f)
+			continue; /* internal edge -- no waiting */
+
+		/* External predecessor: must be a DAG source, otherwise
+		 * the group would have to wait for it. */
+		if (!id_in_set(source_ids, n_sources, e->src_id)) {
+			*out_reason = FUSION_REJ_WOULD_SELF_SUSPEND;
+			return false;
+		}
+	}
+
+	return true;
+}
+
 const char *fusion_reject_reason_name(enum fusion_reject_reason r)
 {
 	switch (r) {
