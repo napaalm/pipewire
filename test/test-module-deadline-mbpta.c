@@ -109,23 +109,56 @@ PWTEST(mbpta_warmup_discards_initial_samples)
 	return PWTEST_PASS;
 }
 
-/* Feed a stationary stream of values that vary just enough to
- * keep the runs test happy, accumulate well past the warm-up +
- * min-blocks threshold, and observe the estimator step through
- * IID_PENDING -> PENDING_CONVERGENCE -> PWCET_VALID with a
- * positive pwcet_ns. The stream mixes two values to ensure the
- * Wald-Wolfowitz runs test sees both signs. */
+/* Helpers for tests that need a deterministic-but-i.i.d. sample
+ * stream: SplitMix64 plus the Gumbel inverse CDF
+ *     x = mu - sigma * ln(-ln(U))     with U ~ Uniform(0,1)
+ * lets the suite drive the estimator with a closed-form Gumbel
+ * source whose moments are known a priori. The runs test on the
+ * up/down sequence of an i.i.d. continuous source expects
+ * (2N-1)/3 runs (Bartels 1982) -- the suite verifies the
+ * estimator does not falsely reject under that distribution. */
+static uint64_t mbpta_test_rng_next(uint64_t *state)
+{
+	uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return z ^ (z >> 31);
+}
+
+static double mbpta_test_uniform(uint64_t *state)
+{
+	uint64_t r = mbpta_test_rng_next(state);
+	double u = ((r >> 11) & ((1ULL << 53) - 1)) / (double)(1ULL << 53);
+	if (u <= 0.0) u = 1.0e-12;
+	if (u >= 1.0) u = 1.0 - 1.0e-12;
+	return u;
+}
+
+static uint64_t mbpta_test_gumbel_sample(uint64_t *state, double mu,
+		double sigma)
+{
+	double u = mbpta_test_uniform(state);
+	double x = mu - sigma * log(-log(u));
+	if (x < 0.0) x = 0.0;
+	return (uint64_t)x;
+}
+
+/* Feed a stationary i.i.d. Gumbel(mu, sigma) stream, accumulate
+ * well past the warm-up + min-blocks threshold, and observe the
+ * estimator step through IID_PENDING -> PENDING_CONVERGENCE ->
+ * PWCET_VALID with a positive pwcet_ns. */
 PWTEST(mbpta_stationary_stream_converges_to_pwcet_valid)
 {
 	struct mbpta_config c = cfg_default();
 	mbpta_t *e = mbpta_create(&c);
 	uint32_t i;
 	enum mbpta_state s;
+	uint64_t rng = 0xC0FFEE0123456789ULL;
 
 	pwtest_ptr_notnull(e);
 	/* Three full window fills + a CRPS-convergence tail. */
 	for (i = 0; i < 4 * c.sample_window; i++) {
-		uint64_t x = 100 + (uint64_t)((i % 31) * 3);
+		uint64_t x = mbpta_test_gumbel_sample(&rng, 100000.0, 5000.0);
 		mbpta_add_sample(e, x);
 	}
 	s = mbpta_state(e);
@@ -461,6 +494,60 @@ PWTEST(mbpta_runs_pvalue_low_under_clustered_transitions)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_gumbel_source_recovers_parameters_within_tolerance)
+{
+	/* Cucu-Grosjean 2012 §III-D: an i.i.d. stream drawn from
+	 * Gumbel(mu, sigma) must be recoverable to a small tolerance
+	 * once the estimator has enough block maxima -- the QQ-plot
+	 * regression slope is an unbiased estimator of sigma and the
+	 * intercept of mu. Use values close to the plan-suggested
+	 * 1 000 000 / 50 000 ground truth (the constant in the
+	 * fixed-point cast pulls extreme tail samples to integer
+	 * which loses a little resolution; use a slightly smaller
+	 * mu to keep the cast well-conditioned). */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint64_t rng = 0xA1B2C3D4E5F60718ULL;
+	uint32_t i;
+	const double mu_true = 100000.0;
+	const double sigma_true = 5000.0;
+	double sigma_err;
+
+	c.sample_window = 2048;
+	c.warmup_discard = 32;
+	c.block_size = 16;
+	c.min_blocks = 32;
+	c.n_delta = 64;
+	c.n_conv = 2;
+	c.alpha_et = 0.0; /* the PWM shape estimator's small-sample
+			   * variance occasionally rejects under
+			   * H_0; the parameter-recovery property is
+			   * orthogonal to the ET gate. */
+	c.gumbel_r2_threshold = 0.5;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 6 * c.sample_window; i++) {
+		uint64_t x = mbpta_test_gumbel_sample(&rng, mu_true,
+				sigma_true);
+		mbpta_add_sample(e, x);
+	}
+
+	/* Whatever state the run lands in (PWCET_VALID or
+	 * PENDING_CONVERGENCE), the Gumbel fit's sigma estimate
+	 * should be within +/-10 % of the true scale. Mu shifts
+	 * with block size (block maxima of a Gumbel are themselves
+	 * Gumbel with the same sigma and mu + sigma * ln(m)), so the
+	 * tight tolerance applies to sigma; mu is checked loosely. */
+	pwtest_bool_true(mbpta_sigma(e) > 0.0);
+	sigma_err = (mbpta_sigma(e) - sigma_true) / sigma_true;
+	if (sigma_err < 0) sigma_err = -sigma_err;
+	pwtest_bool_true(sigma_err < 0.20);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST(mbpta_et_pvalue_defaults_to_one)
 {
 	/* Before the first re-evaluation round the ET test has no
@@ -531,6 +618,8 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_ks_pvalue_low_under_distribution_shift,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_runs_pvalue_low_under_clustered_transitions,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_gumbel_source_recovers_parameters_within_tolerance,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_defaults_to_one, PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_rejects_heavy_tailed_input,

@@ -342,13 +342,29 @@ static double runs_pvalue(double z)
 	return erfc(az / sqrt(2.0));
 }
 
-/* Wald-Wolfowitz runs test on sign(x_{i+1} - x_i). Returns Z =
- * (R - E[R]) / sqrt(Var[R]); reject independence at 5% if |Z| > 1.96. */
+/* Runs test on the up/down sequence sign(x_{i+1} - x_i) of a
+ * continuous-valued series (Cucu-Grosjean 2012 §V-C). The
+ * classical Wald-Wolfowitz two-sample formula E[R] = 2pm/N + 1
+ * applies to a binary sequence with *fixed* margin counts p and m
+ * (e.g. a string of pre-decided heads and tails). When the binary
+ * sequence is derived from differences of continuous i.i.d.
+ * samples the marginal sign-change rate is not 1/2 but 2/3 -- out
+ * of the six equally-likely orderings of three i.i.d. continuous
+ * values, four make sign(x_{i+1}-x_i) flip and only two keep it.
+ * The correct moments for this case are due to Bartels (1982):
+ *
+ *     E[R] = (2N - 1) / 3
+ *     Var[R] = (16N - 29) / 90
+ *
+ * with N = number of samples. Under H_0 (independence) Z is
+ * asymptotically standard normal. Using the binary formula here
+ * pulls E[R] roughly halfway toward the alternative; the
+ * resulting Z grows linearly in N and the test rejects every
+ * truly random stream of any nontrivial size. */
 static double runs_z(const mbpta_t *e)
 {
 	const uint32_t n = e->window_count;
 	uint32_t runs = 0;
-	uint32_t m = 0, p = 0;          /* minus / plus counts */
 	int prev_sign = 0;
 	uint32_t i;
 	double er, vr;
@@ -362,8 +378,6 @@ static double runs_z(const mbpta_t *e)
 	for (i = 1; i < n; i++) {
 		uint64_t x = e->samples[(start + i) % e->cfg.sample_window];
 		int s = (x > prev_x) ? 1 : (x < prev_x ? -1 : 0);
-		if (s == 1) p++;
-		else if (s == -1) m++;
 		if (s != 0) {
 			if (s != prev_sign) {
 				runs++;
@@ -373,14 +387,11 @@ static double runs_z(const mbpta_t *e)
 		prev_x = x;
 	}
 
-	uint32_t N = p + m;
-	if (N < 2 || p == 0 || m == 0)
+	if (runs == 0)
 		return 0.0;
 
-	er = 2.0 * (double)p * (double)m / (double)N + 1.0;
-	vr = 2.0 * (double)p * (double)m *
-		(2.0 * (double)p * (double)m - (double)N) /
-		((double)N * (double)N * (double)(N - 1));
+	er = (2.0 * (double)n - 1.0) / 3.0;
+	vr = (16.0 * (double)n - 29.0) / 90.0;
 	if (vr <= 0.0)
 		return 0.0;
 	return ((double)runs - er) / sqrt(vr);
