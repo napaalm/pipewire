@@ -532,7 +532,8 @@ PWTEST(diag_json_empty_combined)
 		"\"raw_graph\":{\"nodes\":[],\"edges\":[]},"
 		"\"scheduling_dag\":{\"nodes\":[],\"edges\":[],\"excluded_edges\":[]},"
 		"\"fusion\":{\"groups\":[]},"
-		"\"parameters\":{\"nodes\":[]}}\n";
+		"\"parameters\":{\"nodes\":[]},"
+		"\"peer_dispatch\":{\"inline_armed\":0,\"eventfd_path\":0}}\n";
 
 	struct rt_diag_combined c = { 0 };
 	fp = open_memstream(&buf, &len);
@@ -572,7 +573,8 @@ PWTEST(diag_json_full_golden)
 		"\"parameters\":{\"nodes\":[{\"id\":63,\"tid\":302388,"
 		"\"runtime_ns\":85494,\"local_deadline_ns\":21333333,"
 		"\"cumulative_deadline_ns\":21333333,\"period_ns\":21333333,"
-		"\"cpu\":4,\"applied\":true}]}}\n";
+		"\"cpu\":4,\"applied\":true}]},"
+		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
 	rt_diag_sched_snapshot_init(&sched);
@@ -622,10 +624,18 @@ PWTEST(diag_json_full_golden)
 	c.mode = "prototype";
 	c.feasibility_method = "none";
 	c.feasibility_status = "n/a";
+	struct rt_diag_peer_dispatch pd;
+	rt_diag_peer_dispatch_init(&pd);
+	pd.driver_id = 63;
+	pd.generation = 3;
+	pd.inline_armed = 5;
+	pd.eventfd_path = 2;
+
 	c.raw = &raw;
 	c.sched = &sched;
 	c.fusion = &fusion;
 	c.params = &params;
+	c.peer_dispatch = &pd;
 
 	fp = open_memstream(&buf, &len);
 	pwtest_ptr_notnull(fp);
@@ -638,6 +648,39 @@ PWTEST(diag_json_full_golden)
 	rt_diag_sched_snapshot_fini(&sched);
 	rt_diag_fusion_snapshot_fini(&fusion);
 	rt_diag_params_snapshot_fini(&params);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_peer_dispatch_render_text)
+{
+	struct rt_diag_peer_dispatch pd;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	const char expected[] =
+		"deadline-diag-peer-dispatch: driver=42 generation=7 "
+		"inline_armed=4 eventfd_path=1\n";
+
+	rt_diag_peer_dispatch_init(&pd);
+	pd.driver_id = 42;
+	pd.generation = 7;
+	pd.inline_armed = 4;
+	pd.eventfd_path = 1;
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_peer_dispatch_render_text(&pd, fp);
+	fclose(fp);
+	pwtest_str_eq(buf, expected);
+	free(buf);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_peer_dispatch_null_safe)
+{
+	rt_diag_peer_dispatch_init(NULL);
+	rt_diag_peer_dispatch_reset(NULL);
+	rt_diag_peer_dispatch_render_text(NULL, stderr);
 	return PWTEST_PASS;
 }
 
@@ -699,6 +742,8 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_json_empty_combined, PWTEST_NOARG);
 	pwtest_add(diag_json_full_golden, PWTEST_NOARG);
 	pwtest_add(diag_json_escapes_strings, PWTEST_NOARG);
+	pwtest_add(diag_peer_dispatch_render_text, PWTEST_NOARG);
+	pwtest_add(diag_peer_dispatch_null_safe, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

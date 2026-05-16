@@ -705,6 +705,44 @@ static void json_write_fusion_section(FILE *out, const struct rt_diag_fusion_sna
 	fputs("]}", out);
 }
 
+void rt_diag_peer_dispatch_init(struct rt_diag_peer_dispatch *s)
+{
+	if (s == NULL)
+		return;
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_peer_dispatch_reset(struct rt_diag_peer_dispatch *s)
+{
+	if (s == NULL)
+		return;
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_peer_dispatch_render_text(const struct rt_diag_peer_dispatch *s,
+				       FILE *out)
+{
+	if (s == NULL || out == NULL)
+		return;
+	fprintf(out,
+		"deadline-diag-peer-dispatch: driver=%u generation=%llu "
+		"inline_armed=%u eventfd_path=%u\n",
+		s->driver_id, (unsigned long long)s->generation,
+		s->inline_armed, s->eventfd_path);
+}
+
+static void json_write_peer_dispatch_section(FILE *out,
+		const struct rt_diag_peer_dispatch *s)
+{
+	if (s == NULL) {
+		fputs("{\"inline_armed\":0,\"eventfd_path\":0}", out);
+		return;
+	}
+	fprintf(out,
+		"{\"inline_armed\":%u,\"eventfd_path\":%u}",
+		s->inline_armed, s->eventfd_path);
+}
+
 static void json_write_params_section(FILE *out, const struct rt_diag_params_snapshot *s)
 {
 	uint32_t i;
@@ -767,6 +805,8 @@ void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out)
 	json_write_fusion_section(out, c->fusion);
 	fputs(",\"parameters\":", out);
 	json_write_params_section(out, c->params);
+	fputs(",\"peer_dispatch\":", out);
+	json_write_peer_dispatch_section(out, c->peer_dispatch);
 	fputc('}', out);
 	fputc('\n', out);
 }

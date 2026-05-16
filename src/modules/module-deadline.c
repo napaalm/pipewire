@@ -2307,17 +2307,49 @@ static int populate_params_snapshot(struct impl *impl,
 	return 0;
 }
 
-/* Atomic JSON snapshot: render the four diagnostic slices into a
- * temp file, then rename(2) over the final path so concurrent
- * readers see either the previous full document or the new one,
- * never a torn write. Emits nothing when debug.snapshot-json-path
- * is unset or empty. */
+/* Walk every follower's pw_node_peer list and count peer-edges
+ * whose inline-dispatch fast path is armed (src_system populated
+ * to the consumer's system at peer_ref time) versus those that
+ * remained on the eventfd_write path. The fast path is the
+ * runtime realisation of a single-job macro-actor: when both
+ * endpoints share a data loop, trigger_target_v1 calls
+ * process_node on the producer's stack instead of crossing the
+ * kernel via eventfd_write/epoll_wait. Counting both arms here
+ * makes the post-fusion utilisation observable from the JSON
+ * snapshot. */
+static void populate_peer_dispatch(struct impl *impl SPA_UNUSED,
+		struct node *drv, struct rt_diag_peer_dispatch *snap)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	struct pw_node_peer *peer;
+
+	snap->driver_id = dnode->info.id;
+	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		spa_list_for_each(peer, &n_iter->peer_list, link) {
+			if (peer->target.src_system != NULL &&
+			    peer->target.src_system == peer->target.system)
+				snap->inline_armed++;
+			else
+				snap->eventfd_path++;
+		}
+	}
+}
+
+/* Atomic JSON snapshot: render the diagnostic slices into a temp
+ * file, then rename(2) over the final path so concurrent readers
+ * see either the previous full document or the new one, never a
+ * torn write. Emits nothing when debug.snapshot-json-path is
+ * unset or empty. */
 static void dump_combined_json_main(struct impl *impl, struct node *drv)
 {
 	struct rt_diag_raw_snapshot    raw;
 	struct rt_diag_sched_snapshot  sched;
 	struct rt_diag_fusion_snapshot fusion;
 	struct rt_diag_params_snapshot params;
+	struct rt_diag_peer_dispatch   peer_dispatch;
 	struct rt_diag_combined c = { 0 };
 	struct pw_impl_node *dnode = drv->node;
 	char tmp_path[PATH_MAX];
@@ -2332,6 +2364,7 @@ static void dump_combined_json_main(struct impl *impl, struct node *drv)
 	rt_diag_sched_snapshot_init(&sched);
 	rt_diag_fusion_snapshot_init(&fusion);
 	rt_diag_params_snapshot_init(&params);
+	rt_diag_peer_dispatch_init(&peer_dispatch);
 
 	if (populate_raw_snapshot(impl, drv, &raw) < 0)
 		goto cleanup;
@@ -2341,6 +2374,7 @@ static void dump_combined_json_main(struct impl *impl, struct node *drv)
 		goto cleanup;
 	if (populate_params_snapshot(impl, drv, &params) < 0)
 		goto cleanup;
+	populate_peer_dispatch(impl, drv, &peer_dispatch);
 
 	c.driver_id = dnode->info.id;
 	c.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
@@ -2356,6 +2390,7 @@ static void dump_combined_json_main(struct impl *impl, struct node *drv)
 	c.sched = &sched;
 	c.fusion = &fusion;
 	c.params = &params;
+	c.peer_dispatch = &peer_dispatch;
 
 	n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp",
 			impl->debug_snapshot_json_path);

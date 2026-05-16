@@ -395,6 +395,39 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 					 FILE *out);
 
 /*
+ * Peer-dispatch slice.
+ *
+ * The contracted-DAG analysis assumes that, once a macro-node's
+ * leader is woken, every internal edge inside the macro-node
+ * dispatches without leaving the data-loop thread: the in-tree
+ * trigger_target_v1 same-loop fast path (private.h) skips the
+ * eventfd round-trip when the producer and consumer share a
+ * spa_system and calls process_node on the same stack. That fast
+ * path is the runtime realisation of Sarkar 1989 §5.3's macro-
+ * actor: a single non-self-suspending compound execution.
+ *
+ * To verify the assumption holds in practice, the diag layer
+ * carries a per-driver count of how many peer-edges have armed
+ * inline dispatch (`inline_armed`) versus how many remained on
+ * the eventfd path (`eventfd_path`). Module-deadline populates
+ * these by walking each follower's peer list at snapshot time;
+ * the JSON snapshot surfaces them so an operator can confirm,
+ * post-fusion, that the internal edges of every accepted macro-
+ * node use the fast path.
+ */
+struct rt_diag_peer_dispatch {
+	uint32_t driver_id;
+	uint64_t generation;
+	uint32_t inline_armed;
+	uint32_t eventfd_path;
+};
+
+void rt_diag_peer_dispatch_init(struct rt_diag_peer_dispatch *s);
+void rt_diag_peer_dispatch_reset(struct rt_diag_peer_dispatch *s);
+void rt_diag_peer_dispatch_render_text(const struct rt_diag_peer_dispatch *s,
+				       FILE *out);
+
+/*
  * Combined JSON document.
  *
  * Carries the four diagnostic slices plus the driver-level metadata
@@ -421,6 +454,7 @@ struct rt_diag_combined {
 	const struct rt_diag_sched_snapshot  *sched;
 	const struct rt_diag_fusion_snapshot *fusion;
 	const struct rt_diag_params_snapshot *params;
+	const struct rt_diag_peer_dispatch   *peer_dispatch;
 };
 
 void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out);
