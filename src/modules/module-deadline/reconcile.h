@@ -102,10 +102,21 @@ typedef struct {
  * is preserved for sound max-aggregation across fused-thread
  * members and for the JSON / debug snapshots.
  */
+/* `fusion_group_leader_id` is the node id of the macro-node leader
+ * the follower currently belongs to. For a singleton the leader is
+ * the follower itself, so the value equals `id`. The Cucu-Grosjean
+ * 2012 §IV "Path Coverage" rule treats a contracted node as a
+ * fresh program: when the leader id changes between two reconcile
+ * passes the follower's MBPTA estimator must be invalidated because
+ * the new macro is observationally a different workload. Surfacing
+ * the leader through the per-follower callback gives the
+ * implementation a single point to detect the change without
+ * reaching into reconcile internals. */
 typedef void (*reconcile_sched_cb_t)(void *data, uint32_t id, pid_t tid,
 		uint64_t runtime,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu);
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id);
 
 /* Allocate and initialize a reconcile state. `n_cpus` and
  * `cpu_utilization` mirror the dag_create arguments;

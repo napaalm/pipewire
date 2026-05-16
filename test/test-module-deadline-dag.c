@@ -140,7 +140,8 @@ struct foreach_info {
 
 static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu)
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct foreach_info *info = data;
 
@@ -149,6 +150,7 @@ static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 	(void)local_deadline;
 	(void)period;
 	(void)cpu;
+	(void)fusion_group_leader_id;
 
 	info->count++;
 	if (tid < 0 || wcet == 0)
@@ -1072,7 +1074,8 @@ struct dirty_test_stats {
 
 static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu)
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct dirty_test_stats *s = data;
 
@@ -1082,6 +1085,7 @@ static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wce
 	(void)cumulative_deadline;
 	(void)period;
 	(void)cpu;
+	(void)fusion_group_leader_id;
 
 	s->callbacks++;
 	s->deadline_sum += local_deadline;

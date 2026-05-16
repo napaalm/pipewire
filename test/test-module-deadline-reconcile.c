@@ -36,12 +36,14 @@ struct cb_ctx {
 		uint64_t deadline;
 		uint64_t period;
 		uint32_t cpu;
+		uint32_t fusion_leader;
 	} last[16];
 };
 
 static void cb_record(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu)
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct cb_ctx *c = data;
 	uint32_t slot = c->calls % (uint32_t)SPA_N_ELEMENTS(c->last);
@@ -53,6 +55,7 @@ static void cb_record(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 	c->last[slot].deadline = local_deadline;
 	c->last[slot].period = period;
 	c->last[slot].cpu = cpu;
+	c->last[slot].fusion_leader = fusion_group_leader_id;
 	c->calls++;
 }
 
@@ -1364,6 +1367,36 @@ PWTEST(reconcile_mode_hysteresis_promotes_after_n_passes)
 	return PWTEST_PASS;
 }
 
+/* When no fusion groups are formed, every follower is its own
+ * macro-node leader. The MBPTA fusion-group-invalidation path keys
+ * off the leader id staying stable across reconcile passes
+ * (Cucu-Grosjean 2012 §IV); the singleton case is the contract's
+ * baseline: the leader reported through sched_cb must equal the
+ * follower's own id, both on the contracted path and on the
+ * dag_foreach_node fallback. */
+PWTEST(reconcile_singleton_fusion_leader_equals_follower_id)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	uint32_t i;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	pwtest_int_eq((int)cb.calls, 5);
+	for (i = 0; i < cb.calls; i++) {
+		pwtest_int_eq((int)cb.last[i].fusion_leader,
+				(int)cb.last[i].id);
+	}
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_reconcile)
 {
 	pwtest_add(reconcile_rec_1_first_build, PWTEST_NOARG);
@@ -1405,6 +1438,9 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_mode_feasible_repeats_keep_hard, PWTEST_NOARG);
 	pwtest_add(reconcile_mode_density_overload_flips_soft, PWTEST_NOARG);
 	pwtest_add(reconcile_mode_hysteresis_promotes_after_n_passes, PWTEST_NOARG);
+
+	pwtest_add(reconcile_singleton_fusion_leader_equals_follower_id,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

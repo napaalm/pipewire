@@ -2736,11 +2736,18 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 
 	dag_node_t *n;
 	spa_list_for_each(n, &g->nodes, link) {
+		uint32_t leader_id;
 		if (n->fictitious)
 			continue;
+		/* No contracted-DAG layer here -- every node is its
+		 * own macro. Report the node as its own fusion
+		 * leader so callers that key on the leader id (e.g.
+		 * MBPTA invalidation) see a stable identity in the
+		 * singleton case. */
+		leader_id = (n->group_id != 0) ? n->group_id : n->id;
 		cb(data, n->id, n->tid, n->wcet,
 		   n->cumulative_deadline, n->local_deadline,
-		   g->period, n->cpu);
+		   g->period, n->cpu, leader_id);
 	}
 
 	return 0;

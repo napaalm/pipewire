@@ -526,6 +526,16 @@ struct node {
 	uint32_t last_cpu;
 	bool     last_applied;
 
+	/* Last fusion-group leader id stamped by sched_cb. Used to
+	 * detect a change in macro-node membership across reconcile
+	 * passes so the per-follower MBPTA estimator can be
+	 * invalidated (Cucu-Grosjean 2012 §IV: a contracted node is
+	 * a fresh probabilistic-timing subject). _seen=false on
+	 * first ever sched_cb so the initial leader is just
+	 * recorded, not treated as a change. */
+	uint32_t last_fusion_group_leader;
+	bool     last_fusion_group_seen;
+
 	/* Per-driver async state. Only valid when is_driver=true. */
 	/* SPSC sample ring: producer is this driver's data-loop thread
 	 * (inside the complete/incomplete RT hook), consumer is the
@@ -962,7 +972,8 @@ static int set_cpu_affinity(pid_t tid, int cpu)
  * sync mode where the foreach runs on the RT data-loop thread. */
 static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu)
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id)
 {
 	struct impl *impl = data;
 
@@ -1001,8 +1012,26 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 	 * deadline, period, cpu) on the group's leader follower; the
 	 * cumulative deadline is per-follower and lands here. */
 	struct node *mn = find_node_by_id(impl, id);
-	if (mn != NULL)
+	if (mn != NULL) {
 		mn->last_cumulative_deadline = cumulative_deadline;
+		/* Fusion-group invalidation. Per Cucu-Grosjean 2012
+		 * §IV "Path Coverage" a contracted node is a fresh
+		 * MBPTA subject -- its execution-time distribution
+		 * reflects samples taken *after* the contraction is in
+		 * effect. When the macro leader changes between two
+		 * reconcile passes the old fit no longer corresponds
+		 * to the new workload, so drop it. The first pass
+		 * (last_fusion_group_seen = false) records the leader
+		 * without invalidating; subsequent passes compare. */
+		if (mn->last_fusion_group_seen &&
+		    mn->last_fusion_group_leader != fusion_group_leader_id &&
+		    mn->mbpta != NULL) {
+			mbpta_invalidate_with_reason(mn->mbpta,
+					MBPTA_INVALIDATED_FUSION_GROUP);
+		}
+		mn->last_fusion_group_leader = fusion_group_leader_id;
+		mn->last_fusion_group_seen = true;
+	}
 }
 
 /* Per-group apply pass.

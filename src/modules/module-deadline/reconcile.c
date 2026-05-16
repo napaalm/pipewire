@@ -883,10 +883,14 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 			}
 		}
 
-		sched_cb(sched_data, n->id, n->tid, runtime,
-				cn->cumulative_deadline_ns,
-				cn->local_deadline_ns,
-				period_ns, cpu);
+		{
+			uint32_t fusion_leader_id = (leader != NULL)
+				? leader->id : n->id;
+			sched_cb(sched_data, n->id, n->tid, runtime,
+					cn->cumulative_deadline_ns,
+					cn->local_deadline_ns,
+					period_ns, cpu, fusion_leader_id);
+		}
 	}
 
 	free(cpu_scale);

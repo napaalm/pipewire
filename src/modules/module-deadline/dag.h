@@ -380,10 +380,15 @@ bool dag_has_cycle(dag_t *g);
  *     and equals the legacy per-node deadline slice produced by
  *     the splitter for a single non-fused node.
  */
+/* Per-node iteration callback. `fusion_group_leader_id` is the
+ * macro-node leader the node belongs to; on a singleton (no
+ * fusion) the value equals `id`. Callers that do not care about
+ * fusion can ignore the trailing parameter. */
 typedef void (*dag_node_callback_t)(void *data, uint32_t id, pid_t tid,
 		uint64_t wcet,
 		uint64_t cumulative_deadline, uint64_t local_deadline,
-		uint64_t period, uint32_t cpu);
+		uint64_t period, uint32_t cpu,
+		uint32_t fusion_group_leader_id);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);
 
 void dag_print(dag_t *g);
