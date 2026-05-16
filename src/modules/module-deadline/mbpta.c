@@ -35,8 +35,22 @@ const char *mbpta_state_name(enum mbpta_state s)
 	return "unknown";
 }
 
+const char *mbpta_invalidation_reason_name(enum mbpta_invalidation_reason r)
+{
+	switch (r) {
+	case MBPTA_INVALIDATED_NONE:                return "none";
+	case MBPTA_INVALIDATED_PERIOD:              return "period";
+	case MBPTA_INVALIDATED_FUSION_GROUP:        return "fusion_group";
+	case MBPTA_INVALIDATED_TOPOLOGY_GENERATION: return "topology_generation";
+	case MBPTA_INVALIDATED_CPU_CLASS:           return "cpu_class";
+	case MBPTA_INVALIDATED_OPERATOR_REQUEST:    return "operator_request";
+	}
+	return "unknown";
+}
+
 struct mbpta {
 	struct mbpta_config cfg;
+	enum mbpta_invalidation_reason last_invalidation;
 
 	/* Sample ring. samples_total counts every sample ever fed;
 	 * we drop the first `warmup_discard` ones. window_count is
@@ -126,7 +140,8 @@ void mbpta_destroy(mbpta_t *e)
 	free(e);
 }
 
-void mbpta_invalidate(mbpta_t *e)
+void mbpta_invalidate_with_reason(mbpta_t *e,
+		enum mbpta_invalidation_reason reason)
 {
 	if (e == NULL)
 		return;
@@ -147,6 +162,17 @@ void mbpta_invalidate(mbpta_t *e)
 	free(e->prev_bm);
 	e->prev_bm = NULL;
 	e->prev_bm_count = 0;
+	e->last_invalidation = reason;
+}
+
+void mbpta_invalidate(mbpta_t *e)
+{
+	mbpta_invalidate_with_reason(e, MBPTA_INVALIDATED_OPERATOR_REQUEST);
+}
+
+enum mbpta_invalidation_reason mbpta_last_invalidation_reason(const mbpta_t *e)
+{
+	return e ? e->last_invalidation : MBPTA_INVALIDATED_NONE;
 }
 
 /* Two-sample KS statistic on the most recent window split in

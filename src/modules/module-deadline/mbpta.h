@@ -137,10 +137,31 @@ typedef struct mbpta mbpta_t;
 mbpta_t *mbpta_create(const struct mbpta_config *cfg);
 void     mbpta_destroy(mbpta_t *e);
 
+/* Reasons the estimator key fingerprint can change. Surfaced
+ * via mbpta_last_invalidation_reason for operator diagnostics --
+ * a follower whose estimator keeps rebuilding gives the
+ * operator a clear cause to investigate. */
+enum mbpta_invalidation_reason {
+	MBPTA_INVALIDATED_NONE              = 0,
+	MBPTA_INVALIDATED_PERIOD            = 1,
+	MBPTA_INVALIDATED_FUSION_GROUP      = 2,
+	MBPTA_INVALIDATED_TOPOLOGY_GENERATION = 3,
+	MBPTA_INVALIDATED_CPU_CLASS         = 4,
+	MBPTA_INVALIDATED_OPERATOR_REQUEST  = 5,
+};
+
+const char *mbpta_invalidation_reason_name(enum mbpta_invalidation_reason r);
+
 /* Drop every cached sample and reset to INSUFFICIENT_DATA. Used
  * on estimator-key change (period, sample rate, fusion-group
- * membership, CPU class assignment, topology generation). */
+ * membership, CPU class assignment, topology generation). The
+ * reason is stored and exposed via mbpta_last_invalidation_reason. */
 void mbpta_invalidate(mbpta_t *e);
+
+void mbpta_invalidate_with_reason(mbpta_t *e,
+		enum mbpta_invalidation_reason reason);
+
+enum mbpta_invalidation_reason mbpta_last_invalidation_reason(const mbpta_t *e);
 
 /* Add a raw per-cycle execution-time sample in nanoseconds.
  * Returns true if the call triggered a re-evaluation (every

@@ -1449,7 +1449,8 @@ static void apply_sample(struct impl *impl, struct node *n,
 		if (n->sketch_ready)
 			wcet_sketch_reset(&n->sketch);
 		if (n->mbpta != NULL)
-			mbpta_invalidate(n->mbpta);
+			mbpta_invalidate_with_reason(n->mbpta,
+					MBPTA_INVALIDATED_PERIOD);
 		n->wcet = 0;
 	}
 
