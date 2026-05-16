@@ -702,38 +702,6 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 
 	contracted_dag_apply_dag_schedule(cg, macro_dag);
 
-	/* Per-follower emission. For each real node in state_dag, look
-	 * up its owning macro-node and emit sched_cb with the macro's
-	 * (cumulative_deadline, local_deadline, cpu). Runtime: each
-	 * follower reports its own wcet so sched_groups.sum_runtime
-	 * aggregates to sum_of_members; the macro's overhead is folded
-	 * into the leader's report so the final sum equals the
-	 * macro-node's effective WCET. */
-	spa_list_for_each(n, &state_dag->nodes, link) {
-		contracted_node_t *cn;
-		const struct contracted_member *leader;
-		uint64_t runtime;
-		uint32_t cpu;
-
-		if (n->fictitious)
-			continue;
-		cn = contracted_owner(cg, n->id);
-		if (cn == NULL)
-			continue;
-		leader = macro_leader(cn);
-
-		runtime = n->wcet;
-		if (leader != NULL && leader->id == n->id)
-			runtime += cn->overhead_ns;
-
-		cpu = (cn->cpu < 0) ? 0u : (uint32_t)cn->cpu;
-
-		sched_cb(sched_data, n->id, n->tid, runtime,
-				cn->cumulative_deadline_ns,
-				cn->local_deadline_ns,
-				period_ns, cpu);
-	}
-
 	/* Feasibility classification on the macro-dag. Demotion to
 	 * SOFT_DEGRADED is immediate on the first failure; promotion
 	 * back to HARD requires N consecutive feasible passes
@@ -815,6 +783,78 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 
 		state->feas = f;
 	}
+
+	/* Per-CPU soft-redistribution scaling. In SOFT_DEGRADED mode
+	 * the contracted analysis already decided the schedule does
+	 * not meet every deadline on every activation. To bound the
+	 * damage on overloaded CPUs, scale every macro-node's runtime
+	 * budget on a CPU c by min(1.0, 1.0 / density(c)); the
+	 * resulting per-CPU sum of (R / D) is <= 1 and the kernel
+	 * grants no more than that fraction of CPU time per period,
+	 * which is the "least bad" deterministic redistribution the
+	 * plan calls for. Tasks may miss their actual demand --
+	 * xruns are possible -- but the system stays kernel-valid
+	 * and other CPUs are unaffected. In HARD mode the scales
+	 * are all 1.0 (no change). */
+	double *cpu_scale = NULL;
+	if (state->feas.mode == RECONCILE_MODE_SOFT_DEGRADED &&
+			state->n_cpus > 0) {
+		cpu_scale = calloc(state->n_cpus, sizeof(*cpu_scale));
+		if (cpu_scale != NULL) {
+			uint32_t cpu;
+			for (cpu = 0; cpu < state->n_cpus; cpu++) {
+				double d = dag_per_cpu_density(macro_dag, cpu);
+				cpu_scale[cpu] = (d > 1.0) ? (1.0 / d) : 1.0;
+			}
+		}
+	}
+
+	/* Per-follower emission. For each real node in state_dag, look
+	 * up its owning macro-node and emit sched_cb with the macro's
+	 * (cumulative_deadline, local_deadline, cpu). Runtime: each
+	 * follower reports its own wcet so sched_groups.sum_runtime
+	 * aggregates to sum_of_members; the macro's overhead is folded
+	 * into the leader's report so the final sum equals the macro-
+	 * node's effective WCET. In SOFT_DEGRADED mode the runtime is
+	 * scaled down by the per-CPU soft-redistribution factor
+	 * computed above, with a 1ns floor to keep the kernel call
+	 * valid. */
+	spa_list_for_each(n, &state_dag->nodes, link) {
+		contracted_node_t *cn;
+		const struct contracted_member *leader;
+		uint64_t runtime;
+		uint32_t cpu;
+
+		if (n->fictitious)
+			continue;
+		cn = contracted_owner(cg, n->id);
+		if (cn == NULL)
+			continue;
+		leader = macro_leader(cn);
+
+		runtime = n->wcet;
+		if (leader != NULL && leader->id == n->id)
+			runtime += cn->overhead_ns;
+
+		cpu = (cn->cpu < 0) ? 0u : (uint32_t)cn->cpu;
+
+		if (cpu_scale != NULL && cpu < state->n_cpus) {
+			double s = cpu_scale[cpu];
+			if (s > 0.0 && s < 1.0) {
+				double scaled = (double)runtime * s;
+				if (scaled < 1.0)
+					scaled = 1.0;  /* runtime > 0 floor */
+				runtime = (uint64_t)scaled;
+			}
+		}
+
+		sched_cb(sched_data, n->id, n->tid, runtime,
+				cn->cumulative_deadline_ns,
+				cn->local_deadline_ns,
+				period_ns, cpu);
+	}
+
+	free(cpu_scale);
 
 	dag_destroy(macro_dag);
 	contracted_dag_destroy(cg);
