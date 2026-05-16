@@ -327,6 +327,123 @@ PWTEST(diag_sched_render_text_golden)
 	return PWTEST_PASS;
 }
 
+/* --- fusion-decision slice tests --- */
+
+PWTEST(diag_fusion_null_safe)
+{
+	rt_diag_fusion_snapshot_init(NULL);
+	rt_diag_fusion_snapshot_fini(NULL);
+	rt_diag_fusion_snapshot_reset(NULL);
+	rt_diag_fusion_snapshot_render_text(NULL, stderr);
+	pwtest_int_eq(rt_diag_fusion_snapshot_begin_group(NULL, 0,
+				RT_DIAG_FUSION_FUSE, RT_DIAG_FUSION_REJ_NONE),
+		      -EINVAL);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(NULL, 0, 1),
+		      -EINVAL);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_fusion_begin_group_validates_pair)
+{
+	struct rt_diag_fusion_snapshot s;
+	rt_diag_fusion_snapshot_init(&s);
+
+	/* FUSE must come with reason=NONE; any other reason is an
+	 * error and the slot is not consumed. */
+	pwtest_int_eq(rt_diag_fusion_snapshot_begin_group(&s, 1,
+				RT_DIAG_FUSION_FUSE,
+				RT_DIAG_FUSION_REJ_BELOW_THRESHOLD),
+		      -EINVAL);
+	pwtest_int_eq((int)s.n_groups, 0);
+
+	/* SPLIT must come with a non-NONE reason. */
+	pwtest_int_eq(rt_diag_fusion_snapshot_begin_group(&s, 2,
+				RT_DIAG_FUSION_SPLIT,
+				RT_DIAG_FUSION_REJ_NONE),
+		      -EINVAL);
+	pwtest_int_eq((int)s.n_groups, 0);
+
+	rt_diag_fusion_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_fusion_add_member_out_of_range)
+{
+	struct rt_diag_fusion_snapshot s;
+	rt_diag_fusion_snapshot_init(&s);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, 0, 1), -EINVAL);
+	rt_diag_fusion_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_fusion_render_text_golden)
+{
+	struct rt_diag_fusion_snapshot s;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	int g0, g1, g2;
+	const char expected[] =
+		"deadline-diag-fusion: driver=63 generation=5\n"
+		"  groups: 3\n"
+		"    group leader=10 verdict=fuse reason=none members=10,11,12\n"
+		"    group leader=20 verdict=linear_only reason=below_threshold members=20,21\n"
+		"    group leader=30 verdict=split reason=below_threshold members=-\n";
+
+	rt_diag_fusion_snapshot_init(&s);
+	s.driver_id = 63;
+	s.generation = 5;
+
+	g0 = rt_diag_fusion_snapshot_begin_group(&s, 10,
+			RT_DIAG_FUSION_FUSE, RT_DIAG_FUSION_REJ_NONE);
+	pwtest_int_eq(g0, 0);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, (uint32_t)g0, 10), 0);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, (uint32_t)g0, 11), 0);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, (uint32_t)g0, 12), 0);
+
+	g1 = rt_diag_fusion_snapshot_begin_group(&s, 20,
+			RT_DIAG_FUSION_LINEAR_ONLY,
+			RT_DIAG_FUSION_REJ_BELOW_THRESHOLD);
+	pwtest_int_eq(g1, 1);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, (uint32_t)g1, 20), 0);
+	pwtest_int_eq(rt_diag_fusion_snapshot_add_member(&s, (uint32_t)g1, 21), 0);
+
+	g2 = rt_diag_fusion_snapshot_begin_group(&s, 30,
+			RT_DIAG_FUSION_SPLIT,
+			RT_DIAG_FUSION_REJ_BELOW_THRESHOLD);
+	pwtest_int_eq(g2, 2);
+	/* Empty member list: renders as "-" so the format remains
+	 * parseable even on a singleton split. */
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_fusion_snapshot_render_text(&s, fp);
+	fclose(fp);
+
+	pwtest_str_eq(buf, expected);
+
+	free(buf);
+	rt_diag_fusion_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_fusion_verdict_and_reason_names)
+{
+	pwtest_str_eq(rt_diag_fusion_verdict_name(RT_DIAG_FUSION_FUSE), "fuse");
+	pwtest_str_eq(rt_diag_fusion_verdict_name(RT_DIAG_FUSION_LINEAR_ONLY),
+		      "linear_only");
+	pwtest_str_eq(rt_diag_fusion_verdict_name(RT_DIAG_FUSION_SPLIT), "split");
+	pwtest_str_eq(rt_diag_fusion_verdict_name((enum rt_diag_fusion_verdict)999),
+		      "unknown");
+	pwtest_str_eq(rt_diag_fusion_reject_reason_name(RT_DIAG_FUSION_REJ_NONE),
+		      "none");
+	pwtest_str_eq(rt_diag_fusion_reject_reason_name(RT_DIAG_FUSION_REJ_BELOW_THRESHOLD),
+		      "below_threshold");
+	pwtest_str_eq(rt_diag_fusion_reject_reason_name(
+		      (enum rt_diag_fusion_reject_reason)999), "unknown");
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_diag)
 {
 	pwtest_add(diag_raw_init_zeroes, PWTEST_NOARG);
@@ -341,6 +458,11 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_sched_excluded_rejects_none, PWTEST_NOARG);
 	pwtest_add(diag_sched_reason_names_stable, PWTEST_NOARG);
 	pwtest_add(diag_sched_render_text_golden, PWTEST_NOARG);
+	pwtest_add(diag_fusion_null_safe, PWTEST_NOARG);
+	pwtest_add(diag_fusion_begin_group_validates_pair, PWTEST_NOARG);
+	pwtest_add(diag_fusion_add_member_out_of_range, PWTEST_NOARG);
+	pwtest_add(diag_fusion_verdict_and_reason_names, PWTEST_NOARG);
+	pwtest_add(diag_fusion_render_text_golden, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

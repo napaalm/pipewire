@@ -256,6 +256,88 @@ const char *rt_diag_sched_exclude_reason_name(enum rt_diag_sched_exclude_reason 
 void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
 					FILE *out);
 
+/*
+ * Fusion-decision slice.
+ *
+ * The Sarkar 1989 profitability criterion drives a per-component
+ * fusion decision in the core (see src/pipewire/fusion-cost.h). The
+ * decision values are FUSE (members co-located on one data loop),
+ * LINEAR_ONLY (chain fallback for single-input / single-output
+ * pipelines per Gerasoulis & Yang 1993), and SPLIT (no fusion).
+ *
+ * For Phase 0 observability, the dump groups followers by the
+ * applied decision and records each group's component leader, the
+ * applied verdict, the rejection reason for non-FUSE verdicts (today
+ * the only reason is "below_threshold" -- the Sarkar inequality did
+ * not hold for the component; Phase 3's soundness validator will
+ * extend this enum with structural rejection reasons such as
+ * non_convex, internal_milestone, blocking_risk, ...), and the list
+ * of member node ids in the group.
+ */
+enum rt_diag_fusion_verdict {
+	RT_DIAG_FUSION_FUSE        = 0,
+	RT_DIAG_FUSION_LINEAR_ONLY = 1,
+	RT_DIAG_FUSION_SPLIT       = 2,
+};
+
+enum rt_diag_fusion_reject_reason {
+	RT_DIAG_FUSION_REJ_NONE            = 0,
+	RT_DIAG_FUSION_REJ_BELOW_THRESHOLD = 1,
+};
+
+struct rt_diag_fusion_group {
+	uint32_t leader_id;
+	enum rt_diag_fusion_verdict verdict;
+	enum rt_diag_fusion_reject_reason reject_reason;
+	uint32_t *members;
+	uint32_t  n_members;
+	uint32_t  cap_members;
+};
+
+struct rt_diag_fusion_snapshot {
+	uint32_t driver_id;
+	uint64_t generation;
+
+	struct rt_diag_fusion_group *groups;
+	uint32_t n_groups;
+	uint32_t cap_groups;
+};
+
+void rt_diag_fusion_snapshot_init(struct rt_diag_fusion_snapshot *s);
+void rt_diag_fusion_snapshot_fini(struct rt_diag_fusion_snapshot *s);
+void rt_diag_fusion_snapshot_reset(struct rt_diag_fusion_snapshot *s);
+
+/* Begin a new group with the supplied leader / verdict / reason.
+ * Returns the group's index in s->groups on success, or -EINVAL /
+ * -ENOMEM. The reason is required to be NONE when verdict is FUSE
+ * and required to be non-NONE otherwise; the call returns -EINVAL
+ * on a mismatch. */
+int rt_diag_fusion_snapshot_begin_group(struct rt_diag_fusion_snapshot *s,
+					uint32_t leader_id,
+					enum rt_diag_fusion_verdict verdict,
+					enum rt_diag_fusion_reject_reason reason);
+
+/* Append `member_id` to the group at `group_idx`. Returns 0 on
+ * success, -EINVAL on out-of-range index, -ENOMEM on allocation
+ * failure. */
+int rt_diag_fusion_snapshot_add_member(struct rt_diag_fusion_snapshot *s,
+				       uint32_t group_idx,
+				       uint32_t member_id);
+
+const char *rt_diag_fusion_verdict_name(enum rt_diag_fusion_verdict v);
+const char *rt_diag_fusion_reject_reason_name(enum rt_diag_fusion_reject_reason r);
+
+/*
+ * Render to `out` as a stable text block:
+ *
+ *   deadline-diag-fusion: driver=<id> generation=<g>
+ *     groups: <n>
+ *       group leader=<id> verdict=<verdict> reason=<reason> members=<id,id,...>
+ *       ...
+ */
+void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s,
+					 FILE *out);
+
 #ifdef __cplusplus
 }
 #endif

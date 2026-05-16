@@ -697,6 +697,13 @@ struct impl {
 	 * enabled independently because operators occasionally want
 	 * the curated view without the raw-graph noise. */
 	bool                  debug_dump_sched_graph;
+
+	/* Companion switch for the fusion-decision slice. When true,
+	 * the snapshot path emits one group entry per applied fusion
+	 * verdict (fuse / linear_only / split) read off each
+	 * follower's pw_impl_node fusion_prev_decision plus the
+	 * PW_KEY_NODE_LOOP_GROUP property. */
+	bool                  debug_dump_fusion;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -1879,6 +1886,110 @@ cleanup:
 	rt_diag_sched_snapshot_fini(&snap);
 }
 
+/* Translate a pw_impl_node fusion verdict into the diag enum. The
+ * core's enum (see fusion-cost.h) is intentionally kept separate
+ * from the diag enum so a future verdict addition does not silently
+ * change the dump format. */
+static enum rt_diag_fusion_verdict diag_verdict_from_core(
+		enum pw_fusion_decision d)
+{
+	switch (d) {
+	case PW_FUSION_DECISION_FUSE:        return RT_DIAG_FUSION_FUSE;
+	case PW_FUSION_DECISION_LINEAR_ONLY: return RT_DIAG_FUSION_LINEAR_ONLY;
+	case PW_FUSION_DECISION_SPLIT:       return RT_DIAG_FUSION_SPLIT;
+	}
+	return RT_DIAG_FUSION_SPLIT;
+}
+
+/* Build a fusion-decision diagnostic snapshot and emit it via
+ * pw_log_info. The dump aggregates followers into groups keyed by
+ * the PW_KEY_NODE_LOOP_GROUP property (singleton when absent) and
+ * stamps each group with the applied verdict from
+ * pw_impl_node::fusion_prev_decision. Today, the core fusion-cost
+ * model emits a binary FUSE / LINEAR_ONLY / SPLIT verdict driven by
+ * the Sarkar 1989 inequality; a non-FUSE verdict is rendered with
+ * reason=below_threshold. When the fusion soundness validator
+ * lands, it will extend the reject-reason enum with structural
+ * codes (non_convex, internal_milestone, blocking_risk, ...) and
+ * stamp them on this slice without changing the rendered shape. */
+static void dump_fusion_main(struct impl *impl, struct node *drv)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	struct rt_diag_fusion_snapshot snap;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+
+	rt_diag_fusion_snapshot_init(&snap);
+	snap.driver_id = dnode->info.id;
+	snap.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		const char *group_name;
+		enum rt_diag_fusion_verdict verdict;
+		enum rt_diag_fusion_reject_reason reason;
+		int slot;
+		uint32_t g;
+		bool found;
+
+		group_name = pw_properties_get(n_iter->properties,
+				PW_KEY_NODE_LOOP_GROUP);
+		verdict = diag_verdict_from_core(n_iter->fusion_prev_decision);
+		reason = (verdict == RT_DIAG_FUSION_FUSE)
+				? RT_DIAG_FUSION_REJ_NONE
+				: RT_DIAG_FUSION_REJ_BELOW_THRESHOLD;
+
+		/* Look for an existing group that matches by leader_id
+		 * (when group_name is "fusion.<leader>"); fall back to a
+		 * scan when the group name shape changes. Followers
+		 * without PW_KEY_NODE_LOOP_GROUP get their own singleton
+		 * group keyed by node id. */
+		found = false;
+		for (g = 0; g < snap.n_groups && !found; g++) {
+			struct rt_diag_fusion_group *grp = &snap.groups[g];
+			if (group_name != NULL) {
+				char buf2[64];
+				snprintf(buf2, sizeof(buf2), "fusion.%u",
+					 grp->leader_id);
+				if (strcmp(buf2, group_name) == 0) {
+					(void)rt_diag_fusion_snapshot_add_member(
+						&snap, g, n_iter->info.id);
+					found = true;
+				}
+			}
+		}
+		if (!found) {
+			uint32_t leader = n_iter->info.id;
+			if (group_name != NULL &&
+			    strncmp(group_name, "fusion.", 7) == 0) {
+				unsigned long parsed = strtoul(group_name + 7,
+						NULL, 10);
+				if (parsed != 0 && parsed <= UINT32_MAX)
+					leader = (uint32_t)parsed;
+			}
+			slot = rt_diag_fusion_snapshot_begin_group(&snap,
+					leader, verdict, reason);
+			if (slot < 0)
+				goto cleanup;
+			(void)rt_diag_fusion_snapshot_add_member(&snap,
+					(uint32_t)slot, n_iter->info.id);
+		}
+	}
+
+	fp = open_memstream(&buf, &len);
+	if (fp == NULL)
+		goto cleanup;
+	rt_diag_fusion_snapshot_render_text(&snap, fp);
+	fclose(fp);
+	if (buf != NULL)
+		log_info_lines(buf);
+
+cleanup:
+	free(buf);
+	rt_diag_fusion_snapshot_fini(&snap);
+}
+
 /* Main-loop context: walk the driver's follower list and the
  * follower ports/links to capture a self-contained topology snapshot
  * that the worker can consume without further main-loop access. */
@@ -2017,6 +2128,8 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 				dump_raw_graph_main(drv->impl, drv);
 			if (drv->impl != NULL && drv->impl->debug_dump_sched_graph)
 				dump_sched_graph_main(drv->impl, drv);
+			if (drv->impl != NULL && drv->impl->debug_dump_fusion)
+				dump_fusion_main(drv->impl, drv);
 		}
 	}
 	SPA_ATOMIC_STORE(t->pending, 0);
@@ -2624,6 +2737,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			"debug.dump-sched-graph", false);
 	if (impl->debug_dump_sched_graph)
 		pw_log_info("debug.dump-sched-graph = true (scheduling-DAG"
+				" diagnostic dumps will be logged on topology change)");
+	impl->debug_dump_fusion = pw_properties_get_bool(props,
+			"debug.dump-fusion", false);
+	if (impl->debug_dump_fusion)
+		pw_log_info("debug.dump-fusion = true (fusion-decision"
 				" diagnostic dumps will be logged on topology change)");
 
 	impl->recalc_persistent = pw_properties_get_bool(props, "recalc.persistent", true);

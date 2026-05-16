@@ -344,3 +344,140 @@ void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
 			rt_diag_sched_exclude_reason_name(e->reason));
 	}
 }
+
+/* --- fusion-decision slice --- */
+
+#define RT_DIAG_INITIAL_GROUPS  8u
+#define RT_DIAG_INITIAL_MEMBERS 4u
+
+void rt_diag_fusion_snapshot_init(struct rt_diag_fusion_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_fusion_snapshot_fini(struct rt_diag_fusion_snapshot *s)
+{
+	uint32_t i;
+	if (s == NULL)
+		return;
+	for (i = 0; i < s->n_groups; i++)
+		free(s->groups[i].members);
+	free(s->groups);
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_fusion_snapshot_reset(struct rt_diag_fusion_snapshot *s)
+{
+	uint32_t i;
+	if (s == NULL)
+		return;
+	for (i = 0; i < s->n_groups; i++)
+		s->groups[i].n_members = 0;
+	s->n_groups = 0;
+	s->driver_id = 0;
+	s->generation = 0;
+}
+
+int rt_diag_fusion_snapshot_begin_group(struct rt_diag_fusion_snapshot *s,
+					uint32_t leader_id,
+					enum rt_diag_fusion_verdict verdict,
+					enum rt_diag_fusion_reject_reason reason)
+{
+	struct rt_diag_fusion_group *g;
+
+	if (s == NULL)
+		return -EINVAL;
+	if (verdict == RT_DIAG_FUSION_FUSE && reason != RT_DIAG_FUSION_REJ_NONE)
+		return -EINVAL;
+	if (verdict != RT_DIAG_FUSION_FUSE && reason == RT_DIAG_FUSION_REJ_NONE)
+		return -EINVAL;
+
+	if (s->n_groups == s->cap_groups) {
+		int r = grow_array((void **)&s->groups, &s->cap_groups,
+				   (uint32_t)sizeof(*s->groups),
+				   RT_DIAG_INITIAL_GROUPS);
+		if (r < 0)
+			return r;
+	}
+
+	g = &s->groups[s->n_groups];
+	g->leader_id = leader_id;
+	g->verdict = verdict;
+	g->reject_reason = reason;
+	g->members = NULL;
+	g->n_members = 0;
+	g->cap_members = 0;
+	return (int)s->n_groups++;
+}
+
+int rt_diag_fusion_snapshot_add_member(struct rt_diag_fusion_snapshot *s,
+				       uint32_t group_idx,
+				       uint32_t member_id)
+{
+	struct rt_diag_fusion_group *g;
+
+	if (s == NULL || group_idx >= s->n_groups)
+		return -EINVAL;
+	g = &s->groups[group_idx];
+	if (g->n_members == g->cap_members) {
+		int r = grow_array((void **)&g->members, &g->cap_members,
+				   (uint32_t)sizeof(*g->members),
+				   RT_DIAG_INITIAL_MEMBERS);
+		if (r < 0)
+			return r;
+	}
+	g->members[g->n_members++] = member_id;
+	return 0;
+}
+
+const char *rt_diag_fusion_verdict_name(enum rt_diag_fusion_verdict v)
+{
+	switch (v) {
+	case RT_DIAG_FUSION_FUSE:        return "fuse";
+	case RT_DIAG_FUSION_LINEAR_ONLY: return "linear_only";
+	case RT_DIAG_FUSION_SPLIT:       return "split";
+	}
+	return "unknown";
+}
+
+const char *rt_diag_fusion_reject_reason_name(enum rt_diag_fusion_reject_reason r)
+{
+	switch (r) {
+	case RT_DIAG_FUSION_REJ_NONE:            return "none";
+	case RT_DIAG_FUSION_REJ_BELOW_THRESHOLD: return "below_threshold";
+	}
+	return "unknown";
+}
+
+void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s,
+					 FILE *out)
+{
+	uint32_t i, j;
+
+	if (s == NULL || out == NULL)
+		return;
+
+	fprintf(out, "deadline-diag-fusion: driver=%u generation=%llu\n",
+		s->driver_id, (unsigned long long)s->generation);
+	fprintf(out, "  groups: %u\n", s->n_groups);
+	for (i = 0; i < s->n_groups; i++) {
+		const struct rt_diag_fusion_group *g = &s->groups[i];
+		fprintf(out,
+			"    group leader=%u verdict=%s reason=%s members=",
+			g->leader_id,
+			rt_diag_fusion_verdict_name(g->verdict),
+			rt_diag_fusion_reject_reason_name(g->reject_reason));
+		if (g->n_members == 0) {
+			fputc('-', out);
+		} else {
+			for (j = 0; j < g->n_members; j++) {
+				if (j > 0)
+					fputc(',', out);
+				fprintf(out, "%u", g->members[j]);
+			}
+		}
+		fputc('\n', out);
+	}
+}
