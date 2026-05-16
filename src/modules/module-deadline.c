@@ -44,6 +44,7 @@
 
 #include "module-deadline/cpu_topology.h"
 #include "module-deadline/dag.h"
+#include "module-deadline/diag.h"
 #include "module-deadline/reconcile.h"
 #include "module-deadline/sched_groups.h"
 #include "module-deadline/wcet_sketch.h"
@@ -676,6 +677,16 @@ struct impl {
 	 * issues exactly one sched_setattr per distinct tid. Reset at
 	 * the start of each apply pass via sched_groups_reset. */
 	struct sched_groups sched_groups;
+
+	/* Observability switch: when true, the snapshot path emits a
+	 * driver-relative raw-graph dump on every topology-fingerprint
+	 * change. Default false so the production hot path is
+	 * unaffected; flipped on via the `debug.dump-raw-graph` module
+	 * argument when an operator (or a test runner) needs to see
+	 * every follower the daemon reports under the driver,
+	 * regardless of whether it would survive the scheduling-DAG
+	 * inclusion filters. */
+	bool                  debug_dump_raw_graph;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -1606,6 +1617,123 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 		     drv->node ? drv->node->info.id : (uint32_t)-1);
 }
 
+/* Build a raw-graph diagnostic snapshot of the driver as seen on the
+ * main loop and emit it via pw_log_info. The dump is the unfiltered
+ * view: every follower the driver reports, every link the daemon
+ * exposes, with each follower's analyzability bits and each edge's
+ * within-period flags recorded as bitmasks the renderer translates
+ * into stable tokens. The eventual scheduling-DAG slice will
+ * subtract from this view -- async / feedback / exported / main-loop
+ * / unknown-tid entries that do not contribute an in-period
+ * precedence constraint -- but observability happens first, before
+ * inclusion semantics change.
+ *
+ * The function is called from the snapshot path, which already
+ * walks the same follower / port / link lists for the worker's
+ * topology view, so the work is bounded by the same set the
+ * scheduler already pays for once per topology-fingerprint change.
+ */
+static void dump_raw_graph_main(struct impl *impl, struct node *drv)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	struct rt_diag_raw_snapshot snap;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	int r;
+
+	rt_diag_raw_snapshot_init(&snap);
+	snap.driver_id = dnode->info.id;
+	snap.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+	snap.period_ns = drv->topo.period;
+	/* End-to-end deadline reporting is the scheduling-DAG slice's
+	 * responsibility; until that lands, mirror the period so the
+	 * field is still meaningful for a same-period driver. */
+	snap.deadline_ns = drv->topo.period;
+
+	/* Walk every follower attached to the driver (the driver
+	 * itself is in its own follower_list, surfaced with the
+	 * driver bit). */
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct rt_diag_raw_node rn;
+		memset(&rn, 0, sizeof(rn));
+		rn.id = n_iter->info.id;
+		rn.driver_id = dnode->info.id;
+		rn.tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		rn.flags = RT_DIAG_RAW_NODE_DATA_LOOP;
+		if (n_iter == dnode)
+			rn.flags |= RT_DIAG_RAW_NODE_DRIVER;
+		if (n_iter->async)
+			rn.flags |= RT_DIAG_RAW_NODE_ASYNC;
+		if (n_iter->remote)
+			rn.flags |= RT_DIAG_RAW_NODE_REMOTE;
+		if (n_iter->exported)
+			rn.flags |= RT_DIAG_RAW_NODE_EXPORTED;
+		if (pw_properties_get_bool(n_iter->properties,
+				PW_KEY_NODE_LOOP_DYNAMIC, false))
+			rn.flags |= RT_DIAG_RAW_NODE_DYNAMIC_LOOP;
+		if (n_iter->name != NULL)
+			snprintf(rn.name, sizeof(rn.name), "%s", n_iter->name);
+		r = rt_diag_raw_snapshot_add_node(&snap, &rn);
+		if (r < 0)
+			goto cleanup;
+	}
+
+	/* Edges: walk every follower's output ports and the link list
+	 * on each port. Feedback / async links are surfaced via flags
+	 * so the renderer's reader can correlate a raw edge against
+	 * the eventual scheduling-DAG exclusion list. */
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &n_iter->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				struct rt_diag_raw_edge re = { 0 };
+				if (l->input == NULL || l->input->node == NULL)
+					continue;
+				re.src = n_iter->info.id;
+				re.dst = l->input->node->info.id;
+				if (l->feedback)
+					re.flags |= RT_DIAG_RAW_EDGE_FEEDBACK;
+				if (l->output != NULL && l->output->node != NULL &&
+				    (l->output->node->async ||
+				     l->input->node->async))
+					re.flags |= RT_DIAG_RAW_EDGE_ASYNC;
+				r = rt_diag_raw_snapshot_add_edge(&snap, &re);
+				if (r < 0)
+					goto cleanup;
+			}
+		}
+	}
+
+	fp = open_memstream(&buf, &len);
+	if (fp == NULL)
+		goto cleanup;
+	rt_diag_raw_snapshot_render_text(&snap, fp);
+	fclose(fp);
+	/* The PipeWire logger prefers one logical line per pw_log_info
+	 * call; emit the rendered text line by line so multi-line
+	 * snapshots render cleanly in journalctl / pw.log. */
+	if (buf != NULL) {
+		char *cursor = buf;
+		while (*cursor != '\0') {
+			char *nl = strchr(cursor, '\n');
+			if (nl != NULL)
+				*nl = '\0';
+			pw_log_info("%s", cursor);
+			if (nl == NULL)
+				break;
+			cursor = nl + 1;
+		}
+	}
+
+cleanup:
+	free(buf);
+	rt_diag_raw_snapshot_fini(&snap);
+}
+
 /* Main-loop context: walk the driver's follower list and the
  * follower ports/links to capture a self-contained topology snapshot
  * that the worker can consume without further main-loop access. */
@@ -1740,6 +1868,8 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 			 * nodes/edges arrays) observes the freshly-written
 			 * topology atomically. */
 			SPA_ATOMIC_STORE(t->generation, t->generation + 1);
+			if (drv->impl != NULL && drv->impl->debug_dump_raw_graph)
+				dump_raw_graph_main(drv->impl, drv);
 		}
 	}
 	SPA_ATOMIC_STORE(t->pending, 0);
@@ -2337,6 +2467,12 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		else
 			pw_log_warn("wcet.min-samples %s ignored", s);
 	}
+
+	impl->debug_dump_raw_graph = pw_properties_get_bool(props,
+			"debug.dump-raw-graph", false);
+	if (impl->debug_dump_raw_graph)
+		pw_log_info("debug.dump-raw-graph = true (raw-graph diagnostic"
+				" dumps will be logged on topology change)");
 
 	impl->recalc_persistent = pw_properties_get_bool(props, "recalc.persistent", true);
 	impl->wcet_recalc_threshold = 0.01;

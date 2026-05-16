@@ -104,6 +104,15 @@ test('test-module-deadline-sched-groups',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-diag',
+    executable('test-module-deadline-diag',
+               'test-module-deadline-diag.c',
+               '../src/modules/module-deadline/diag.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',
