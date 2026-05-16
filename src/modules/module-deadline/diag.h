@@ -438,6 +438,15 @@ struct rt_diag_param_node {
 	double   mbpta_sigma;
 	uint32_t mbpta_convergence_streak;
 	uint32_t mbpta_iid_reject_streak;
+
+	/* Effective per-node exceedance probability used in the
+	 * Gumbel inverse-CDF evaluation, after the
+	 * working-precision floor (Cucu-Grosjean 2012 §III-D step 6,
+	 * 1e-16) is applied. mbpta_eps_node_capped is true iff the
+	 * floor clipped the configured value -- surface both so the
+	 * runtime probabilistic guarantee in effect is visible. */
+	double   mbpta_effective_eps_node;
+	bool     mbpta_eps_node_capped;
 };
 
 struct rt_diag_params_snapshot {

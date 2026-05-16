@@ -22,6 +22,28 @@
 
 #include "mbpta.h"
 
+/* Working-precision floor for the per-node exceedance target.
+ * Cucu-Grosjean 2012 §III-D step 6 evaluates pWCET via the Gumbel
+ * inverse CDF
+ *
+ *     pWCET(eps) = mu - sigma * ln(-ln(1 - eps)),
+ *
+ * which is numerically degenerate as `eps` approaches the IEEE-754
+ * subnormal range: `1 - eps` rounds to 1.0 (cancellation loses every
+ * significant bit) and the inner log becomes 0, the outer log
+ * diverges, and the extrapolated quantile collapses to mu - sigma *
+ * (-inf). The paper picks 10^-16 as its working precision; clamp at
+ * the same floor and surface the effective value in diagnostics so a
+ * configuration that hit the cap is observable. */
+#define MBPTA_EPS_NODE_FLOOR 1.0e-16
+
+static double mbpta_effective_eps_value(double cfg_eps)
+{
+	if (cfg_eps < MBPTA_EPS_NODE_FLOOR)
+		return MBPTA_EPS_NODE_FLOOR;
+	return cfg_eps;
+}
+
 const char *mbpta_state_name(enum mbpta_state s)
 {
 	switch (s) {
@@ -490,9 +512,11 @@ static void mbpta_step(mbpta_t *e)
 		if (e->crps <= e->cfg.crps_threshold) {
 			e->convergence_streak++;
 			if (e->convergence_streak >= e->cfg.n_conv) {
+				double eps_eff = mbpta_effective_eps_value(
+						e->cfg.eps_node);
 				e->state = MBPTA_PWCET_VALID;
 				e->pwcet_ns_cached = (uint64_t)(mu - sigma *
-					log(-log(1.0 - e->cfg.eps_node)));
+					log(-log(1.0 - eps_eff)));
 			} else {
 				e->state = MBPTA_PENDING_CONVERGENCE;
 			}
@@ -569,4 +593,18 @@ uint64_t mbpta_pwcet_ns(const mbpta_t *e)
 	if (e == NULL || e->state != MBPTA_PWCET_VALID)
 		return 0;
 	return e->pwcet_ns_cached;
+}
+
+double mbpta_effective_eps_node(const mbpta_t *e)
+{
+	if (e == NULL)
+		return 0.0;
+	return mbpta_effective_eps_value(e->cfg.eps_node);
+}
+
+bool mbpta_eps_node_capped(const mbpta_t *e)
+{
+	if (e == NULL)
+		return false;
+	return e->cfg.eps_node < MBPTA_EPS_NODE_FLOOR;
 }

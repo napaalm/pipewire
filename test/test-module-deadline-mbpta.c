@@ -266,6 +266,61 @@ PWTEST(mbpta_non_gumbel_distribution_rejects_fit)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_eps_node_at_floor_is_not_capped)
+{
+	/* The Cucu-Grosjean 2012 §III-D step 6 working-precision
+	 * floor is 1e-16; an exactly-floor configuration should be
+	 * passed through unchanged. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+
+	c.eps_node = 1.0e-16;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	pwtest_bool_false(mbpta_eps_node_capped(e));
+	pwtest_bool_true(mbpta_effective_eps_node(e) == 1.0e-16);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_eps_node_below_floor_is_clamped)
+{
+	/* Anything below the working-precision floor clamps up to
+	 * 1e-16 and the cap-engaged flag flips. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+
+	c.eps_node = 1.0e-30;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	pwtest_bool_true(mbpta_eps_node_capped(e));
+	pwtest_bool_true(mbpta_effective_eps_node(e) == 1.0e-16);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_eps_node_above_floor_passes_through)
+{
+	/* The default eps_node (1e-9, plan §8.6) is well above the
+	 * floor and should report uncapped with the exact value. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+
+	c.eps_node = 1.0e-9;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	pwtest_bool_false(mbpta_eps_node_capped(e));
+	pwtest_bool_true(mbpta_effective_eps_node(e) == 1.0e-9);
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_mbpta)
 {
 	pwtest_add(mbpta_state_name_stable, PWTEST_NOARG);
@@ -277,6 +332,9 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_invalidate_resets_state, PWTEST_NOARG);
 	pwtest_add(mbpta_drift_after_sustained_iid_rejection, PWTEST_NOARG);
 	pwtest_add(mbpta_non_gumbel_distribution_rejects_fit, PWTEST_NOARG);
+	pwtest_add(mbpta_eps_node_at_floor_is_not_capped, PWTEST_NOARG);
+	pwtest_add(mbpta_eps_node_below_floor_is_clamped, PWTEST_NOARG);
+	pwtest_add(mbpta_eps_node_above_floor_passes_through, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

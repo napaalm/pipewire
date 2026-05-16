@@ -192,6 +192,17 @@ uint32_t mbpta_iid_reject_streak(const mbpta_t *e);
  * Returns 0 when state != PWCET_VALID. */
 uint64_t mbpta_pwcet_ns(const mbpta_t *e);
 
+/* Effective per-node exceedance probability actually used to
+ * compute pWCET. Equal to cfg.eps_node when that value is at or
+ * above the working-precision floor (1e-16, the value Cucu-Grosjean
+ * 2012 §III-D step 6 quotes), otherwise clamped to the floor so the
+ * Gumbel inverse-CDF evaluation stays in the representable range.
+ * mbpta_eps_node_capped() is true exactly when the clamp was
+ * applied; surface both in diagnostics so an operator-set value
+ * below the floor is observable. */
+double mbpta_effective_eps_node(const mbpta_t *e);
+bool   mbpta_eps_node_capped(const mbpta_t *e);
+
 #ifdef __cplusplus
 }
 #endif

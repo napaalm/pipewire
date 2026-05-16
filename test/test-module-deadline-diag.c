@@ -482,14 +482,16 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
-		" mbpta_conv=0 mbpta_iid_reject=0\n"
+		" mbpta_conv=0 mbpta_iid_reject=0"
+		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
 		" budget_kind=bootstrap_fallback budget_samples=0"
 		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
 		" mbpta_mu=0 mbpta_sigma=0"
 		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
-		" mbpta_conv=0 mbpta_iid_reject=0\n";
+		" mbpta_conv=0 mbpta_iid_reject=0"
+		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -502,6 +504,8 @@ PWTEST(diag_params_render_text_golden)
 	n.cpu = 4; n.applied = true;
 	n.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
 	n.budget_sample_count = 128;
+	n.mbpta_effective_eps_node = 1.0e-9;
+	n.mbpta_eps_node_capped = false;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 	n.id = 38; n.tid = 302371;
 	n.runtime_budget_ns = 42620; n.local_deadline_ns = 21333333;
@@ -509,6 +513,8 @@ PWTEST(diag_params_render_text_golden)
 	n.cpu = 5; n.applied = false;
 	n.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
 	n.budget_sample_count = 0;
+	n.mbpta_effective_eps_node = 1.0e-16;
+	n.mbpta_eps_node_capped = true;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 
 	fp = open_memstream(&buf, &len);
@@ -595,7 +601,9 @@ PWTEST(diag_json_full_golden)
 		"\"ks_stat\":0.041000,\"runs_z\":-0.230000,"
 		"\"crps\":0.072000,"
 		"\"convergence_streak\":4,"
-		"\"iid_reject_streak\":0}}]},"
+		"\"iid_reject_streak\":0,"
+		"\"effective_eps_node\":0.0000000010000000,"
+		"\"eps_node_capped\":false}}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -649,6 +657,8 @@ PWTEST(diag_json_full_golden)
 	pn.mbpta_crps = 0.072;
 	pn.mbpta_convergence_streak = 4;
 	pn.mbpta_iid_reject_streak = 0;
+	pn.mbpta_effective_eps_node = 1.0e-9;
+	pn.mbpta_eps_node_capped = false;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;

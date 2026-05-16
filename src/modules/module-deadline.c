@@ -2460,6 +2460,10 @@ static int populate_params_snapshot(struct impl *impl,
 				mbpta_convergence_streak(mn->mbpta);
 			pn.mbpta_iid_reject_streak =
 				mbpta_iid_reject_streak(mn->mbpta);
+			pn.mbpta_effective_eps_node =
+				mbpta_effective_eps_node(mn->mbpta);
+			pn.mbpta_eps_node_capped =
+				mbpta_eps_node_capped(mn->mbpta);
 		} else {
 			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
 			pn.mbpta_pwcet_ns = 0;
