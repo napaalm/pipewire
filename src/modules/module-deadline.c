@@ -509,7 +509,8 @@ struct node {
 	 * the next reconcile retries. last_applied=false means "never
 	 * applied; first call must issue the syscalls". */
 	uint64_t last_runtime;
-	uint64_t last_deadline;
+	uint64_t last_deadline;            /* kernel-API local deadline */
+	uint64_t last_cumulative_deadline; /* graph-relative milestone, for snapshots */
 	uint64_t last_period;
 	uint32_t last_cpu;
 	bool     last_applied;
@@ -905,9 +906,16 @@ static int set_cpu_affinity(pid_t tid, int cpu)
  * keeps dag_foreach_node free of syscall jitter, which matters in
  * sync mode where the foreach runs on the RT data-loop thread. */
 static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu)
 {
 	struct impl *impl = data;
+	/* The kernel-API value the sched_setattr() chain consumes is
+	 * the local (kernel-relative) deadline. The graph-relative
+	 * cumulative deadline travels alongside for the future
+	 * max-aggregation hotfix and for the JSON snapshot. */
+	uint64_t deadline = local_deadline;
+	(void)cumulative_deadline;
 
 	/* Denormalise runtime from reference-CPU units into kernel
 	 * units for the placement CPU. The sketch holds WCETs as if the
@@ -935,6 +943,16 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 	/* -EINVAL (tid <= 0) is silently ignored: a follower with no
 	 * published thread can't be scheduled, same as before the
 	 * extraction. */
+
+	/* Stamp the per-follower graph-relative milestone on the
+	 * caller's struct node so populate_params_snapshot can surface
+	 * cumulative and local deadlines separately. apply_sched_groups
+	 * later overwrites the kernel-side fields (runtime, local
+	 * deadline, period, cpu) on the group's leader follower; the
+	 * cumulative deadline is per-follower and lands here. */
+	struct node *mn = find_node_by_id(impl, id);
+	if (mn != NULL)
+		mn->last_cumulative_deadline = cumulative_deadline;
 }
 
 /* Per-group apply pass.
@@ -2231,7 +2249,14 @@ static int populate_params_snapshot(struct impl *impl,
 		if (mn != NULL && mn->last_applied) {
 			pn.runtime_budget_ns = mn->last_runtime;
 			pn.local_deadline_ns = mn->last_deadline;
-			pn.cumulative_deadline_ns = mn->last_deadline;
+			/* The cumulative deadline is graph-relative and
+			 * stamped per-follower by sched_cb; it may be
+			 * zero on a follower whose first sched_cb has
+			 * not yet fired (a transient that the next
+			 * recalc round clears). */
+			pn.cumulative_deadline_ns = mn->last_cumulative_deadline
+				!= 0 ? mn->last_cumulative_deadline
+				     : mn->last_deadline;
 			pn.period_ns = mn->last_period;
 			pn.cpu = mn->last_cpu;
 			pn.applied = true;

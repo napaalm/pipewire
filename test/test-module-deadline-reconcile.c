@@ -40,15 +40,17 @@ struct cb_ctx {
 };
 
 static void cb_record(void *data, uint32_t id, pid_t tid, uint64_t runtime,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu)
 {
 	struct cb_ctx *c = data;
 	uint32_t slot = c->calls % (uint32_t)SPA_N_ELEMENTS(c->last);
 
+	(void)cumulative_deadline;
 	c->last[slot].id = id;
 	c->last[slot].tid = tid;
 	c->last[slot].runtime = runtime;
-	c->last[slot].deadline = deadline;
+	c->last[slot].deadline = local_deadline;
 	c->last[slot].period = period;
 	c->last[slot].cpu = cpu;
 	c->calls++;

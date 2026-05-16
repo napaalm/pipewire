@@ -2325,6 +2325,116 @@ static int assign_cpus(dag_t *g)
 	return 0;
 }
 
+/* Forward topological pass: assign each real node a graph-relative
+ * cumulative deadline equal to max(pred.cumulative_deadline) +
+ * own splitter slice (node->deadline). Source nodes (no real
+ * predecessor) inherit their splitter slice directly. Fictitious
+ * endpoints are zeroed; the splitter never schedules them via the
+ * kernel.
+ *
+ * The result is the analysis layer's natural unit: a milestone
+ * measured from the driver-graph's activation. The follow-up step
+ * dag_compute_local_deadlines() converts it back to the kernel
+ * API's relative form.
+ *
+ * Requires g->indexed_nodes to be populated in topological order
+ * (dag_build_analysis already does this for the longest-path
+ * passes the splitter consumes). Skips quietly when the cache is
+ * absent.
+ */
+static void dag_assign_cumulative_deadlines(dag_t *g)
+{
+	if (!g || !g->indexed_nodes)
+		return;
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		uint64_t max_pred = 0;
+		dag_edge_t *e;
+
+		if (n->fictitious) {
+			n->cumulative_deadline = 0;
+			n->local_deadline = 0;
+			continue;
+		}
+
+		spa_list_for_each(e, &n->incoming, dst_link) {
+			if (e->src->fictitious)
+				continue;
+			if (e->src->cumulative_deadline > max_pred)
+				max_pred = e->src->cumulative_deadline;
+		}
+
+		n->cumulative_deadline = max_pred + n->deadline;
+	}
+}
+
+bool dag_compute_local_deadlines(dag_t *g)
+{
+	if (!g || !g->indexed_nodes) {
+		errno = EINVAL;
+		return false;
+	}
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		uint64_t max_pred = 0;
+		dag_edge_t *e;
+		bool has_real_pred = false;
+
+		if (n->fictitious) {
+			n->local_deadline = 0;
+			continue;
+		}
+
+		spa_list_for_each(e, &n->incoming, dst_link) {
+			if (e->src->fictitious)
+				continue;
+			/* Monotonicity: every real predecessor's
+			 * cumulative deadline must be <= this node's.
+			 * Failure means the analysis layer produced
+			 * inconsistent cumulative milestones, which would
+			 * also break the path-sum constraint. */
+			if (e->src->cumulative_deadline > n->cumulative_deadline) {
+				pw_log_error("non-monotonic cumulative deadline "
+					     "along edge %u -> %u "
+					     "(%" PRIu64 " > %" PRIu64 ")",
+					     e->src->id, n->id,
+					     e->src->cumulative_deadline,
+					     n->cumulative_deadline);
+				errno = EINVAL;
+				return false;
+			}
+			if (e->src->cumulative_deadline > max_pred)
+				max_pred = e->src->cumulative_deadline;
+			has_real_pred = true;
+		}
+
+		if (!has_real_pred) {
+			/* Source node: local equals cumulative -- the
+			 * node is released at the graph's activation. */
+			n->local_deadline = n->cumulative_deadline;
+		} else {
+			n->local_deadline = n->cumulative_deadline - max_pred;
+		}
+
+		if (n->local_deadline == 0) {
+			pw_log_error("node %u has zero local deadline after "
+				     "cumulative-to-local conversion", n->id);
+			errno = EINVAL;
+			return false;
+		}
+		if (n->local_deadline > g->period) {
+			/* The kernel SCHED_DEADLINE contract requires
+			 * runtime <= deadline <= period. A local deadline
+			 * above the period would let the splitter assign
+			 * an unbounded budget; clamp explicitly so the
+			 * downstream sched_setattr() validation cannot
+			 * see an invalid input. */
+			n->local_deadline = g->period;
+		}
+	}
+	return true;
+}
+
 int dag_recalculate(dag_t *g)
 {
 	// register initial time
@@ -2402,6 +2512,25 @@ int dag_recalculate(dag_t *g)
 		return -1;
 	}
 
+	/* Forward topological pass: now that every real node carries
+	 * its splitter-assigned per-node slice, populate the explicit
+	 * graph-relative milestone (cumulative_deadline) and the
+	 * kernel-relative deadline (local_deadline). The two fields
+	 * are derived purely from the splitter's output and the DAG
+	 * structure; the legacy `deadline` member is left untouched
+	 * for the in-flight callers that have not yet migrated. */
+	dag_assign_cumulative_deadlines(g);
+
+	/* Convert the freshly-populated cumulative deadlines to
+	 * kernel-API relative deadlines. Monotonicity and
+	 * 0 < local <= period are validated here; failure marks the
+	 * DAG dirty so a caller-side retry can reassign. */
+	if (!dag_compute_local_deadlines(g)) {
+		dag_mark_dirty(g);
+		errno = EINVAL;
+		return -1;
+	}
+
 	if (assign_cpus(g) < 0) {
 		dag_mark_dirty(g);
 		return -1;
@@ -2439,7 +2568,9 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 	spa_list_for_each(n, &g->nodes, link) {
 		if (n->fictitious)
 			continue;
-		cb(data, n->id, n->tid, n->wcet, n->deadline, g->period, n->cpu);
+		cb(data, n->id, n->tid, n->wcet,
+		   n->cumulative_deadline, n->local_deadline,
+		   g->period, n->cpu);
 	}
 
 	return 0;

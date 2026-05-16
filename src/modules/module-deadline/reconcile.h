@@ -93,13 +93,18 @@ typedef struct {
 /*
  * Sched callback signature. Identical to dag_foreach_node's
  * callback. Called once per real follower per reconcile_apply with
- * the freshly assigned (runtime, deadline, period, cpu) tuple; the
- * implementation in module-deadline.c is sched_cb, which applies
- * SCHED_DEADLINE + CPU affinity via syscalls (gated by the per-
- * follower last-applied tuple cache to skip no-op syscalls).
+ * the freshly assigned (runtime, cumulative_deadline, local_deadline,
+ * period, cpu) tuple; the implementation in module-deadline.c is
+ * sched_cb, which applies SCHED_DEADLINE + CPU affinity via
+ * syscalls (gated by the per-follower last-applied tuple cache to
+ * skip no-op syscalls). The kernel call consumes `local_deadline`
+ * (kernel-relative), while `cumulative_deadline` (graph-relative)
+ * is preserved for sound max-aggregation across fused-thread
+ * members and for the JSON / debug snapshots.
  */
 typedef void (*reconcile_sched_cb_t)(void *data, uint32_t id, pid_t tid,
-		uint64_t runtime, uint64_t deadline,
+		uint64_t runtime,
+		uint64_t cumulative_deadline, uint64_t local_deadline,
 		uint64_t period, uint32_t cpu);
 
 /* Allocate and initialize a reconcile state. `n_cpus` and

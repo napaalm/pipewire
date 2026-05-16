@@ -262,6 +262,29 @@ dag_node_t *dag_find_node(dag_t *g, uint32_t id);
 /* Recalculate scheduling parameters after changes */
 int dag_recalculate(dag_t *g);
 
+/* Compute every real node's local_deadline from its already-populated
+ * cumulative_deadline using the kernel-API conversion
+ *
+ *   local_deadline = cumulative_deadline - max(pred.cumulative_deadline)
+ *
+ * with the boundary rule that a source node (no real predecessor)
+ * has local_deadline = cumulative_deadline. Returns true on
+ * success, false on any of:
+ *
+ *   - g or g->indexed_nodes is NULL,
+ *   - cumulative_deadline is non-monotonic along some edge,
+ *   - the conversion yields zero or a value greater than g->period
+ *     for any real node (the kernel SCHED_DEADLINE contract rejects
+ *     zero deadlines and a deadline above the period).
+ *
+ * The function does not touch g->dirty: it is callable as a
+ * post-contraction step from the analysis layer once
+ * cumulative_deadline has been assigned. dag_recalculate runs it
+ * automatically as the closing step of the splitter pass; external
+ * callers (Phase 2's contracted DAG) invoke it directly.
+ */
+bool dag_compute_local_deadlines(dag_t *g);
+
 /* Return true if the DAG currently contains a cycle. Walks the
  * graph independently of the indexed-nodes cache so the caller may
  * invoke it even before dag_recalculate. Defense-in-depth for the
@@ -271,9 +294,23 @@ bool dag_has_cycle(dag_t *g);
 /* Apply a function to all real nodes with their current scheduling
  * parameters. The id is passed alongside the tid so the caller can
  * look up its own per-node state (e.g. the sched_setattr skip
- * cache) without rebuilding a tid index. */
+ * cache) without rebuilding a tid index.
+ *
+ * The deadline is exposed in two forms:
+ *   - cumulative_deadline: graph-relative milestone. Useful for the
+ *     contracted-DAG analysis and for sound max-aggregation across
+ *     a fused thread's members (a chain's externally observable
+ *     completion bound).
+ *   - local_deadline: kernel-relative. This is the value the
+ *     caller must hand to sched_setattr() for the corresponding
+ *     thread; it is `cumulative_deadline - max(pred.cumulative)`
+ *     and equals the legacy per-node deadline slice produced by
+ *     the splitter for a single non-fused node.
+ */
 typedef void (*dag_node_callback_t)(void *data, uint32_t id, pid_t tid,
-		uint64_t wcet, uint64_t deadline, uint64_t period, uint32_t cpu);
+		uint64_t wcet,
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu);
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data);
 
 void dag_print(dag_t *g);

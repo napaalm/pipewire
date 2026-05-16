@@ -139,12 +139,14 @@ struct foreach_info {
 };
 
 static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu)
 {
 	struct foreach_info *info = data;
 
 	(void)id;
-	(void)deadline;
+	(void)cumulative_deadline;
+	(void)local_deadline;
 	(void)period;
 	(void)cpu;
 
@@ -153,15 +155,11 @@ static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		info->saw_internal_tid = true;
 }
 
-/* Smoke test for the explicit deadline fields. The legacy `deadline`
- * member is preserved; cumulative_deadline and local_deadline are
- * new fields with explicit graph-vs-kernel semantics. At this
- * commit they are zero-initialised and remain zero across
- * dag_recalculate -- a later commit wires the actual computation.
- * This test pins the field contract: every real node starts with
- * zero cumulative / local deadlines, and the values do not regress
- * to anything else during the analysis pass. */
-PWTEST(explicit_deadline_fields_zero_initialised)
+/* Pin the contract for the explicit deadline fields after
+ * dag_recalculate: cumulative > 0 on every real node, local > 0 and
+ * <= cumulative, monotonicity along every edge, and source nodes
+ * (no real predecessor) have local == cumulative. */
+PWTEST(explicit_deadline_fields_populated_after_recalc)
 {
 	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
 	pwtest_ptr_notnull(g);
@@ -174,18 +172,171 @@ PWTEST(explicit_deadline_fields_zero_initialised)
 	dag_node_t *n2 = find_node_by_id(g, 2);
 	pwtest_int_eq((int)n1->cumulative_deadline, 0);
 	pwtest_int_eq((int)n1->local_deadline, 0);
-	pwtest_int_eq((int)n2->cumulative_deadline, 0);
-	pwtest_int_eq((int)n2->local_deadline, 0);
 
 	pwtest_int_eq(dag_recalculate(g), 0);
 
-	/* Legacy deadline field is populated by the splitter; the
-	 * explicit fields stay at zero until the populate pass lands. */
 	pwtest_bool_true(n1->deadline > 0);
-	pwtest_int_eq((int)n1->cumulative_deadline, 0);
-	pwtest_int_eq((int)n1->local_deadline, 0);
-	pwtest_int_eq((int)n2->cumulative_deadline, 0);
-	pwtest_int_eq((int)n2->local_deadline, 0);
+	pwtest_bool_true(n1->cumulative_deadline > 0);
+	pwtest_bool_true(n1->local_deadline > 0);
+	pwtest_bool_true(n2->cumulative_deadline > 0);
+	pwtest_bool_true(n2->local_deadline > 0);
+	/* Source: local equals cumulative (no real predecessor). */
+	pwtest_int_eq((int)n1->local_deadline, (int)n1->cumulative_deadline);
+	/* Monotonicity along the only real edge. */
+	pwtest_bool_true(n1->cumulative_deadline <= n2->cumulative_deadline);
+	/* For a non-source the local-vs-cumulative relation holds. */
+	pwtest_int_eq((int)n2->local_deadline,
+		      (int)(n2->cumulative_deadline - n1->cumulative_deadline));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Chain A->B->C: with the splitter producing per-node slices, the
+ * forward sum populates monotonically increasing cumulative
+ * deadlines; the local-deadline conversion produces the original
+ * per-node slices for the source and the difference downstream.
+ * Pins the kernel-API conversion the plan's pseudocode requires. */
+PWTEST(local_deadline_conversion_chain)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+
+	/* Cumulative is monotone non-decreasing along edges. */
+	pwtest_bool_true(a->cumulative_deadline <= b->cumulative_deadline);
+	pwtest_bool_true(b->cumulative_deadline <= c->cumulative_deadline);
+	/* Source: local == cumulative. */
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+	/* Non-source: local equals cumulative delta. */
+	pwtest_int_eq((int)b->local_deadline,
+		      (int)(b->cumulative_deadline - a->cumulative_deadline));
+	pwtest_int_eq((int)c->local_deadline,
+		      (int)(c->cumulative_deadline - b->cumulative_deadline));
+	/* Sink cumulative <= global D (the splitter enforces this
+	 * before this commit's pass runs). */
+	pwtest_bool_true(c->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Join A->C, B->C: local_deadline[C] = cumulative[C] - max(cumulative
+ * of predecessors). The forward sum picks the longer path. */
+PWTEST(local_deadline_conversion_join_uses_max_pred)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 300, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 200, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+
+	uint64_t max_pred = a->cumulative_deadline >= b->cumulative_deadline
+		? a->cumulative_deadline : b->cumulative_deadline;
+	pwtest_int_eq((int)c->local_deadline,
+		      (int)(c->cumulative_deadline - max_pred));
+	pwtest_bool_true(c->cumulative_deadline >= max_pred);
+	pwtest_bool_true(c->local_deadline > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* dag_compute_local_deadlines is callable as a stand-alone transform
+ * once cumulative_deadline has been assigned externally (the
+ * contracted-DAG path will exercise this). Drive it with the plan's
+ * pseudocode example: cumulative (100, 250, 500) on A -> B -> C must
+ * yield local (100, 150, 250). */
+PWTEST(local_deadline_conversion_direct_pseudocode_example)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 50, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Overwrite cumulative deadlines with the plan's reference
+	 * values, then ask the conversion function to derive locals. */
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+	a->cumulative_deadline = 100;
+	b->cumulative_deadline = 250;
+	c->cumulative_deadline = 500;
+
+	pwtest_bool_true(dag_compute_local_deadlines(g));
+	pwtest_int_eq((int)a->local_deadline, 100);
+	pwtest_int_eq((int)b->local_deadline, 150);
+	pwtest_int_eq((int)c->local_deadline, 250);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Same shape, join topology: A -> C, B -> C with cumulative
+ * (100, 200, 500) must yield C.local = 300. */
+PWTEST(local_deadline_conversion_direct_join_example)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *c = find_node_by_id(g, 3);
+	a->cumulative_deadline = 100;
+	b->cumulative_deadline = 200;
+	c->cumulative_deadline = 500;
+
+	pwtest_bool_true(dag_compute_local_deadlines(g));
+	pwtest_int_eq((int)a->local_deadline, 100);
+	pwtest_int_eq((int)b->local_deadline, 200);
+	pwtest_int_eq((int)c->local_deadline, 300);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Non-monotonic cumulatives are rejected before any kernel call. */
+PWTEST(local_deadline_conversion_rejects_nonmonotonic)
+{
+	dag_t *g = dag_create(1000, 500, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	a->cumulative_deadline = 300;
+	b->cumulative_deadline = 200;
+
+	pwtest_bool_false(dag_compute_local_deadlines(g));
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -707,18 +858,20 @@ struct dirty_test_stats {
 };
 
 static void dirty_test_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
-		uint64_t deadline, uint64_t period, uint32_t cpu)
+		uint64_t cumulative_deadline, uint64_t local_deadline,
+		uint64_t period, uint32_t cpu)
 {
 	struct dirty_test_stats *s = data;
 
 	(void)id;
 	(void)tid;
 	(void)wcet;
+	(void)cumulative_deadline;
 	(void)period;
 	(void)cpu;
 
 	s->callbacks++;
-	s->deadline_sum += deadline;
+	s->deadline_sum += local_deadline;
 }
 
 /* after a clean recalc, a second dag_foreach_node with
@@ -2962,7 +3115,12 @@ PWTEST(unrelated_collapse_no_groups_matches_baseline)
 
 PWTEST_SUITE(module_deadline_dag)
 {
-	pwtest_add(explicit_deadline_fields_zero_initialised, PWTEST_NOARG);
+	pwtest_add(explicit_deadline_fields_populated_after_recalc, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_chain, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_join_uses_max_pred, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_direct_pseudocode_example, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_direct_join_example, PWTEST_NOARG);
+	pwtest_add(local_deadline_conversion_rejects_nonmonotonic, PWTEST_NOARG);
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);
