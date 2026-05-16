@@ -426,7 +426,10 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 		return -1;
 	}
 	if (wcet == 0 && !fictitious) {
-		pw_log_error("Cannot add node %u with wcet=0", id);
+		/* Transient: a freshly registered follower can race ahead
+		 * of the first measured cycle. The reconciler retries on
+		 * the next driver completion once prev_run_time lands. */
+		pw_log_debug("Cannot add node %u with wcet=0", id);
 		errno = EINVAL;
 		return -1;
 	}
@@ -1652,7 +1655,7 @@ static int dag_build_analysis(dag_t *g, dag_node_t **sources, uint32_t nsources,
 		goto error;
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-	pw_log_error("Unrelated set computation took %.6f seconds", elapsed);
+	pw_log_debug("Unrelated set computation took %.6f seconds", elapsed);
 
 	return 0;
 
@@ -2400,13 +2403,11 @@ int dag_recalculate(dag_t *g)
 		return -1;
 	}
 
-	dag_print(g); // DEBUG
-	// register end time and log duration
 	struct timespec end_time;
 	clock_gettime(CLOCK_MONOTONIC, &end_time);
 	double duration = (end_time.tv_sec - start_time.tv_sec) +
 		(end_time.tv_nsec - start_time.tv_nsec) / 1e9;
-	pw_log_info("DAG recalculation completed in %.6f seconds", duration);
+	pw_log_debug("DAG recalculation completed in %.6f seconds", duration);
 
 	/* Success: the cached schedule is now clean. */
 	g->dirty = false;
@@ -2441,15 +2442,27 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 }
 
 void dag_node_dump_unrelated(dag_t *g) {
+  char buf[1024];
+  size_t off = 0;
   for (uint32_t i = 0; i < g->unrelated_size; i++) {
-    printf("{ ");
+    int wrote = snprintf(buf + off, sizeof(buf) - off, "{ ");
+    if (wrote < 0 || (size_t)wrote >= sizeof(buf) - off) break;
+    off += (size_t)wrote;
     int k = 0;
-    for (uint32_t j = 0; j < g->indexed_count; j++)
-      if (bitset_test(g->unrelated[i], j))
-        printf("%s%d", k++ > 0 ? ", " : "", j);
-    printf(" }%s", i < g->unrelated_size - 1 ? ", " : "");
+    for (uint32_t j = 0; j < g->indexed_count; j++) {
+      if (!bitset_test(g->unrelated[i], j))
+        continue;
+      wrote = snprintf(buf + off, sizeof(buf) - off,
+              "%s%u", k++ > 0 ? ", " : "", j);
+      if (wrote < 0 || (size_t)wrote >= sizeof(buf) - off) break;
+      off += (size_t)wrote;
+    }
+    wrote = snprintf(buf + off, sizeof(buf) - off, " }%s",
+            i < g->unrelated_size - 1 ? ", " : "");
+    if (wrote < 0 || (size_t)wrote >= sizeof(buf) - off) break;
+    off += (size_t)wrote;
   }
-  printf("\n");
+  pw_log_debug("Unrelated sets: %s", buf);
 }
 
 void dag_print(dag_t *g)

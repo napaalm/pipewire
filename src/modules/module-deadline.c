@@ -1166,7 +1166,12 @@ static inline uint64_t get_runtime_ns(struct pw_impl_node *node, struct pw_node_
 	uint64_t runtime = SPA_ATOMIC_LOAD(na->prev_run_time);
 	
 	if (runtime == 0 || runtime > UINT64_MAX / 2) {
-		pw_log_warn("invalid runtime %lu for node %d, using 0 instead", runtime, node->info.id);
+		/* Normal for a freshly activated follower: prev_run_time
+		 * is published on the cycle the node first ran. The
+		 * reconciler tolerates a 0 sample by skipping the node
+		 * for one round. */
+		pw_log_debug("invalid runtime %lu for node %d, using 0 instead",
+				runtime, node->info.id);
 		return 0;
 	}
 
