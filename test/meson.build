@@ -113,6 +113,15 @@ test('test-module-deadline-diag',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-contracted',
+    executable('test-module-deadline-contracted',
+               'test-module-deadline-contracted.c',
+               '../src/modules/module-deadline/contracted.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',
