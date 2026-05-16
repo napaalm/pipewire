@@ -1484,7 +1484,34 @@ static void apply_sample(struct impl *impl, struct node *n,
 	if (runtime > 0 && n->mbpta != NULL && sample_ref > 0.0)
 		(void)mbpta_add_sample(n->mbpta, (uint64_t)sample_ref);
 
-	if (!n->sketch_ready ||
+	/* Budget source selection, in declining order of provenance
+	 * strength (Cucu-Grosjean et al. 2012 §III):
+	 *
+	 *   1. MBPTA pWCET when the per-node estimator is
+	 *      PWCET_VALID and the operator has opted in via
+	 *      deadline.mbpta.accept_probabilistic_hard. This is
+	 *      the strongest claim the implementation produces --
+	 *      a tail-extrapolated bound at the configured
+	 *      exceedance probability eps_node.
+	 *   2. Sketch empirical quantile once the bootstrap-min
+	 *      gate has cleared. The result is a soft-real-time
+	 *      estimate only (Dunning & Ertl 2019 does not produce
+	 *      a worst-case bound).
+	 *   3. Peak-hold of the most recent sample when neither
+	 *      estimator is ready -- the bootstrap fallback.
+	 *
+	 * The peak-hold floor stays as a lower bound even when an
+	 * estimator is publishing, so a single spike that the
+	 * estimator has not yet incorporated still raises the
+	 * kernel runtime in the next cycle. */
+	if (n->mbpta != NULL &&
+	    impl->mbpta_accept_probabilistic_hard &&
+	    mbpta_state(n->mbpta) == MBPTA_PWCET_VALID) {
+		uint64_t p = mbpta_pwcet_ns(n->mbpta);
+		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
+			(uint64_t)sample_ref : 0;
+		n->wcet = SPA_MAX(p, sample_ref_u64);
+	} else if (!n->sketch_ready ||
 	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
 		/* Peak-hold fallback. n->wcet is stored in reference-CPU
 		 * units so it lines up with the sketch's eventual output;
@@ -2405,16 +2432,6 @@ static int populate_params_snapshot(struct impl *impl,
 		 * in via deadline.mbpta.accept_probabilistic_hard,
 		 * the kernel runtime will switch to mbpta_pwcet_ns
 		 * and the budget_kind will flip to PWCET. */
-		if (mn != NULL && mn->sketch_ready) {
-			uint32_t count = wcet_sketch_count(&mn->sketch);
-			pn.budget_sample_count = count;
-			pn.budget_kind = count >= impl->sketch_min_samples
-				? RT_DIAG_BUDGET_EMPIRICAL_QUANTILE
-				: RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
-		} else {
-			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
-			pn.budget_sample_count = 0;
-		}
 		if (mn != NULL && mn->mbpta != NULL) {
 			pn.mbpta_state =
 				(enum rt_diag_mbpta_state)mbpta_state(mn->mbpta);
@@ -2424,6 +2441,21 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
 			pn.mbpta_pwcet_ns = 0;
 			pn.mbpta_block_count = 0;
+		}
+		if (mn != NULL && mn->mbpta != NULL &&
+		    impl->mbpta_accept_probabilistic_hard &&
+		    mbpta_state(mn->mbpta) == MBPTA_PWCET_VALID) {
+			pn.budget_kind = RT_DIAG_BUDGET_PWCET;
+			pn.budget_sample_count = mbpta_sample_count(mn->mbpta);
+		} else if (mn != NULL && mn->sketch_ready) {
+			uint32_t count = wcet_sketch_count(&mn->sketch);
+			pn.budget_sample_count = count;
+			pn.budget_kind = count >= impl->sketch_min_samples
+				? RT_DIAG_BUDGET_EMPIRICAL_QUANTILE
+				: RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+		} else {
+			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+			pn.budget_sample_count = 0;
 		}
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
