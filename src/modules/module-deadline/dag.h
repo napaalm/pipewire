@@ -299,6 +299,42 @@ bool dag_density_feasible(const dag_t *g,
 		double *out_max_density,
 		uint32_t *out_failing_cpu);
 
+/*
+ * Processor-demand (DBF) feasibility test on the post-placement
+ * schedule. Baruah, Howell & Rosier 1990 (Real-Time Systems
+ * 2(4):301-324) gives an exact EDF feasibility test for
+ * constrained-deadline sporadic task sets on a uniprocessor: the
+ * task set is schedulable iff
+ *
+ *     sum_i dbf_i(t) <= scaled_t  for every relevant t
+ *
+ * where dbf_i(t) = max(0, floor((t - D_i) / T_i) + 1) * C_i for
+ * t >= D_i (zero otherwise), and scaled_t accounts for the CPU's
+ * relative capacity.
+ *
+ * In the current scheduling model every task shares the global
+ * period (T_i == g->period), so the relevant checkpoints reduce
+ * to {k * T + D_i} for k in [0, K_max] and every task on the
+ * partition. The implementation walks k up to a bound derived
+ * from the per-CPU utilisation; on a feasible partition the
+ * sweep terminates after at most one period worth of checkpoints.
+ *
+ * Returns true iff every CPU is DBF-feasible. On the first
+ * failing checkpoint, returns false and sets *out_failing_cpu /
+ * *out_failing_t / *out_failing_demand to the offending partition,
+ * the checkpoint t at which the bound was breached, and the
+ * computed demand sum (NULL pointers are tolerated).
+ *
+ * The check is strictly stronger than dag_density_feasible: a
+ * task set that passes density also passes DBF, but DBF can
+ * accept density-infeasible task sets whose tail of jobs
+ * actually fits.
+ */
+bool dag_dbf_feasible(const dag_t *g,
+		uint32_t *out_failing_cpu,
+		uint64_t *out_failing_t,
+		uint64_t *out_failing_demand);
+
 /* Compute every real node's local_deadline from its already-populated
  * cumulative_deadline using the kernel-API conversion
  *

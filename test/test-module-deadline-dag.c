@@ -483,6 +483,78 @@ PWTEST(density_null_safe)
 	return PWTEST_PASS;
 }
 
+/* --- processor-demand (DBF) feasibility (Baruah 1990) --- */
+
+PWTEST(dbf_feasible_single_task)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_dbf_feasible(g, NULL, NULL, NULL));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_infeasible_when_demand_exceeds_t)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	dag_node_t *n;
+	uint32_t failing_cpu;
+	uint64_t failing_t, failing_demand;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Force C > D so the first checkpoint t = D fails because
+	 * demand C > t. */
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+	n->wcet = n->local_deadline + 1;
+
+	pwtest_bool_false(dag_dbf_feasible(g, &failing_cpu, &failing_t,
+				&failing_demand));
+	pwtest_int_eq((int)failing_cpu, (int)n->cpu);
+	pwtest_bool_true(failing_t == n->local_deadline);
+	pwtest_bool_true(failing_demand > failing_t);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_passes_when_density_passes)
+{
+	/* A density-feasible schedule (every per-CPU density <= 1) is
+	 * also DBF-feasible: the dbf criterion is strictly weaker
+	 * than density for synchronously-released constrained-
+	 * deadline task sets. Construct a comfortably under-loaded
+	 * task set and verify both predicates agree. */
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 1003), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, NULL));
+	pwtest_bool_true(max_d <= 1.0);
+	pwtest_bool_true(dag_dbf_feasible(g, NULL, NULL, NULL));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(dbf_null_safe)
+{
+	pwtest_bool_false(dag_dbf_feasible(NULL, NULL, NULL, NULL));
+	return PWTEST_PASS;
+}
+
 PWTEST(chain_uses_peak_not_sum)
 {
 	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
@@ -3268,6 +3340,10 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(density_per_cpu_isolates_workloads, PWTEST_NOARG);
 	pwtest_add(density_relative_capacity_scaling, PWTEST_NOARG);
 	pwtest_add(density_null_safe, PWTEST_NOARG);
+	pwtest_add(dbf_feasible_single_task, PWTEST_NOARG);
+	pwtest_add(dbf_infeasible_when_demand_exceeds_t, PWTEST_NOARG);
+	pwtest_add(dbf_passes_when_density_passes, PWTEST_NOARG);
+	pwtest_add(dbf_null_safe, PWTEST_NOARG);
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);

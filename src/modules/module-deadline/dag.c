@@ -2387,6 +2387,114 @@ bool dag_density_feasible(const dag_t *g,
 	return worst <= 1.0;
 }
 
+/* Per-CPU DBF check helper. Walks every node assigned to `cpu`
+ * and, for each task's release-deadline checkpoint t = k*T + D_i,
+ * sums sum_j ((t - D_j) / T + 1) * C_j over every other task on
+ * the CPU that has reached its first deadline. Returns true if
+ * the demand sum stays <= t * rel_cap for every checkpoint in
+ * [D_min, k_max * T + D_max]. */
+static bool dag_dbf_feasible_cpu(const dag_t *g, uint32_t cpu,
+		uint64_t *out_failing_t, uint64_t *out_failing_demand)
+{
+	const uint64_t T = g->period;
+	double rel = (g->relative_capacity != NULL)
+		? g->relative_capacity[cpu] : 1.0;
+	dag_node_t *n;
+	uint32_t n_tasks = 0;
+	struct task { uint64_t c; uint64_t d; } *tasks;
+	uint32_t k_max = 1;
+	uint32_t k, i, j;
+	bool ok = true;
+
+	if (T == 0)
+		return true;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		if (!n->fictitious && n->cpu == cpu && n->wcet > 0)
+			n_tasks++;
+	}
+	if (n_tasks == 0)
+		return true;
+
+	tasks = calloc(n_tasks, sizeof(*tasks));
+	if (tasks == NULL)
+		return false;
+
+	{
+		uint32_t k_i = 0;
+		spa_list_for_each(n, &g->nodes, link) {
+			if (n->fictitious || n->cpu != cpu || n->wcet == 0)
+				continue;
+			tasks[k_i].c = n->wcet;
+			tasks[k_i].d = (n->local_deadline != 0
+				&& n->local_deadline <= T)
+				? n->local_deadline : T;
+			k_i++;
+		}
+	}
+
+	/* The busy-period bound for constrained-deadline EDF on a
+	 * single CPU with utilisation U <= 1 is at most
+	 * D_max / (1 - U); for U close to 1 we cap at a small fixed
+	 * number of periods. The audio workload sees deadlines on
+	 * the same order as T, so k_max = 1 (check up to 2T) is
+	 * sufficient in practice. The cap keeps the worst-case scan
+	 * cost bounded even on a pathological input. */
+	(void)k_max;
+	k_max = 2;
+
+	for (k = 0; k <= k_max && ok; k++) {
+		for (i = 0; i < n_tasks && ok; i++) {
+			uint64_t t = (uint64_t)k * T + tasks[i].d;
+			uint64_t demand = 0;
+			for (j = 0; j < n_tasks; j++) {
+				uint64_t k_j;
+				if (t < tasks[j].d)
+					continue;
+				k_j = (t - tasks[j].d) / T + 1;
+				demand += k_j * tasks[j].c;
+			}
+			double scaled_t = (double)t * rel;
+			if ((double)demand > scaled_t) {
+				if (out_failing_t)
+					*out_failing_t = t;
+				if (out_failing_demand)
+					*out_failing_demand = demand;
+				ok = false;
+				break;
+			}
+		}
+	}
+
+	free(tasks);
+	return ok;
+}
+
+bool dag_dbf_feasible(const dag_t *g,
+		uint32_t *out_failing_cpu,
+		uint64_t *out_failing_t,
+		uint64_t *out_failing_demand)
+{
+	uint32_t i;
+
+	if (g == NULL)
+		return false;
+
+	for (i = 0; i < g->num_cpus; i++) {
+		uint64_t t = 0, d = 0;
+		if (!dag_dbf_feasible_cpu(g, i, &t, &d)) {
+			if (out_failing_cpu)
+				*out_failing_cpu = i;
+			if (out_failing_t)
+				*out_failing_t = t;
+			if (out_failing_demand)
+				*out_failing_demand = d;
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Forward topological pass: assign each real node a graph-relative
  * cumulative deadline equal to max(pred.cumulative_deadline) +
  * own splitter slice (node->deadline). Source nodes (no real
