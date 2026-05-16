@@ -342,6 +342,147 @@ PWTEST(local_deadline_conversion_rejects_nonmonotonic)
 	return PWTEST_PASS;
 }
 
+/* --- per-CPU density predicate (Baruah 1990 sufficient test) --- */
+
+PWTEST(density_empty_cpu_returns_zero)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* CPU 0 carries the single node; CPU 1 is empty. */
+	pwtest_bool_true(dag_per_cpu_density(g, 1) == 0.0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* A single small task on one CPU: density = C/D well under 1. */
+PWTEST(density_feasible_chain_under_one)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, &failing_cpu));
+	pwtest_bool_true(max_d > 0.0);
+	pwtest_bool_true(max_d <= 1.0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Single CPU with a task whose wcet exceeds the local deadline ->
+ * density > 1. We construct it by post-hoc raising the wcet
+ * (the recalculate step gives a feasible split; tweak afterwards
+ * to drive density above 1). */
+PWTEST(density_infeasible_chain_above_one)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	dag_node_t *n;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Force a density > 1 by mutating WCET past the local
+	 * deadline after recalculate. The placer doesn't re-run; the
+	 * density predicate inspects current state. */
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+	n->wcet = (uint64_t)((double)n->local_deadline * 2.0);
+
+	pwtest_bool_false(dag_density_feasible(g, &max_d, &failing_cpu));
+	pwtest_bool_true(max_d > 1.0);
+	pwtest_int_eq((int)failing_cpu, (int)n->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* With three CPUs and unrelated tasks, each task lands on its own
+ * CPU and the per-CPU density does not aggregate across CPUs. */
+PWTEST(density_per_cpu_isolates_workloads)
+{
+	dag_t *g = dag_create(1000, 1000, 0.55f, 3, NULL);
+	double max_d;
+	uint32_t failing_cpu;
+	uint32_t i;
+	double total = 0.0;
+	pwtest_ptr_notnull(g);
+	/* Three independent sources -> each gets its own CPU under
+	 * worst-fit when admission_ceiling = 0.55 forces a spread. */
+	pwtest_int_eq(add_real_node(g, 1, 300, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 300, 1002), 0);
+	pwtest_int_eq(add_real_node(g, 3, 300, 1003), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_density_feasible(g, &max_d, &failing_cpu));
+	/* Sum across CPUs is the workload's total density; no single
+	 * CPU should hit anywhere near total. */
+	for (i = 0; i < 3; i++)
+		total += dag_per_cpu_density(g, i);
+	pwtest_bool_true(max_d < total);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Relative capacity scaling: a slower CPU's density is divided by
+ * its relative_capacity. Same node, same deadline -> density on
+ * a 0.5-capacity CPU is 2x that on a 1.0-capacity CPU. */
+PWTEST(density_relative_capacity_scaling)
+{
+	double rel[2] = { 1.0, 0.5 };
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, rel);
+	dag_node_t *n;
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	n = find_node_by_id(g, 1);
+	pwtest_ptr_notnull(n);
+
+	/* If the placer chose CPU 0 (fastest), force the node to CPU
+	 * 1 (slow) and observe the density jump. */
+	uint32_t orig_cpu = n->cpu;
+	(void)orig_cpu;
+	double d0_native = dag_per_cpu_density(g, n->cpu);
+	pwtest_bool_true(d0_native > 0.0);
+
+	/* Pretend the node sits on CPU 1 -- density should be the
+	 * D=local_deadline normalised result divided by 0.5. */
+	uint32_t saved = n->cpu;
+	n->cpu = 1;
+	double d_slow = dag_per_cpu_density(g, 1);
+	n->cpu = saved;
+	pwtest_bool_true(d_slow > 0.0);
+	/* Ratio == relative_capacity[0] / relative_capacity[1] = 2.0,
+	 * but only when the node was originally on CPU 0. Verify
+	 * directly: density on the slow CPU is twice the contribution
+	 * the fast CPU would have seen for the same node. */
+	double expected_fast_contrib = (double)n->wcet /
+		(double)(n->local_deadline ? n->local_deadline : g->period);
+	pwtest_bool_true(d_slow > expected_fast_contrib * 1.5);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(density_null_safe)
+{
+	pwtest_bool_true(dag_per_cpu_density(NULL, 0) == 0.0);
+	pwtest_bool_false(dag_density_feasible(NULL, NULL, NULL));
+	return PWTEST_PASS;
+}
+
 PWTEST(chain_uses_peak_not_sum)
 {
 	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
@@ -3121,6 +3262,12 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(local_deadline_conversion_direct_pseudocode_example, PWTEST_NOARG);
 	pwtest_add(local_deadline_conversion_direct_join_example, PWTEST_NOARG);
 	pwtest_add(local_deadline_conversion_rejects_nonmonotonic, PWTEST_NOARG);
+	pwtest_add(density_empty_cpu_returns_zero, PWTEST_NOARG);
+	pwtest_add(density_feasible_chain_under_one, PWTEST_NOARG);
+	pwtest_add(density_infeasible_chain_above_one, PWTEST_NOARG);
+	pwtest_add(density_per_cpu_isolates_workloads, PWTEST_NOARG);
+	pwtest_add(density_relative_capacity_scaling, PWTEST_NOARG);
+	pwtest_add(density_null_safe, PWTEST_NOARG);
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);

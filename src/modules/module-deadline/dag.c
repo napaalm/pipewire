@@ -2325,6 +2325,68 @@ static int assign_cpus(dag_t *g)
 	return 0;
 }
 
+double dag_per_cpu_density(const dag_t *g, uint32_t cpu)
+{
+	double sum = 0.0;
+	double rel;
+	dag_node_t *n;
+
+	if (g == NULL || cpu >= g->num_cpus)
+		return 0.0;
+	if (g->period == 0)
+		return 0.0;
+
+	rel = g->relative_capacity != NULL ? g->relative_capacity[cpu] : 1.0;
+	if (rel <= 0.0)
+		return 0.0;
+
+	spa_list_for_each(n, &g->nodes, link) {
+		uint64_t d;
+		if (n->fictitious)
+			continue;
+		if (n->cpu == DAG_CPU_INVALID || n->cpu != cpu)
+			continue;
+		if (n->wcet == 0)
+			continue;
+		/* min(D_i, T_i): a node whose local deadline is
+		 * larger than the period is treated as if D == T per
+		 * the kernel's SCHED_DEADLINE clamp. */
+		d = n->local_deadline != 0 ? n->local_deadline : g->period;
+		if (d > g->period)
+			d = g->period;
+		if (d == 0)
+			continue;
+		sum += ((double)n->wcet / (double)d) / rel;
+	}
+	return sum;
+}
+
+bool dag_density_feasible(const dag_t *g,
+		double *out_max_density,
+		uint32_t *out_failing_cpu)
+{
+	uint32_t i, worst_cpu = 0;
+	double worst = 0.0;
+
+	if (g == NULL)
+		return false;
+
+	for (i = 0; i < g->num_cpus; i++) {
+		double d = dag_per_cpu_density(g, i);
+		if (d > worst) {
+			worst = d;
+			worst_cpu = i;
+		}
+	}
+
+	if (out_max_density != NULL)
+		*out_max_density = worst;
+	if (out_failing_cpu != NULL)
+		*out_failing_cpu = worst_cpu;
+
+	return worst <= 1.0;
+}
+
 /* Forward topological pass: assign each real node a graph-relative
  * cumulative deadline equal to max(pred.cumulative_deadline) +
  * own splitter slice (node->deadline). Source nodes (no real

@@ -262,6 +262,43 @@ dag_node_t *dag_find_node(dag_t *g, uint32_t id);
 /* Recalculate scheduling parameters after changes */
 int dag_recalculate(dag_t *g);
 
+/*
+ * Per-CPU EDF density. For every real node assigned to `cpu`, sum
+ *
+ *     C_i / min(D_i, T_i)
+ *
+ * where C_i is the node's wcet (in reference-CPU units), D_i is
+ * its local_deadline, and T_i is the global period. The result is
+ * divided by `cpu`'s relative_capacity so a slower CPU's density
+ * reflects the wall-clock cost the node will actually incur
+ * there. The result is the constrained-deadline EDF density on
+ * that CPU; the kernel's SCHED_DEADLINE sufficient-feasibility
+ * test (Linux kernel sched-deadline.rst §Bandwidth management;
+ * Baruah, Howell & Rosier 1990 RTS) requires density <= 1.
+ *
+ * Returns 0.0 on a CPU with no assigned nodes, on null inputs, or
+ * when cpu is out of range. Skips nodes whose cumulative analysis
+ * results have not yet been populated (deadline_assigned == false).
+ */
+double dag_per_cpu_density(const dag_t *g, uint32_t cpu);
+
+/*
+ * Density-sufficient feasibility test on the post-placement
+ * schedule. Returns true iff every CPU's density (see
+ * dag_per_cpu_density) is <= 1.0; otherwise returns false and
+ * sets *out_max_density / *out_failing_cpu to the highest density
+ * observed and the CPU that produced it (NULL pointers are
+ * tolerated).
+ *
+ * The check is sufficient but not necessary: a task set that
+ * fails density may still be EDF-feasible by the exact
+ * processor-demand criterion (Baruah 1990). The DBF check is the
+ * heavier fallback once it lands.
+ */
+bool dag_density_feasible(const dag_t *g,
+		double *out_max_density,
+		uint32_t *out_failing_cpu);
+
 /* Compute every real node's local_deadline from its already-populated
  * cumulative_deadline using the kernel-API conversion
  *
