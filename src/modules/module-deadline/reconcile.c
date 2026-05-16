@@ -692,8 +692,27 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 
 	if (dag_recalculate(macro_dag) < 0) {
 		int e = errno;
-		pw_log_warn("reconcile: contracted-DAG recalculate failed "
-			    "(%m); falling back to per-node deadline split.");
+		/* The macro-dag analysis rejected the schedule -- the
+		 * most common cause is the worst-fit placer failing
+		 * admission_ceiling, which is itself a density-style
+		 * test and therefore the same signal the SOFT mode
+		 * classification expects. Stamp the feas state
+		 * accordingly before falling back so an operator
+		 * sees the transition; the fallback then runs the
+		 * per-original-node analysis as a best-effort
+		 * scheduler. */
+		if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
+			pw_log_warn("reconcile: contracted-DAG analysis "
+				"rejected the schedule (%m); falling "
+				"back to per-node deadline split; "
+				"hard-real-time guarantees dropped");
+		}
+		state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
+		state->feas.density_passed = false;
+		state->feas.dbf_passed = false;
+		state->feas.consecutive_hard_passes = 0;
+		snprintf(state->feas.reason, sizeof(state->feas.reason),
+				"placer_rejected");
 		dag_destroy(macro_dag);
 		contracted_dag_destroy(cg);
 		errno = e;

@@ -1223,6 +1223,147 @@ static dag_t *reconcile_state_peek_dag(reconcile_state_t *s)
 	return reconcile_state_dag_for_test(s);
 }
 
+/* --- mode classification + hysteresis tests --- */
+
+/* A comfortably feasible single-task workload: the reconcile
+ * dispatcher must classify it HARD and the consecutive-pass
+ * counter must increment on every additional apply call (up to
+ * the hysteresis cap). */
+PWTEST(reconcile_mode_feasible_repeats_keep_hard)
+{
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t f = { 10, 100, 100 };
+	reconcile_edge_t e[] = { { 0, 0 } };
+	reconcile_topo_t rt = {
+		.followers = &f, .n_followers = 1,
+		.edges = NULL, .n_edges = 0,
+		.period = 1000000, .generation = 1,
+	};
+	struct reconcile_feasibility feas = { 0 };
+
+	pwtest_ptr_notnull(s);
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_HARD);
+	pwtest_bool_true(feas.consecutive_hard_passes >= 1);
+
+	/* Three more applies on the same topology keep mode HARD;
+	 * the consecutive counter saturates at the hysteresis
+	 * cap. */
+	for (int i = 0; i < 5; i++)
+		pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_HARD);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+/* Build a topology that the density predicate will reject (sum
+ * density on the only CPU exceeds 1). Mode must flip to
+ * SOFT_DEGRADED on the first apply, regardless of how many
+ * times the same topology is reapplied. */
+PWTEST(reconcile_mode_density_overload_flips_soft)
+{
+	reconcile_state_t *s = reconcile_init(1, 1.0, NULL, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t followers[] = {
+		{ 10, 100, 80000 },
+		{ 11, 101, 80000 },
+		{ 12, 102, 80000 },
+	};
+	reconcile_edge_t edges[] = { { 10, 11 }, { 11, 12 } };
+	reconcile_topo_t rt = {
+		.followers = followers, .n_followers = 3,
+		.edges = edges, .n_edges = 2,
+		.period = 100000, .generation = 1,
+	};
+	struct reconcile_feasibility feas = { 0 };
+
+	pwtest_ptr_notnull(s);
+
+	/* On 1 CPU with admission_ceiling=1.0 the placer's density-
+	 * style admission test rejects all three chain followers'
+	 * combined density. The dispatcher catches the failure,
+	 * marks the schedule SOFT_DEGRADED with
+	 * reason="placer_rejected", and falls back to the per-
+	 * original-node legacy path. */
+	(void)reconcile_apply(s, &rt, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason, "placer_rejected");
+	pwtest_int_eq((int)feas.consecutive_hard_passes, 0);
+
+	/* Reapplying the same infeasible topology leaves the mode
+	 * unchanged -- transitions are state-driven, not per-period. */
+	for (int i = 0; i < 5; i++)
+		(void)reconcile_apply(s, &rt, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_int_eq((int)feas.consecutive_hard_passes, 0);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+/* After a SOFT transition, the dispatcher needs N consecutive
+ * feasible passes before promoting back to HARD (hysteresis).
+ * Drive an infeasible topology, then a feasible one, and verify
+ * the promotion fires only at the third consecutive feasible
+ * apply (default hysteresis = 3). */
+PWTEST(reconcile_mode_hysteresis_promotes_after_n_passes)
+{
+	reconcile_state_t *s = reconcile_init(1, 1.0, NULL, 0.01, true);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t bad[] = {
+		{ 10, 100, 80000 }, { 11, 101, 80000 }, { 12, 102, 80000 },
+	};
+	reconcile_edge_t bad_e[] = { { 10, 11 }, { 11, 12 } };
+	reconcile_topo_t bad_topo = {
+		.followers = bad, .n_followers = 3,
+		.edges = bad_e, .n_edges = 2,
+		.period = 100000, .generation = 1,
+	};
+	reconcile_follower_t good = { 10, 100, 1000 };
+	reconcile_topo_t good_topo = {
+		.followers = &good, .n_followers = 1,
+		.edges = NULL, .n_edges = 0,
+		.period = 1000000, .generation = 2,
+	};
+	struct reconcile_feasibility feas = { 0 };
+
+	pwtest_ptr_notnull(s);
+
+	/* Force into SOFT. */
+	(void)reconcile_apply(s, &bad_topo, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+
+	/* First feasible apply: stays SOFT, counter at 1. */
+	(void)reconcile_apply(s, &good_topo, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_int_eq((int)feas.consecutive_hard_passes, 1);
+
+	good_topo.generation = 3;
+	(void)reconcile_apply(s, &good_topo, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_int_eq((int)feas.consecutive_hard_passes, 2);
+
+	/* Third consecutive feasible apply: promotion to HARD. */
+	good_topo.generation = 4;
+	(void)reconcile_apply(s, &good_topo, cb_record, &cb);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_HARD);
+	pwtest_int_eq((int)feas.consecutive_hard_passes, 3);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_reconcile)
 {
 	pwtest_add(reconcile_rec_1_first_build, PWTEST_NOARG);
@@ -1260,6 +1401,10 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_g11_cb_receives_per_node_values_for_group, PWTEST_NOARG);
 	pwtest_add(reconcile_g12_group_overcapacity_returns_failure_state, PWTEST_NOARG);
 	pwtest_add(reconcile_g13_chain_member_leaves_group, PWTEST_NOARG);
+
+	pwtest_add(reconcile_mode_feasible_repeats_keep_hard, PWTEST_NOARG);
+	pwtest_add(reconcile_mode_density_overload_flips_soft, PWTEST_NOARG);
+	pwtest_add(reconcile_mode_hysteresis_promotes_after_n_passes, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
