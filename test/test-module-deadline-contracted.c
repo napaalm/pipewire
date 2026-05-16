@@ -333,6 +333,83 @@ PWTEST(contracted_builder_rejects_dangling_edge)
 	return PWTEST_PASS;
 }
 
+/* --- overhead tests --- */
+
+PWTEST(contracted_overhead_defaults_to_zero)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 500), 0);
+	n->wcet_ns += 500;
+	pwtest_int_eq((int)n->overhead_ns, 0);
+	pwtest_int_eq((int)n->overhead.group_dispatch_ns, 0);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 0);
+	pwtest_int_eq((int)n->overhead.activation_pending_ns, 0);
+	pwtest_int_eq((int)n->overhead.buffer_port_iter_ns, 0);
+	pwtest_int_eq((int)n->overhead.wakeup_savings_ns, 0);
+	pwtest_int_eq((int)contracted_node_effective_wcet(n), 500);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_overhead_set_aggregates_components)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 500), 0);
+	n->wcet_ns += 500;
+
+	struct contracted_overhead_components c = {
+		.group_dispatch_ns     = 30,
+		.internal_topo_ns      = 20,
+		.activation_pending_ns = 10,
+		.buffer_port_iter_ns   = 40,
+		.wakeup_savings_ns     = 200, /* observational only */
+	};
+	pwtest_int_eq(contracted_node_set_overhead(n, &c), 0);
+
+	/* 30 + 20 + 10 + 40 = 100; wakeup_savings_ns NOT subtracted. */
+	pwtest_int_eq((int)n->overhead_ns, 100);
+	pwtest_int_eq((int)n->overhead.wakeup_savings_ns, 200);
+	pwtest_int_eq((int)contracted_node_effective_wcet(n), 600);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_overhead_set_rejects_null)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	struct contracted_overhead_components c = { 0 };
+	pwtest_int_eq(contracted_node_set_overhead(NULL, &c), -EINVAL);
+	pwtest_int_eq(contracted_node_set_overhead(n, NULL), -EINVAL);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_overhead_effective_wcet_null_safe)
+{
+	pwtest_int_eq((int)contracted_node_effective_wcet(NULL), 0);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_overhead_set_replaces_not_adds)
+{
+	/* set_overhead overwrites the components struct verbatim;
+	 * two calls do not accumulate. The analysis layer relies on
+	 * this when it refreshes the overhead between recalc passes. */
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	struct contracted_overhead_components c1 = { 100, 0, 0, 0, 0 };
+	struct contracted_overhead_components c2 = { 50, 0, 0, 0, 0 };
+	pwtest_int_eq(contracted_node_set_overhead(n, &c1), 0);
+	pwtest_int_eq((int)n->overhead_ns, 100);
+	pwtest_int_eq(contracted_node_set_overhead(n, &c2), 0);
+	pwtest_int_eq((int)n->overhead_ns, 50);
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -351,6 +428,11 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_builder_singletons_only, PWTEST_NOARG);
 	pwtest_add(contracted_builder_rejects_duplicate_ids, PWTEST_NOARG);
 	pwtest_add(contracted_builder_rejects_dangling_edge, PWTEST_NOARG);
+	pwtest_add(contracted_overhead_defaults_to_zero, PWTEST_NOARG);
+	pwtest_add(contracted_overhead_set_aggregates_components, PWTEST_NOARG);
+	pwtest_add(contracted_overhead_set_rejects_null, PWTEST_NOARG);
+	pwtest_add(contracted_overhead_effective_wcet_null_safe, PWTEST_NOARG);
+	pwtest_add(contracted_overhead_set_replaces_not_adds, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

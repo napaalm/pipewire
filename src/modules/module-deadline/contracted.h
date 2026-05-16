@@ -62,6 +62,44 @@ struct contracted_member {
 	uint64_t wcet_ns;
 };
 
+/*
+ * Macro-node residual overhead decomposition.
+ *
+ * Aggregating N original members under one SCHED_DEADLINE
+ * reservation does not eliminate every accounting cost: the
+ * contracted thread must still dispatch internal work in
+ * topological order, decrement an internal pending counter as
+ * each member completes, walk its input / output ports per
+ * member, and run any per-group bookkeeping the runtime
+ * imposes. Each of those is small per-cycle but bounded; the
+ * sum must enter the analysis's WCET budget for the macro-node
+ * or the deadline split silently under-budgets the group.
+ *
+ * The fields below carry the per-component upper bound in
+ * nanoseconds. The aggregated overhead used by the analysis is
+ *
+ *   overhead_ns = group_dispatch_ns + internal_topo_ns
+ *               + activation_pending_ns + buffer_port_iter_ns
+ *
+ * `wakeup_savings_ns` is reported separately (so an operator can
+ * see how much wake-up cost the fusion saves) but is NOT
+ * subtracted from the analysis budget: pessimism in the budget is
+ * safe, optimism is not. A future analysis variant that explicitly
+ * models the saving can plug it in; today the field is
+ * observational only.
+ *
+ * The breakdown follows Sarkar 1989's macro-actor accounting
+ * (chapter 5): internal overhead of a macro-actor versus the
+ * wake-up cost saved by collapsing successor edges.
+ */
+struct contracted_overhead_components {
+	uint64_t group_dispatch_ns;
+	uint64_t internal_topo_ns;
+	uint64_t activation_pending_ns;
+	uint64_t buffer_port_iter_ns;
+	uint64_t wakeup_savings_ns;
+};
+
 /* Macro-node in the contracted DAG. */
 struct contracted_node {
 	struct spa_list link;       /* link in contracted_dag::nodes */
@@ -76,11 +114,16 @@ struct contracted_node {
 	struct spa_list preds;      /* head of contracted_edge::dst_link */
 	struct spa_list succs;      /* head of contracted_edge::src_link */
 
-	/* Aggregated timing. wcet_ns is the sum of member WCETs plus
-	 * the measured overhead; the two are tracked separately so a
-	 * reader can distinguish work from book-keeping. */
+	/* Aggregated timing. wcet_ns is the sum of member WCETs;
+	 * overhead_ns is the aggregated residual overhead populated
+	 * by contracted_node_set_overhead() from the per-component
+	 * breakdown; the two are tracked separately so a reader can
+	 * distinguish work from book-keeping. The analysis layer's
+	 * effective WCET for the macro-node is
+	 * contracted_node_effective_wcet() = wcet_ns + overhead_ns. */
 	uint64_t wcet_ns;
 	uint64_t overhead_ns;
+	struct contracted_overhead_components overhead;
 
 	/* Scheduling parameters, populated by the analysis layer. */
 	uint64_t runtime_budget_ns;
@@ -211,6 +254,27 @@ int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
 		const struct contracted_edge_input *edges,
 		uint32_t n_edges,
 		contracted_dag_t **out);
+
+/*
+ * Replace the overhead breakdown on a macro-node and recompute the
+ * aggregated overhead_ns the analysis layer reads. Pass a fresh
+ * components struct (set unobserved fields to 0); this is the only
+ * supported way to mutate cn->overhead so the wcet/overhead split
+ * stays consistent. Returns 0 on success, -EINVAL on NULL cn or
+ * components.
+ *
+ * The aggregation is intentionally additive over every component
+ * other than wakeup_savings_ns: that field is reported back to the
+ * operator but never subtracted from the analysis budget so the
+ * fused-thread reservation is never sized smaller than the work
+ * actually requires.
+ */
+int contracted_node_set_overhead(contracted_node_t *cn,
+		const struct contracted_overhead_components *components);
+
+/* Effective WCET (wcet_ns + overhead_ns) the analysis layer uses
+ * as the macro-node's runtime budget input. Returns 0 on NULL. */
+uint64_t contracted_node_effective_wcet(const contracted_node_t *cn);
 
 #ifdef __cplusplus
 }

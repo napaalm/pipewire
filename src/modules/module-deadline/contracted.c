@@ -101,6 +101,33 @@ int contracted_node_add_member(contracted_node_t *cn, uint32_t id,
 	return 0;
 }
 
+int contracted_node_set_overhead(contracted_node_t *cn,
+		const struct contracted_overhead_components *components)
+{
+	if (cn == NULL || components == NULL)
+		return -EINVAL;
+
+	cn->overhead = *components;
+	/* Aggregation rule: every measured cost lifts the budget;
+	 * wakeup_savings_ns is observational only and does NOT enter
+	 * overhead_ns. The analysis layer can only safely shrink the
+	 * budget when a future model explicitly proves the saving
+	 * applies on every activation, which is out of scope for the
+	 * fusion-as-contraction step. */
+	cn->overhead_ns = components->group_dispatch_ns
+			+ components->internal_topo_ns
+			+ components->activation_pending_ns
+			+ components->buffer_port_iter_ns;
+	return 0;
+}
+
+uint64_t contracted_node_effective_wcet(const contracted_node_t *cn)
+{
+	if (cn == NULL)
+		return 0;
+	return cn->wcet_ns + cn->overhead_ns;
+}
+
 int contracted_dag_add_edge(contracted_dag_t *cg,
 		contracted_node_t *src, contracted_node_t *dst)
 {
