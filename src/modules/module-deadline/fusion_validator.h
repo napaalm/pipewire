@@ -239,6 +239,56 @@ bool fusion_validator_externally_atomic_accept(
 		const struct fusion_edge_input *edges, uint32_t n_edges,
 		enum fusion_reject_reason *out_reason);
 
+/*
+ * Per-member RT capability bitmask.
+ *
+ * Chen et al. 2019 establishes that suspension-aware EDF
+ * feasibility is subtle and error-prone, and that the safe
+ * default for an unanalysed task is to refuse the analysis. The
+ * blocking-closure predicate enforces that default: every fusion
+ * member must declare that its process() function does not
+ * suspend the calling thread. Unknown plugin nodes carry no
+ * capability bits and are therefore non-fusible at hard mode by
+ * construction.
+ *
+ * The capability bits below match the plan's pw_rt_capability
+ * vocabulary; today only NONBLOCKING_PROCESS is consumed by the
+ * predicate. The other bits are reserved for future, more
+ * granular fall-through checks (a memory-allocation guard, a
+ * main-loop-wait guard, an unbounded-lock guard) that the
+ * runtime instrumentation will populate.
+ */
+enum fusion_member_capability {
+	FUSION_CAP_NONBLOCKING_PROCESS    = 1u << 0,
+	FUSION_CAP_NO_DYNAMIC_ALLOCATION  = 1u << 1,
+	FUSION_CAP_NO_MAINLOOP_WAIT       = 1u << 2,
+	FUSION_CAP_NO_UNBOUNDED_LOCKS     = 1u << 3,
+};
+
+/*
+ * Blocking-closure predicate.
+ *
+ * A fused group fails hard-mode admission unless every member
+ * declares FUSION_CAP_NONBLOCKING_PROCESS. The reasoning: a
+ * member that may suspend inside process() turns the entire
+ * macro-node into a self-suspending task, and the EDF
+ * feasibility proof on which the contracted-DAG schedule relies
+ * does not apply to self-suspending tasks without explicit
+ * suspension-aware analysis (Chen et al. 2019 §III).
+ *
+ * Inputs:
+ *   - member_caps[]: per-member capability bitmask, length
+ *     n_members. A NULL pointer with n_members > 0 rejects
+ *     defensively (treated as "all members are unknown").
+ *
+ * Returns true with *out_reason = NONE on accept, false with
+ * *out_reason = BLOCKING_RISK on reject. n_members == 0
+ * trivially accepts.
+ */
+bool fusion_validator_blocking_closure_accept(
+		const uint32_t *member_caps, uint32_t n_members,
+		enum fusion_reject_reason *out_reason);
+
 /* Stable lower_snake_case token for a given rejection reason.
  * Unknown values render as "unknown". */
 const char *fusion_reject_reason_name(enum fusion_reject_reason r);

@@ -513,6 +513,71 @@ PWTEST(fusion_externally_atomic_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
+/* --- blocking-closure predicate (Phase 3.5) --- */
+
+PWTEST(fusion_blocking_empty_accepts)
+{
+	enum fusion_reject_reason r = FUSION_REJ_NON_CONVEX;
+	pwtest_bool_true(fusion_validator_blocking_closure_accept(
+				NULL, 0, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_blocking_all_nonblocking_accepts)
+{
+	uint32_t caps[] = {
+		FUSION_CAP_NONBLOCKING_PROCESS,
+		FUSION_CAP_NONBLOCKING_PROCESS | FUSION_CAP_NO_DYNAMIC_ALLOCATION,
+		FUSION_CAP_NONBLOCKING_PROCESS,
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NON_CONVEX;
+	pwtest_bool_true(fusion_validator_blocking_closure_accept(
+				caps, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_blocking_unknown_capability_rejects)
+{
+	/* A member that does NOT carry NONBLOCKING_PROCESS is
+	 * categorically rejected from hard fusion -- the safe
+	 * default for unknown plugin nodes. */
+	uint32_t caps[] = {
+		FUSION_CAP_NONBLOCKING_PROCESS,
+		0,                          /* unknown plugin */
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_blocking_closure_accept(
+				caps, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_BLOCKING_RISK);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_blocking_explicit_blocker_rejects)
+{
+	/* A member with NO_DYNAMIC_ALLOCATION but without
+	 * NONBLOCKING_PROCESS is also unsafe -- the
+	 * NONBLOCKING_PROCESS bit is what the predicate keys on. */
+	uint32_t caps[] = {
+		FUSION_CAP_NO_DYNAMIC_ALLOCATION | FUSION_CAP_NO_MAINLOOP_WAIT,
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_blocking_closure_accept(
+				caps, 1, &r));
+	pwtest_int_eq(r, FUSION_REJ_BLOCKING_RISK);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_blocking_null_caps_rejects)
+{
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_blocking_closure_accept(
+				NULL, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_BLOCKING_RISK);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -550,6 +615,11 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_externally_atomic_chain_full_with_external_sink_accepts, PWTEST_NOARG);
 	pwtest_add(fusion_externally_atomic_middle_external_succ_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_externally_atomic_null_member_ids_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_empty_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_all_nonblocking_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_unknown_capability_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_explicit_blocker_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_null_caps_rejects, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

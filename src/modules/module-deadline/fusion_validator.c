@@ -286,6 +286,33 @@ bool fusion_validator_externally_atomic_accept(
 	return true;
 }
 
+bool fusion_validator_blocking_closure_accept(
+		const uint32_t *member_caps, uint32_t n_members,
+		enum fusion_reject_reason *out_reason)
+{
+	enum fusion_reject_reason ignore = FUSION_REJ_NONE;
+	uint32_t i;
+
+	if (out_reason == NULL)
+		out_reason = &ignore;
+	*out_reason = FUSION_REJ_NONE;
+
+	if (n_members == 0)
+		return true;
+	if (member_caps == NULL) {
+		*out_reason = FUSION_REJ_BLOCKING_RISK;
+		return false;
+	}
+
+	for (i = 0; i < n_members; i++) {
+		if ((member_caps[i] & FUSION_CAP_NONBLOCKING_PROCESS) == 0) {
+			*out_reason = FUSION_REJ_BLOCKING_RISK;
+			return false;
+		}
+	}
+	return true;
+}
+
 const char *fusion_reject_reason_name(enum fusion_reject_reason r)
 {
 	switch (r) {
