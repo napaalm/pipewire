@@ -543,7 +543,8 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 		fprintf(out,
 			"    node id=%u tid=%d runtime=%lluns local_deadline=%lluns"
 			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s"
-			" budget_kind=%s budget_samples=%llu\n",
+			" budget_kind=%s budget_samples=%llu"
+			" mbpta_state=%s mbpta_pwcet=%lluns mbpta_blocks=%u\n",
 			n->id, (int)n->tid,
 			(unsigned long long)n->runtime_budget_ns,
 			(unsigned long long)n->local_deadline_ns,
@@ -552,7 +553,10 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			n->cpu,
 			n->applied ? "true" : "false",
 			rt_diag_budget_kind_name(n->budget_kind),
-			(unsigned long long)n->budget_sample_count);
+			(unsigned long long)n->budget_sample_count,
+			rt_diag_mbpta_state_name(n->mbpta_state),
+			(unsigned long long)n->mbpta_pwcet_ns,
+			n->mbpta_block_count);
 	}
 }
 
@@ -708,6 +712,19 @@ static void json_write_fusion_section(FILE *out, const struct rt_diag_fusion_sna
 	fputs("]}", out);
 }
 
+const char *rt_diag_mbpta_state_name(enum rt_diag_mbpta_state s)
+{
+	switch (s) {
+	case RT_DIAG_MBPTA_INSUFFICIENT_DATA:   return "insufficient_data";
+	case RT_DIAG_MBPTA_IID_PENDING:         return "iid_pending";
+	case RT_DIAG_MBPTA_NON_GUMBEL:          return "non_gumbel";
+	case RT_DIAG_MBPTA_PENDING_CONVERGENCE: return "pending_convergence";
+	case RT_DIAG_MBPTA_PWCET_VALID:         return "pwcet_valid";
+	case RT_DIAG_MBPTA_DRIFT:               return "drift";
+	}
+	return "unknown";
+}
+
 const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k)
 {
 	switch (k) {
@@ -774,7 +791,9 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				"\"cumulative_deadline_ns\":%llu,"
 				"\"period_ns\":%llu,\"cpu\":%u,"
 				"\"applied\":%s,\"budget_kind\":\"%s\","
-				"\"budget_samples\":%llu}",
+				"\"budget_samples\":%llu,"
+				"\"mbpta\":{\"state\":\"%s\","
+				"\"pwcet_ns\":%llu,\"blocks\":%u}}",
 				n->id, (int)n->tid,
 				(unsigned long long)n->runtime_budget_ns,
 				(unsigned long long)n->local_deadline_ns,
@@ -783,7 +802,10 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				n->cpu,
 				n->applied ? "true" : "false",
 				rt_diag_budget_kind_name(n->budget_kind),
-				(unsigned long long)n->budget_sample_count);
+				(unsigned long long)n->budget_sample_count,
+				rt_diag_mbpta_state_name(n->mbpta_state),
+				(unsigned long long)n->mbpta_pwcet_ns,
+				n->mbpta_block_count);
 		}
 	}
 	fputs("]}", out);

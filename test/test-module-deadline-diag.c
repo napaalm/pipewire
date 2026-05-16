@@ -478,10 +478,12 @@ PWTEST(diag_params_render_text_golden)
 		"  nodes: 2\n"
 		"    node id=37 tid=302370 runtime=85494ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true"
-		" budget_kind=empirical_quantile budget_samples=128\n"
+		" budget_kind=empirical_quantile budget_samples=128"
+		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
-		" budget_kind=bootstrap_fallback budget_samples=0\n";
+		" budget_kind=bootstrap_fallback budget_samples=0"
+		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -581,7 +583,8 @@ PWTEST(diag_json_full_golden)
 		"\"cumulative_deadline_ns\":21333333,\"period_ns\":21333333,"
 		"\"cpu\":4,\"applied\":true,"
 		"\"budget_kind\":\"empirical_quantile\","
-		"\"budget_samples\":512}]},"
+		"\"budget_samples\":512,"
+		"\"mbpta\":{\"state\":\"pwcet_valid\",\"pwcet_ns\":91234,\"blocks\":50}}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -625,6 +628,9 @@ PWTEST(diag_json_full_golden)
 	pn.cpu = 4; pn.applied = true;
 	pn.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
 	pn.budget_sample_count = 512;
+	pn.mbpta_state = RT_DIAG_MBPTA_PWCET_VALID;
+	pn.mbpta_pwcet_ns = 91234;
+	pn.mbpta_block_count = 50;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;
@@ -691,6 +697,24 @@ PWTEST(diag_peer_dispatch_null_safe)
 	rt_diag_peer_dispatch_init(NULL);
 	rt_diag_peer_dispatch_reset(NULL);
 	rt_diag_peer_dispatch_render_text(NULL, stderr);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_mbpta_state_names_stable)
+{
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_INSUFFICIENT_DATA),
+		      "insufficient_data");
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_IID_PENDING),
+		      "iid_pending");
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_NON_GUMBEL),
+		      "non_gumbel");
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_PENDING_CONVERGENCE),
+		      "pending_convergence");
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_PWCET_VALID),
+		      "pwcet_valid");
+	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_DRIFT), "drift");
+	pwtest_str_eq(rt_diag_mbpta_state_name((enum rt_diag_mbpta_state)999),
+		      "unknown");
 	return PWTEST_PASS;
 }
 
@@ -772,6 +796,7 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_peer_dispatch_render_text, PWTEST_NOARG);
 	pwtest_add(diag_peer_dispatch_null_safe, PWTEST_NOARG);
 	pwtest_add(diag_budget_kind_names_stable, PWTEST_NOARG);
+	pwtest_add(diag_mbpta_state_names_stable, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

@@ -45,6 +45,7 @@
 #include "module-deadline/cpu_topology.h"
 #include "module-deadline/dag.h"
 #include "module-deadline/diag.h"
+#include "module-deadline/mbpta.h"
 #include "module-deadline/reconcile.h"
 #include "module-deadline/sched_groups.h"
 #include "module-deadline/wcet_sketch.h"
@@ -502,6 +503,16 @@ struct node {
 	wcet_sketch_t sketch;
 	bool sketch_ready;
 
+	/* MBPTA pWCET estimator running alongside the t-digest
+	 * sketch. The estimator owns its own sample window and
+	 * runs the full Cucu-Grosjean et al. 2012 pipeline (KS,
+	 * runs test, block maxima, Gumbel fit, CRPS convergence)
+	 * on the same samples the sketch sees. Reserved for
+	 * RT_DIAG_BUDGET_PWCET provenance; surfaced in the JSON
+	 * snapshot for observability. NULL until the first sample
+	 * arrives (lazy init). */
+	mbpta_t  *mbpta;
+
 	/* Last-applied SCHED_DEADLINE tuple. Used by sched_cb to skip
 	 * a sched_setattr+sched_setaffinity pair when the four
 	 * components (runtime, deadline, period, cpu) all match the
@@ -623,6 +634,25 @@ struct impl {
 	double   sketch_quantile;
 	double   sketch_compression;
 	uint32_t sketch_min_samples;
+
+	/* MBPTA pWCET estimator configuration. Cucu-Grosjean et al.
+	 * 2012 ECRTS shapes the pipeline; the defaults below are
+	 * the plan's starting points pending calibration. The
+	 * estimator runs unconditionally for observability; the
+	 * accept_probabilistic_hard flag will gate whether
+	 * RT_BUDGET_PWCET is allowed to drive the kernel runtime
+	 * once that integration lands. */
+	uint32_t mbpta_sample_window;
+	uint32_t mbpta_warmup_discard;
+	uint32_t mbpta_block_size;
+	uint32_t mbpta_min_blocks;
+	double   mbpta_alpha_iid;
+	uint32_t mbpta_n_delta;
+	uint32_t mbpta_n_conv;
+	double   mbpta_crps_threshold;
+	double   mbpta_eps_node;
+	uint32_t mbpta_n_iid_reject;
+	bool     mbpta_accept_probabilistic_hard;
 
 	/* Persistent-DAG path on the worker (default). When false the
 	 * worker still runs but reconcile_apply takes the legacy
@@ -764,6 +794,10 @@ static void module_destroy(void *data)
 		}
 		if (n->sketch_ready)
 			wcet_sketch_fini(&n->sketch);
+		if (n->mbpta != NULL) {
+			mbpta_destroy(n->mbpta);
+			n->mbpta = NULL;
+		}
 		free(n->ring_slots);
 		free(n->topo.nodes);
 		free(n->topo.edges);
@@ -1382,7 +1416,34 @@ static void apply_sample(struct impl *impl, struct node *n,
 	if (n->period != period) {
 		if (n->sketch_ready)
 			wcet_sketch_reset(&n->sketch);
+		if (n->mbpta != NULL)
+			mbpta_invalidate(n->mbpta);
 		n->wcet = 0;
+	}
+
+	/* Lazy-init MBPTA from impl's configured knobs on first
+	 * sample. The estimator is observational today (does not
+	 * yet drive sched_setattr); its state surfaces in the JSON
+	 * snapshot so an operator can see whether each follower has
+	 * reached PWCET_VALID and what pWCET would be published if
+	 * the operator opted in to probabilistic guarantees. */
+	if (n->mbpta == NULL) {
+		struct mbpta_config c = {
+			.sample_window  = impl->mbpta_sample_window,
+			.warmup_discard = impl->mbpta_warmup_discard,
+			.block_size     = impl->mbpta_block_size,
+			.min_blocks     = impl->mbpta_min_blocks,
+			.alpha_iid      = impl->mbpta_alpha_iid,
+			.n_delta        = impl->mbpta_n_delta,
+			.n_conv         = impl->mbpta_n_conv,
+			.crps_threshold = impl->mbpta_crps_threshold,
+			.eps_node       = impl->mbpta_eps_node,
+			.n_iid_reject   = impl->mbpta_n_iid_reject,
+		};
+		n->mbpta = mbpta_create(&c);
+		if (n->mbpta == NULL)
+			pw_log_warn("node %d: MBPTA estimator init failed",
+				n->node ? n->node->info.id : (uint32_t)-1);
 	}
 
 	/* Prefer cycles when available: they are frequency-invariant
@@ -1394,6 +1455,14 @@ static void apply_sample(struct impl *impl, struct node *n,
 
 	if (runtime > 0 && n->sketch_ready)
 		wcet_sketch_add(&n->sketch, sample_ref);
+
+	/* Feed the MBPTA estimator the same reference-CPU-normalised
+	 * sample. The estimator stays in INSUFFICIENT_DATA until it
+	 * has enough samples for a block-maxima fit; until it
+	 * declares PWCET_VALID nothing here changes the kernel-side
+	 * behaviour. */
+	if (runtime > 0 && n->mbpta != NULL && sample_ref > 0.0)
+		(void)mbpta_add_sample(n->mbpta, (uint64_t)sample_ref);
 
 	if (!n->sketch_ready ||
 	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
@@ -2300,15 +2369,22 @@ static int populate_params_snapshot(struct impl *impl,
 		} else {
 			pn.applied = false;
 		}
-		/* Budget provenance. The current estimator is the
-		 * Dunning & Ertl 2019 t-digest sliding-window quantile
-		 * sketch: when it has collected enough samples to leave
-		 * the bootstrap-min-samples gate, the runtime budget
-		 * comes from the configured quantile (an empirical
-		 * quantile, not a pWCET); otherwise the node runs on
+		/* Budget provenance. The Dunning & Ertl 2019 t-digest
+		 * sliding-window quantile sketch is the active source
+		 * for the kernel runtime budget today: when enough
+		 * samples have accumulated past the bootstrap-min
+		 * gate, the runtime comes from the configured
+		 * empirical quantile; until then the node runs under
 		 * the bootstrap fallback. Calling either a "WCET"
 		 * would conflate provenance with magnitude, which
-		 * Cucu-Grosjean et al. 2012 explicitly warns against. */
+		 * Cucu-Grosjean et al. 2012 explicitly warns against.
+		 *
+		 * The MBPTA pWCET estimator runs in parallel and its
+		 * state is surfaced separately under mbpta_*. Once
+		 * its state reaches PWCET_VALID and the operator opts
+		 * in via deadline.mbpta.accept_probabilistic_hard,
+		 * the kernel runtime will switch to mbpta_pwcet_ns
+		 * and the budget_kind will flip to PWCET. */
 		if (mn != NULL && mn->sketch_ready) {
 			uint32_t count = wcet_sketch_count(&mn->sketch);
 			pn.budget_sample_count = count;
@@ -2318,6 +2394,16 @@ static int populate_params_snapshot(struct impl *impl,
 		} else {
 			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
 			pn.budget_sample_count = 0;
+		}
+		if (mn != NULL && mn->mbpta != NULL) {
+			pn.mbpta_state =
+				(enum rt_diag_mbpta_state)mbpta_state(mn->mbpta);
+			pn.mbpta_pwcet_ns = mbpta_pwcet_ns(mn->mbpta);
+			pn.mbpta_block_count = mbpta_block_count(mn->mbpta);
+		} else {
+			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
+			pn.mbpta_pwcet_ns = 0;
+			pn.mbpta_block_count = 0;
 		}
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
@@ -3189,6 +3275,74 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		else
 			pw_log_warn("wcet.min-samples %s ignored", s);
 	}
+
+	/* MBPTA defaults follow the plan's starting points. They
+	 * are placeholders pending a calibration pass; the
+	 * per-knob deadline.mbpta.* options below override them. */
+	impl->mbpta_sample_window     = 2048;
+	impl->mbpta_warmup_discard    = 64;
+	impl->mbpta_block_size        = 32;
+	impl->mbpta_min_blocks        = 50;
+	impl->mbpta_alpha_iid         = 0.05;
+	impl->mbpta_n_delta           = 50;
+	impl->mbpta_n_conv            = 5;
+	impl->mbpta_crps_threshold    = 0.1;
+	impl->mbpta_eps_node          = 1e-9;
+	impl->mbpta_n_iid_reject      = 3;
+	impl->mbpta_accept_probabilistic_hard = false;
+
+	if ((s = pw_properties_get(props, "deadline.mbpta.sample_window")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 2 && v <= UINT32_MAX)
+			impl->mbpta_sample_window = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.warmup_discard")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v <= UINT32_MAX)
+			impl->mbpta_warmup_discard = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.block_size")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 2 && v <= UINT32_MAX)
+			impl->mbpta_block_size = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.min_blocks")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 2 && v <= UINT32_MAX)
+			impl->mbpta_min_blocks = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.alpha_iid")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->mbpta_alpha_iid = v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.n_delta")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 1 && v <= UINT32_MAX)
+			impl->mbpta_n_delta = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.n_conv")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 1 && v <= UINT32_MAX)
+			impl->mbpta_n_conv = (uint32_t)v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.crps_threshold")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0)
+			impl->mbpta_crps_threshold = v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.eps_node")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->mbpta_eps_node = v;
+	}
+	if ((s = pw_properties_get(props, "deadline.mbpta.n_iid_reject")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 1 && v <= UINT32_MAX)
+			impl->mbpta_n_iid_reject = (uint32_t)v;
+	}
+	impl->mbpta_accept_probabilistic_hard = pw_properties_get_bool(props,
+			"deadline.mbpta.accept_probabilistic_hard", false);
 
 	impl->debug_dump_raw_graph = pw_properties_get_bool(props,
 			"debug.dump-raw-graph", false);

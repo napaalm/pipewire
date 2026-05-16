@@ -386,6 +386,26 @@ enum rt_diag_budget_kind {
 
 const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k);
 
+/*
+ * MBPTA estimator state mirror. The enum is intentionally a
+ * caller-visible copy of mbpta.h's state machine so the diag
+ * layer can render the tokens without depending on the
+ * estimator TU. The accompanying pwcet_ns is the most recent
+ * tail-extrapolation result; zero unless state == PWCET_VALID.
+ * Tokens are the same lower_snake_case strings the estimator's
+ * mbpta_state_name returns.
+ */
+enum rt_diag_mbpta_state {
+	RT_DIAG_MBPTA_INSUFFICIENT_DATA   = 0,
+	RT_DIAG_MBPTA_IID_PENDING         = 1,
+	RT_DIAG_MBPTA_NON_GUMBEL          = 2,
+	RT_DIAG_MBPTA_PENDING_CONVERGENCE = 3,
+	RT_DIAG_MBPTA_PWCET_VALID         = 4,
+	RT_DIAG_MBPTA_DRIFT               = 5,
+};
+
+const char *rt_diag_mbpta_state_name(enum rt_diag_mbpta_state s);
+
 struct rt_diag_param_node {
 	uint32_t id;
 	pid_t    tid;
@@ -397,6 +417,9 @@ struct rt_diag_param_node {
 	bool     applied;
 	enum rt_diag_budget_kind budget_kind;
 	uint64_t budget_sample_count;
+	enum rt_diag_mbpta_state mbpta_state;
+	uint64_t mbpta_pwcet_ns;
+	uint32_t mbpta_block_count;
 };
 
 struct rt_diag_params_snapshot {
