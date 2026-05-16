@@ -216,6 +216,117 @@ PWTEST(diag_raw_render_text_golden)
 	return PWTEST_PASS;
 }
 
+/* --- scheduling-DAG slice tests --- */
+
+PWTEST(diag_sched_init_zeroes)
+{
+	struct rt_diag_sched_snapshot s;
+	memset(&s, 0xcc, sizeof(s));
+	rt_diag_sched_snapshot_init(&s);
+	pwtest_ptr_null(s.nodes);
+	pwtest_ptr_null(s.edges);
+	pwtest_ptr_null(s.excluded_edges);
+	pwtest_int_eq((int)s.n_nodes, 0);
+	pwtest_int_eq((int)s.n_edges, 0);
+	pwtest_int_eq((int)s.n_excluded, 0);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_sched_null_safe)
+{
+	rt_diag_sched_snapshot_init(NULL);
+	rt_diag_sched_snapshot_fini(NULL);
+	rt_diag_sched_snapshot_reset(NULL);
+	rt_diag_sched_snapshot_render_text(NULL, stderr);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_sched_excluded_rejects_none)
+{
+	struct rt_diag_sched_snapshot s;
+	struct rt_diag_sched_excluded_edge e = { 0 };
+	rt_diag_sched_snapshot_init(&s);
+	e.src = 1; e.dst = 2; e.reason = RT_DIAG_SCHED_EXC_NONE;
+	/* NONE must not appear in the excluded list -- the reason
+	 * sentinel is just for "this edge is not excluded". */
+	pwtest_int_eq(rt_diag_sched_snapshot_add_excluded(&s, &e), -EINVAL);
+	pwtest_int_eq((int)s.n_excluded, 0);
+	rt_diag_sched_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_sched_reason_names_stable)
+{
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_NONE),
+		      "none");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_FEEDBACK),
+		      "feedback");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_ASYNC),
+		      "async");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_CROSS_DRIVER),
+		      "cross_driver");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_EXPORTED),
+		      "exported");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_NON_RT),
+		      "non_rt");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name(RT_DIAG_SCHED_EXC_UNSUPPORTED),
+		      "unsupported");
+	pwtest_str_eq(rt_diag_sched_exclude_reason_name((enum rt_diag_sched_exclude_reason)999),
+		      "unknown");
+	return PWTEST_PASS;
+}
+
+PWTEST(diag_sched_render_text_golden)
+{
+	struct rt_diag_sched_snapshot s;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+	const char expected[] =
+		"deadline-diag-sched: driver=63 generation=4 period_ns=1000000 deadline_ns=1000000\n"
+		"  nodes: 2\n"
+		"    node id=37 tid=302370\n"
+		"    node id=38 tid=302371\n"
+		"  edges: 1\n"
+		"    edge 38->63\n"
+		"  excluded: 2\n"
+		"    excluded 100->101 reason=feedback\n"
+		"    excluded 76->37 reason=async\n";
+
+	rt_diag_sched_snapshot_init(&s);
+	s.driver_id = 63;
+	s.generation = 4;
+	s.period_ns = 1000000ull;
+	s.deadline_ns = 1000000ull;
+
+	struct rt_diag_sched_node n = { 0 };
+	n.id = 37; n.tid = 302370;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_node(&s, &n), 0);
+	n.id = 38; n.tid = 302371;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_node(&s, &n), 0);
+
+	struct rt_diag_sched_edge e = { 0 };
+	e.src = 38; e.dst = 63;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_edge(&s, &e), 0);
+
+	struct rt_diag_sched_excluded_edge x = { 0 };
+	x.src = 100; x.dst = 101; x.reason = RT_DIAG_SCHED_EXC_FEEDBACK;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_excluded(&s, &x), 0);
+	x.src = 76;  x.dst = 37;  x.reason = RT_DIAG_SCHED_EXC_ASYNC;
+	pwtest_int_eq(rt_diag_sched_snapshot_add_excluded(&s, &x), 0);
+
+	fp = open_memstream(&buf, &len);
+	pwtest_ptr_notnull(fp);
+	rt_diag_sched_snapshot_render_text(&s, fp);
+	fclose(fp);
+
+	pwtest_str_eq(buf, expected);
+
+	free(buf);
+	rt_diag_sched_snapshot_fini(&s);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_diag)
 {
 	pwtest_add(diag_raw_init_zeroes, PWTEST_NOARG);
@@ -225,6 +336,11 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_raw_add_node_copies_and_truncates_name, PWTEST_NOARG);
 	pwtest_add(diag_raw_geometric_growth, PWTEST_NOARG);
 	pwtest_add(diag_raw_render_text_golden, PWTEST_NOARG);
+	pwtest_add(diag_sched_init_zeroes, PWTEST_NOARG);
+	pwtest_add(diag_sched_null_safe, PWTEST_NOARG);
+	pwtest_add(diag_sched_excluded_rejects_none, PWTEST_NOARG);
+	pwtest_add(diag_sched_reason_names_stable, PWTEST_NOARG);
+	pwtest_add(diag_sched_render_text_golden, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

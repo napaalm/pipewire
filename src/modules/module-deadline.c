@@ -687,6 +687,16 @@ struct impl {
 	 * regardless of whether it would survive the scheduling-DAG
 	 * inclusion filters. */
 	bool                  debug_dump_raw_graph;
+
+	/* Companion switch for the scheduling-DAG slice. When true,
+	 * the snapshot path emits an in-period view: the followers
+	 * the daemon will hand to the analysis layer plus every link
+	 * the inclusion filters dropped, each tagged with a single
+	 * exclusion reason (feedback, async, exported, ...). Gated
+	 * identically to debug_dump_raw_graph; the two views can be
+	 * enabled independently because operators occasionally want
+	 * the curated view without the raw-graph noise. */
+	bool                  debug_dump_sched_graph;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -1633,6 +1643,25 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
  * topology view, so the work is bounded by the same set the
  * scheduler already pays for once per topology-fingerprint change.
  */
+
+/* Emit a multi-line text buffer one logical line per pw_log_info
+ * call so the PipeWire logger renders it the same way hist_dump
+ * does. The buffer is mutated in place (the newline is stomped with
+ * '\0' to terminate the line) -- callers must own a mutable copy. */
+static void log_info_lines(char *buf)
+{
+	char *cursor = buf;
+	while (*cursor != '\0') {
+		char *nl = strchr(cursor, '\n');
+		if (nl != NULL)
+			*nl = '\0';
+		pw_log_info("%s", cursor);
+		if (nl == NULL)
+			break;
+		cursor = nl + 1;
+	}
+}
+
 static void dump_raw_graph_main(struct impl *impl, struct node *drv)
 {
 	struct pw_impl_node *dnode = drv->node;
@@ -1713,25 +1742,141 @@ static void dump_raw_graph_main(struct impl *impl, struct node *drv)
 		goto cleanup;
 	rt_diag_raw_snapshot_render_text(&snap, fp);
 	fclose(fp);
-	/* The PipeWire logger prefers one logical line per pw_log_info
-	 * call; emit the rendered text line by line so multi-line
-	 * snapshots render cleanly in journalctl / pw.log. */
-	if (buf != NULL) {
-		char *cursor = buf;
-		while (*cursor != '\0') {
-			char *nl = strchr(cursor, '\n');
-			if (nl != NULL)
-				*nl = '\0';
-			pw_log_info("%s", cursor);
-			if (nl == NULL)
-				break;
-			cursor = nl + 1;
-		}
-	}
+	if (buf != NULL)
+		log_info_lines(buf);
 
 cleanup:
 	free(buf);
 	rt_diag_raw_snapshot_fini(&snap);
+}
+
+/* Is `follower` a candidate for the scheduling-DAG inclusion set?
+ * The rule mirrors the existing topology-snapshot filter: a follower
+ * that publishes PW_KEY_NODE_LOOP_DYNAMIC plus a numeric
+ * PW_KEY_NODE_LOOP_TID is on a dedicated data-loop thread the
+ * daemon can configure with SCHED_DEADLINE. Any other follower is
+ * excluded from the scheduling DAG with an UNSUPPORTED reason on
+ * its edges. */
+static bool sched_dag_follower_in_set(struct pw_impl_node *follower)
+{
+	if (!pw_properties_get_bool(follower->properties,
+			PW_KEY_NODE_LOOP_DYNAMIC, false))
+		return false;
+	return pw_properties_get_int32(follower->properties,
+			PW_KEY_NODE_LOOP_TID, -1) >= 0;
+}
+
+/* Per-edge exclusion reason, derived from the pw_impl_link state
+ * the topology pass already consults. Returns RT_DIAG_SCHED_EXC_NONE
+ * for an edge that should land in the included-edges list. */
+static enum rt_diag_sched_exclude_reason sched_dag_edge_reason(
+		struct pw_impl_link *l, struct pw_impl_node *src,
+		struct pw_impl_node *dst)
+{
+	if (l->feedback)
+		return RT_DIAG_SCHED_EXC_FEEDBACK;
+	if ((src != NULL && src->async) || (dst != NULL && dst->async))
+		return RT_DIAG_SCHED_EXC_ASYNC;
+	if ((src != NULL && src->exported) || (dst != NULL && dst->exported))
+		return RT_DIAG_SCHED_EXC_EXPORTED;
+	if (src == NULL || dst == NULL ||
+	    !sched_dag_follower_in_set(src) ||
+	    !sched_dag_follower_in_set(dst))
+		return RT_DIAG_SCHED_EXC_UNSUPPORTED;
+	return RT_DIAG_SCHED_EXC_NONE;
+}
+
+/* Build a scheduling-DAG diagnostic snapshot and emit it via
+ * pw_log_info. The included set is the same one the existing
+ * topology pass passes to the worker (dynamic-loop followers with a
+ * known TID, plus their feedback-/async-free links). The excluded
+ * list records every link that did not make it into that set,
+ * tagged with the single reason that drove the exclusion. */
+static void dump_sched_graph_main(struct impl *impl, struct node *drv)
+{
+	struct pw_impl_node *dnode = drv->node;
+	struct pw_impl_node *n_iter;
+	struct rt_diag_sched_snapshot snap;
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *fp;
+
+	rt_diag_sched_snapshot_init(&snap);
+	snap.driver_id = dnode->info.id;
+	snap.generation = SPA_ATOMIC_LOAD(drv->topo.generation);
+	snap.period_ns = drv->topo.period;
+	snap.deadline_ns = drv->topo.period;
+
+	/* The driver itself is implicitly part of the schedulable
+	 * set: it is the activation root of the in-period DAG.
+	 * Surface it so the included-nodes list is reader-friendly. */
+	{
+		struct rt_diag_sched_node sn = { 0 };
+		sn.id = dnode->info.id;
+		sn.tid = pw_properties_get_int32(dnode->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		if (rt_diag_sched_snapshot_add_node(&snap, &sn) < 0)
+			goto cleanup;
+	}
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		if (n_iter == dnode)
+			continue;
+		if (!sched_dag_follower_in_set(n_iter))
+			continue;
+		struct rt_diag_sched_node sn = { 0 };
+		sn.id = n_iter->info.id;
+		sn.tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		if (rt_diag_sched_snapshot_add_node(&snap, &sn) < 0)
+			goto cleanup;
+	}
+
+	/* Walk every output-port link once; each link is classified
+	 * by sched_dag_edge_reason. RT_DIAG_SCHED_EXC_NONE lands in
+	 * the included list; anything else lands in the excluded
+	 * list with its reason. */
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct pw_impl_port *p;
+		struct pw_impl_link *l;
+		spa_list_for_each(p, &n_iter->output_ports, link) {
+			spa_list_for_each(l, &p->links, output_link) {
+				struct pw_impl_node *src, *dst;
+				enum rt_diag_sched_exclude_reason r;
+
+				if (l->input == NULL || l->input->node == NULL)
+					continue;
+				src = n_iter;
+				dst = l->input->node;
+				r = sched_dag_edge_reason(l, src, dst);
+				if (r == RT_DIAG_SCHED_EXC_NONE) {
+					struct rt_diag_sched_edge se = { 0 };
+					se.src = src->info.id;
+					se.dst = dst->info.id;
+					if (rt_diag_sched_snapshot_add_edge(&snap, &se) < 0)
+						goto cleanup;
+				} else {
+					struct rt_diag_sched_excluded_edge xe = { 0 };
+					xe.src = src->info.id;
+					xe.dst = dst->info.id;
+					xe.reason = r;
+					if (rt_diag_sched_snapshot_add_excluded(&snap, &xe) < 0)
+						goto cleanup;
+				}
+			}
+		}
+	}
+
+	fp = open_memstream(&buf, &len);
+	if (fp == NULL)
+		goto cleanup;
+	rt_diag_sched_snapshot_render_text(&snap, fp);
+	fclose(fp);
+	if (buf != NULL)
+		log_info_lines(buf);
+
+cleanup:
+	free(buf);
+	rt_diag_sched_snapshot_fini(&snap);
 }
 
 /* Main-loop context: walk the driver's follower list and the
@@ -1870,6 +2015,8 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 			SPA_ATOMIC_STORE(t->generation, t->generation + 1);
 			if (drv->impl != NULL && drv->impl->debug_dump_raw_graph)
 				dump_raw_graph_main(drv->impl, drv);
+			if (drv->impl != NULL && drv->impl->debug_dump_sched_graph)
+				dump_sched_graph_main(drv->impl, drv);
 		}
 	}
 	SPA_ATOMIC_STORE(t->pending, 0);
@@ -2473,6 +2620,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (impl->debug_dump_raw_graph)
 		pw_log_info("debug.dump-raw-graph = true (raw-graph diagnostic"
 				" dumps will be logged on topology change)");
+	impl->debug_dump_sched_graph = pw_properties_get_bool(props,
+			"debug.dump-sched-graph", false);
+	if (impl->debug_dump_sched_graph)
+		pw_log_info("debug.dump-sched-graph = true (scheduling-DAG"
+				" diagnostic dumps will be logged on topology change)");
 
 	impl->recalc_persistent = pw_properties_get_bool(props, "recalc.persistent", true);
 	impl->wcet_recalc_threshold = 0.01;

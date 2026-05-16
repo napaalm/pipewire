@@ -210,3 +210,137 @@ void rt_diag_raw_snapshot_render_text(const struct rt_diag_raw_snapshot *s,
 		fputc('\n', out);
 	}
 }
+
+/* --- scheduling-DAG slice --- */
+
+void rt_diag_sched_snapshot_init(struct rt_diag_sched_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_sched_snapshot_fini(struct rt_diag_sched_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	free(s->nodes);
+	free(s->edges);
+	free(s->excluded_edges);
+	memset(s, 0, sizeof(*s));
+}
+
+void rt_diag_sched_snapshot_reset(struct rt_diag_sched_snapshot *s)
+{
+	if (s == NULL)
+		return;
+	s->n_nodes = 0;
+	s->n_edges = 0;
+	s->n_excluded = 0;
+	s->driver_id = 0;
+	s->generation = 0;
+	s->period_ns = 0;
+	s->deadline_ns = 0;
+}
+
+int rt_diag_sched_snapshot_add_node(struct rt_diag_sched_snapshot *s,
+				    const struct rt_diag_sched_node *node)
+{
+	if (s == NULL || node == NULL)
+		return -EINVAL;
+	if (s->n_nodes == s->cap_nodes) {
+		int r = grow_array((void **)&s->nodes, &s->cap_nodes,
+				   (uint32_t)sizeof(*s->nodes),
+				   RT_DIAG_INITIAL_NODES);
+		if (r < 0)
+			return r;
+	}
+	s->nodes[s->n_nodes++] = *node;
+	return 0;
+}
+
+int rt_diag_sched_snapshot_add_edge(struct rt_diag_sched_snapshot *s,
+				    const struct rt_diag_sched_edge *edge)
+{
+	if (s == NULL || edge == NULL)
+		return -EINVAL;
+	if (s->n_edges == s->cap_edges) {
+		int r = grow_array((void **)&s->edges, &s->cap_edges,
+				   (uint32_t)sizeof(*s->edges),
+				   RT_DIAG_INITIAL_EDGES);
+		if (r < 0)
+			return r;
+	}
+	s->edges[s->n_edges++] = *edge;
+	return 0;
+}
+
+int rt_diag_sched_snapshot_add_excluded(struct rt_diag_sched_snapshot *s,
+					const struct rt_diag_sched_excluded_edge *edge)
+{
+	if (s == NULL || edge == NULL)
+		return -EINVAL;
+	if (edge->reason == RT_DIAG_SCHED_EXC_NONE)
+		return -EINVAL;
+	if (s->n_excluded == s->cap_excluded) {
+		int r = grow_array((void **)&s->excluded_edges,
+				   &s->cap_excluded,
+				   (uint32_t)sizeof(*s->excluded_edges),
+				   RT_DIAG_INITIAL_EDGES);
+		if (r < 0)
+			return r;
+	}
+	s->excluded_edges[s->n_excluded++] = *edge;
+	return 0;
+}
+
+const char *rt_diag_sched_exclude_reason_name(enum rt_diag_sched_exclude_reason r)
+{
+	switch (r) {
+	case RT_DIAG_SCHED_EXC_NONE:         return "none";
+	case RT_DIAG_SCHED_EXC_FEEDBACK:     return "feedback";
+	case RT_DIAG_SCHED_EXC_ASYNC:        return "async";
+	case RT_DIAG_SCHED_EXC_CROSS_DRIVER: return "cross_driver";
+	case RT_DIAG_SCHED_EXC_EXPORTED:     return "exported";
+	case RT_DIAG_SCHED_EXC_NON_RT:       return "non_rt";
+	case RT_DIAG_SCHED_EXC_UNSUPPORTED:  return "unsupported";
+	}
+	return "unknown";
+}
+
+void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
+					FILE *out)
+{
+	uint32_t i;
+
+	if (s == NULL || out == NULL)
+		return;
+
+	fprintf(out,
+		"deadline-diag-sched: driver=%u generation=%llu period_ns=%llu deadline_ns=%llu\n",
+		s->driver_id,
+		(unsigned long long)s->generation,
+		(unsigned long long)s->period_ns,
+		(unsigned long long)s->deadline_ns);
+
+	fprintf(out, "  nodes: %u\n", s->n_nodes);
+	for (i = 0; i < s->n_nodes; i++) {
+		const struct rt_diag_sched_node *n = &s->nodes[i];
+		fprintf(out, "    node id=%u tid=%d\n",
+			n->id, (int)n->tid);
+	}
+
+	fprintf(out, "  edges: %u\n", s->n_edges);
+	for (i = 0; i < s->n_edges; i++) {
+		const struct rt_diag_sched_edge *e = &s->edges[i];
+		fprintf(out, "    edge %u->%u\n", e->src, e->dst);
+	}
+
+	fprintf(out, "  excluded: %u\n", s->n_excluded);
+	for (i = 0; i < s->n_excluded; i++) {
+		const struct rt_diag_sched_excluded_edge *e = &s->excluded_edges[i];
+		fprintf(out, "    excluded %u->%u reason=%s\n",
+			e->src, e->dst,
+			rt_diag_sched_exclude_reason_name(e->reason));
+	}
+}

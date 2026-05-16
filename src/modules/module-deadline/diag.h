@@ -161,6 +161,101 @@ int rt_diag_raw_snapshot_add_edge(struct rt_diag_raw_snapshot *s,
 void rt_diag_raw_snapshot_render_text(const struct rt_diag_raw_snapshot *s,
 				      FILE *out);
 
+/*
+ * Scheduling-DAG slice.
+ *
+ * Where the raw-graph slice records every follower and every link
+ * verbatim, the scheduling-DAG slice records the subset that
+ * contributes an in-period precedence constraint -- the actual
+ * input to the deadline analysis. The dump surfaces (a) the
+ * included nodes, (b) the included edges, and (c) every edge that
+ * was rejected from the included set, tagged with a single
+ * exclusion-reason code so the operator can correlate the
+ * scheduling decision against the raw graph.
+ *
+ * The reason set is closed: every excluded edge must carry exactly
+ * one reason from the enum below. NONE is the sentinel for "not
+ * excluded"; it must never appear in the excluded-edges list. New
+ * reasons may be appended; the textual token is stable.
+ */
+enum rt_diag_sched_exclude_reason {
+	RT_DIAG_SCHED_EXC_NONE         = 0,
+	RT_DIAG_SCHED_EXC_FEEDBACK     = 1,
+	RT_DIAG_SCHED_EXC_ASYNC        = 2,
+	RT_DIAG_SCHED_EXC_CROSS_DRIVER = 3,
+	RT_DIAG_SCHED_EXC_EXPORTED     = 4,
+	RT_DIAG_SCHED_EXC_NON_RT       = 5,
+	RT_DIAG_SCHED_EXC_UNSUPPORTED  = 6,
+};
+
+struct rt_diag_sched_node {
+	uint32_t id;
+	pid_t    tid;
+};
+
+struct rt_diag_sched_edge {
+	uint32_t src;
+	uint32_t dst;
+};
+
+struct rt_diag_sched_excluded_edge {
+	uint32_t src;
+	uint32_t dst;
+	enum rt_diag_sched_exclude_reason reason;
+};
+
+struct rt_diag_sched_snapshot {
+	uint32_t driver_id;
+	uint64_t generation;
+	uint64_t period_ns;
+	uint64_t deadline_ns;
+
+	struct rt_diag_sched_node *nodes;
+	uint32_t n_nodes;
+	uint32_t cap_nodes;
+
+	struct rt_diag_sched_edge *edges;
+	uint32_t n_edges;
+	uint32_t cap_edges;
+
+	struct rt_diag_sched_excluded_edge *excluded_edges;
+	uint32_t n_excluded;
+	uint32_t cap_excluded;
+};
+
+void rt_diag_sched_snapshot_init(struct rt_diag_sched_snapshot *s);
+void rt_diag_sched_snapshot_fini(struct rt_diag_sched_snapshot *s);
+void rt_diag_sched_snapshot_reset(struct rt_diag_sched_snapshot *s);
+
+int rt_diag_sched_snapshot_add_node(struct rt_diag_sched_snapshot *s,
+				    const struct rt_diag_sched_node *node);
+int rt_diag_sched_snapshot_add_edge(struct rt_diag_sched_snapshot *s,
+				    const struct rt_diag_sched_edge *edge);
+int rt_diag_sched_snapshot_add_excluded(struct rt_diag_sched_snapshot *s,
+					const struct rt_diag_sched_excluded_edge *edge);
+
+/* Stable token for a given exclusion reason. The strings are kept
+ * narrow (lower_snake_case) so the rendered text is grep-friendly.
+ * Unknown reasons render as "unknown". */
+const char *rt_diag_sched_exclude_reason_name(enum rt_diag_sched_exclude_reason r);
+
+/*
+ * Render to `out` as a stable text block:
+ *
+ *   deadline-diag-sched: driver=<id> generation=<g> period_ns=<p> deadline_ns=<d>
+ *     nodes: <n>
+ *       node id=<i> tid=<t>
+ *       ...
+ *     edges: <n>
+ *       edge <src>-><dst>
+ *       ...
+ *     excluded: <n>
+ *       excluded <src>-><dst> reason=<reason>
+ *       ...
+ */
+void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
+					FILE *out);
+
 #ifdef __cplusplus
 }
 #endif
