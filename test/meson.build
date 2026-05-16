@@ -124,6 +124,15 @@ test('test-module-deadline-contracted',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-fusion-validator',
+    executable('test-module-deadline-fusion-validator',
+               'test-module-deadline-fusion-validator.c',
+               '../src/modules/module-deadline/fusion_validator.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',
