@@ -410,6 +410,109 @@ PWTEST(fusion_convex_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
+/* --- externally atomic predicate (Phase 3.4) --- */
+
+PWTEST(fusion_externally_atomic_singleton_accepts)
+{
+	uint32_t members[] = { 1 };
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_externally_atomic_accept(
+				members, 1, NULL, 0, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C, F = {A, B}. A is non-terminal (A -> B
+ * internal). A has no external successors. B is terminal (no
+ * internal successor); B -> C is an external successor from a
+ * terminal member -- accepted. */
+PWTEST(fusion_externally_atomic_chain_prefix_accepts)
+{
+	uint32_t members[] = { 1, 2 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_externally_atomic_accept(
+				members, 2, edges, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* A -> B -> C, A -> X, F = {A, B}. A is non-terminal (A -> B
+ * internal). A also has external successor X -- that is the
+ * internal-milestone violation. Reject. */
+PWTEST(fusion_externally_atomic_non_terminal_external_succ_rejects)
+{
+	uint32_t members[] = { 1, 2 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 1, 99 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_externally_atomic_accept(
+				members, 2, edges, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_INTERNAL_MILESTONE);
+	return PWTEST_PASS;
+}
+
+/* Fork A -> B, A -> C, F = {A, B, C}. A has two internal
+ * outgoing edges (to B and to C), so A is non-terminal. A has
+ * no external outgoing edges. B and C are terminal (no
+ * outgoing edges at all). Accepted. */
+PWTEST(fusion_externally_atomic_fork_full_accepts)
+{
+	uint32_t members[] = { 1, 2, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_externally_atomic_accept(
+				members, 3, edges, 2, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C with C having external successor D, F =
+ * {A, B, C}. A: non-terminal, no external out. B: non-terminal,
+ * no external out. C: terminal (no internal out), external out
+ * to D -- allowed. Accept. */
+PWTEST(fusion_externally_atomic_chain_full_with_external_sink_accepts)
+{
+	uint32_t members[] = { 1, 2, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 3, 4 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_BLOCKING_RISK;
+	pwtest_bool_true(fusion_validator_externally_atomic_accept(
+				members, 3, edges, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Chain A -> B -> C, B -> X (external), F = {A, B, C}. B is
+ * non-terminal (B -> C is internal). B also has external
+ * successor X. Reject (B is an internal milestone). */
+PWTEST(fusion_externally_atomic_middle_external_succ_rejects)
+{
+	uint32_t members[] = { 1, 2, 3 };
+	struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 2, 99 },
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_externally_atomic_accept(
+				members, 3, edges, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_INTERNAL_MILESTONE);
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_externally_atomic_null_member_ids_rejects)
+{
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_externally_atomic_accept(
+				NULL, 2, NULL, 0, &r));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -440,6 +543,13 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_convex_fork_full_accepts, PWTEST_NOARG);
 	pwtest_add(fusion_convex_chain_skip_middle_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_convex_null_member_ids_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_singleton_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_chain_prefix_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_non_terminal_external_succ_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_fork_full_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_chain_full_with_external_sink_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_middle_external_succ_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_externally_atomic_null_member_ids_rejects, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

@@ -209,6 +209,36 @@ bool fusion_validator_precedence_convex_accept(
 		const struct fusion_edge_input *edges, uint32_t n_edges,
 		enum fusion_reject_reason *out_reason);
 
+/*
+ * Externally atomic predicate.
+ *
+ * A single SCHED_DEADLINE reservation has one local deadline. If
+ * a non-terminal internal member has an external successor, that
+ * successor's release depends on a milestone INSIDE the group
+ * that the macro-node deadline cannot represent: the external
+ * peer observes the internal member's output before the macro-
+ * node completes, and there is no kernel-visible deadline that
+ * pins when. Without an internal milestone-aware dispatcher
+ * (deferred future work), such groups are unsound.
+ *
+ * "Terminal internal member" = a member with no outgoing edges
+ * to other F members. Terminal members may have external
+ * outgoing edges (those represent the macro-node's externally
+ * observable output, which the macro deadline does pin).
+ *
+ * The first implementation policy is the conservative one the
+ * plan calls for: reject any group containing a non-terminal
+ * internal member with an external outgoing edge.
+ *
+ * Returns true with *out_reason = NONE on accept, false with
+ * *out_reason = INTERNAL_MILESTONE on reject. n_members <= 1
+ * trivially accepts.
+ */
+bool fusion_validator_externally_atomic_accept(
+		const uint32_t *member_ids, uint32_t n_members,
+		const struct fusion_edge_input *edges, uint32_t n_edges,
+		enum fusion_reject_reason *out_reason);
+
 /* Stable lower_snake_case token for a given rejection reason.
  * Unknown values render as "unknown". */
 const char *fusion_reject_reason_name(enum fusion_reject_reason r);

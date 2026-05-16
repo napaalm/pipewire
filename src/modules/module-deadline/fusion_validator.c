@@ -245,6 +245,47 @@ bool fusion_validator_precedence_convex_accept(
 	return accept;
 }
 
+bool fusion_validator_externally_atomic_accept(
+		const uint32_t *member_ids, uint32_t n_members,
+		const struct fusion_edge_input *edges, uint32_t n_edges,
+		enum fusion_reject_reason *out_reason)
+{
+	enum fusion_reject_reason ignore = FUSION_REJ_NONE;
+	uint32_t i, e;
+
+	if (out_reason == NULL)
+		out_reason = &ignore;
+	*out_reason = FUSION_REJ_NONE;
+
+	if (n_members <= 1)
+		return true;
+	if (member_ids == NULL)
+		return false;
+
+	for (i = 0; i < n_members; i++) {
+		uint32_t m = member_ids[i];
+		bool is_terminal = true;
+		bool has_external_out = false;
+
+		for (e = 0; e < n_edges; e++) {
+			if (edges[e].src_id != m)
+				continue;
+			if (id_in_set(member_ids, n_members,
+					edges[e].dst_id))
+				is_terminal = false;
+			else
+				has_external_out = true;
+		}
+
+		if (!is_terminal && has_external_out) {
+			*out_reason = FUSION_REJ_INTERNAL_MILESTONE;
+			return false;
+		}
+	}
+
+	return true;
+}
+
 const char *fusion_reject_reason_name(enum fusion_reject_reason r)
 {
 	switch (r) {
