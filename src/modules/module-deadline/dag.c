@@ -56,6 +56,8 @@ static void dag_invalidate_schedule(dag_t *g)
 	spa_list_for_each(n, &g->nodes, link) {
 		n->deadline_assigned = false;
 		n->deadline = 0;
+		n->cumulative_deadline = 0;
+		n->local_deadline = 0;
 		n->remaining_deadline = 0;
 		n->cpu = DAG_CPU_INVALID;
 	}
@@ -453,6 +455,8 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->longest_next = -1;
 	n->successors = NULL;
 	n->deadline = 0;
+	n->cumulative_deadline = 0;
+	n->local_deadline = 0;
 	n->cpu = DAG_CPU_INVALID;
 	n->deadline_assigned = false;
 	spa_list_init(&n->outgoing);

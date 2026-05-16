@@ -54,7 +54,43 @@ struct dag_node {
 	uint32_t id;
 	uint32_t index;      /* dense topological index for analysis caches */
 	uint64_t wcet;       /* worst case execution time */
-	uint64_t deadline;   /* assigned relative deadline */
+	uint64_t deadline;   /* assigned relative deadline (legacy field;
+			      * mirrors local_deadline once populated and is
+			      * retained for in-flight callers that have not
+			      * yet switched to the explicit fields below). */
+
+	/*
+	 * Explicit deadline semantics.
+	 *
+	 * `cumulative_deadline` is **graph-relative**: it expresses
+	 * the latest instant, measured from the driver-graph's
+	 * activation, by which this node must have finished. It is the
+	 * absolute milestone the analysis layer reasons about; it is
+	 * never passed to the kernel directly. The forward
+	 * topological sum that populates it is monotonic along every
+	 * scheduling edge: for every edge u -> v,
+	 * cumulative_deadline[u] <= cumulative_deadline[v].
+	 *
+	 * `local_deadline` is **kernel-relative**: it is the relative
+	 * deadline value handed to sched_setattr() for the node's
+	 * data-loop thread, expressing "after the node is released
+	 * (its predecessors have completed), this is the time it has
+	 * to finish". For a source node local_deadline equals
+	 * cumulative_deadline. For a non-source node it is
+	 *
+	 *   local_deadline = cumulative_deadline
+	 *                  - max(pred.cumulative_deadline)
+	 *
+	 * which is the kernel API's natural unit (Linux kernel docs,
+	 * "Deadline Task Scheduling", sched-deadline.rst).
+	 *
+	 * Both fields are zero outside an analysis pass; they are
+	 * populated by dag_recalculate and cleared by
+	 * dag_invalidate_analysis.
+	 */
+	uint64_t cumulative_deadline;
+	uint64_t local_deadline;
+
 	uint32_t cpu;        /* assigned CPU */
 	pid_t tid;           /* associated thread id */
 

@@ -153,6 +153,44 @@ static void foreach_count_cb(void *data, uint32_t id, pid_t tid, uint64_t wcet,
 		info->saw_internal_tid = true;
 }
 
+/* Smoke test for the explicit deadline fields. The legacy `deadline`
+ * member is preserved; cumulative_deadline and local_deadline are
+ * new fields with explicit graph-vs-kernel semantics. At this
+ * commit they are zero-initialised and remain zero across
+ * dag_recalculate -- a later commit wires the actual computation.
+ * This test pins the field contract: every real node starts with
+ * zero cumulative / local deadlines, and the values do not regress
+ * to anything else during the analysis pass. */
+PWTEST(explicit_deadline_fields_zero_initialised)
+{
+	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	dag_node_t *n1 = find_node_by_id(g, 1);
+	dag_node_t *n2 = find_node_by_id(g, 2);
+	pwtest_int_eq((int)n1->cumulative_deadline, 0);
+	pwtest_int_eq((int)n1->local_deadline, 0);
+	pwtest_int_eq((int)n2->cumulative_deadline, 0);
+	pwtest_int_eq((int)n2->local_deadline, 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	/* Legacy deadline field is populated by the splitter; the
+	 * explicit fields stay at zero until the populate pass lands. */
+	pwtest_bool_true(n1->deadline > 0);
+	pwtest_int_eq((int)n1->cumulative_deadline, 0);
+	pwtest_int_eq((int)n1->local_deadline, 0);
+	pwtest_int_eq((int)n2->cumulative_deadline, 0);
+	pwtest_int_eq((int)n2->local_deadline, 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(chain_uses_peak_not_sum)
 {
 	dag_t *g = dag_create(100, 100, 0.55f, 1, NULL);
@@ -2924,6 +2962,7 @@ PWTEST(unrelated_collapse_no_groups_matches_baseline)
 
 PWTEST_SUITE(module_deadline_dag)
 {
+	pwtest_add(explicit_deadline_fields_zero_initialised, PWTEST_NOARG);
 	pwtest_add(chain_uses_peak_not_sum, PWTEST_NOARG);
 	pwtest_add(fork_join_fails_on_peak_concurrency, PWTEST_NOARG);
 	pwtest_add(multi_source_initial_cut_and_cleanup, PWTEST_NOARG);
