@@ -9,6 +9,7 @@
 #include "reconcile.h"
 #include "dag.h"
 #include "contracted.h"
+#include "fusion_validator.h"
 
 #include <pipewire/log.h>
 
@@ -306,6 +307,175 @@ static bool wcet_drift_significant(reconcile_state_t *state,
 	return (diff / maxv) > state->recalc_threshold;
 }
 
+/* Run the structural fusion validators on every group present in
+ * `state_dag`'s group_id assignment and zero out group_ids that
+ * fail. Each rejected group degrades back to singletons in the
+ * contracted-DAG step, which is the same effect the dispatcher's
+ * cycle-detection fallback achieves for non-convex groups but
+ * with a clearer cause-of-rejection log line per group. The
+ * caller-visible scheduling outcome is identical to the legacy
+ * per-node path for rejected groups; the validator only matters
+ * for groups the cost model proposes that violate one of the
+ * predicates structurally.
+ *
+ * Today's reconcile inputs do not carry pw_impl_node
+ * analyzability flags or per-member nonblocking capabilities;
+ * the topology snapshot pre-filters main-loop / exported /
+ * tid<=0 followers out of the candidate set, and every dynamic-
+ * loop follower is implicitly treated as having
+ * FUSION_CAP_NONBLOCKING_PROCESS. The structural predicates that
+ * the current data path can actually run are predecessor
+ * closure, precedence convexity, and externally atomic; the
+ * analyzability and blocking-closure predicates become
+ * load-bearing once the topo snapshot carries the missing bits.
+ */
+static void reconcile_filter_unsound_groups(dag_t *state_dag)
+{
+	dag_node_t *n;
+	dag_edge_t *e;
+	uint32_t i, j;
+	uint32_t n_nodes = 0, n_edges = 0;
+	uint32_t *member_ids = NULL;
+	uint32_t *source_ids = NULL;
+	struct fusion_edge_input *edges = NULL;
+	uint32_t n_groups = 0;
+	uint32_t *seen_groups = NULL;
+
+	if (state_dag == NULL)
+		return;
+
+	/* Counts. */
+	spa_list_for_each(n, &state_dag->nodes, link) {
+		if (!n->fictitious)
+			n_nodes++;
+	}
+	spa_list_for_each(e, &state_dag->edges, link) {
+		if (!e->src->fictitious && !e->dst->fictitious)
+			n_edges++;
+	}
+	if (n_nodes == 0)
+		return;
+
+	member_ids = malloc(n_nodes * sizeof(*member_ids));
+	source_ids = malloc(n_nodes * sizeof(*source_ids));
+	seen_groups = malloc(n_nodes * sizeof(*seen_groups));
+	edges = n_edges ? malloc(n_edges * sizeof(*edges)) : NULL;
+	if (member_ids == NULL || source_ids == NULL ||
+			seen_groups == NULL ||
+			(n_edges && edges == NULL)) {
+		free(member_ids);
+		free(source_ids);
+		free(seen_groups);
+		free(edges);
+		return;
+	}
+
+	/* Fill the static views: all real nodes, all source ids
+	 * (no incoming real edges), and the flat edge array. */
+	{
+		uint32_t k = 0;
+		spa_list_for_each(n, &state_dag->nodes, link) {
+			if (n->fictitious)
+				continue;
+			source_ids[k] = n->id;
+			bool has_real_pred = false;
+			dag_edge_t *pe;
+			spa_list_for_each(pe, &n->incoming, dst_link) {
+				if (!pe->src->fictitious) {
+					has_real_pred = true;
+					break;
+				}
+			}
+			if (!has_real_pred)
+				k++;
+		}
+		/* k holds the number of sources; trim the array
+		 * length on the caller-side variable. */
+		n_groups = k; /* repurposing variable */
+	}
+	uint32_t n_sources = n_groups;
+	n_groups = 0;
+	{
+		uint32_t k = 0;
+		spa_list_for_each(e, &state_dag->edges, link) {
+			if (e->src->fictitious || e->dst->fictitious)
+				continue;
+			edges[k].src_id = e->src->id;
+			edges[k].dst_id = e->dst->id;
+			k++;
+		}
+	}
+
+	/* Iterate distinct non-zero group_ids. For each, gather its
+	 * members and run the three structural predicates the
+	 * available data supports. */
+	spa_list_for_each(n, &state_dag->nodes, link) {
+		uint32_t gid;
+		uint32_t n_members = 0;
+		enum fusion_reject_reason reason;
+		dag_node_t *m;
+		bool already_seen = false;
+
+		if (n->fictitious)
+			continue;
+		gid = n->group_id;
+		if (gid == 0)
+			continue;
+
+		for (j = 0; j < n_groups; j++) {
+			if (seen_groups[j] == gid) {
+				already_seen = true;
+				break;
+			}
+		}
+		if (already_seen)
+			continue;
+		seen_groups[n_groups++] = gid;
+
+		spa_list_for_each(m, &state_dag->nodes, link) {
+			if (m->fictitious)
+				continue;
+			if (m->group_id == gid)
+				member_ids[n_members++] = m->id;
+		}
+		if (n_members <= 1)
+			continue;
+
+		reason = FUSION_REJ_NONE;
+		bool accepted =
+			fusion_validator_predecessor_closure_accept(
+				member_ids, n_members,
+				edges, n_edges,
+				source_ids, n_sources, &reason) &&
+			fusion_validator_precedence_convex_accept(
+				member_ids, n_members,
+				edges, n_edges, &reason) &&
+			fusion_validator_externally_atomic_accept(
+				member_ids, n_members,
+				edges, n_edges, &reason);
+
+		if (!accepted) {
+			pw_log_info("reconcile: rejecting fusion group %u "
+				    "(%u members) -- reason=%s",
+				    gid, n_members,
+				    fusion_reject_reason_name(reason));
+			for (i = 0; i < n_members; i++) {
+				dag_node_t *dn = dag_find_node(state_dag,
+						member_ids[i]);
+				if (dn != NULL && dn->group_id != 0) {
+					(void)dag_set_node_group(state_dag,
+							member_ids[i], 0);
+				}
+			}
+		}
+	}
+
+	free(member_ids);
+	free(source_ids);
+	free(seen_groups);
+	free(edges);
+}
+
 /* Build a contracted DAG that mirrors `state_dag`'s topology plus
  * group assignment: every node with the same non-zero group_id
  * collapses into one macro-node; nodes with group_id == 0 form
@@ -462,6 +632,14 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 	struct dag *macro_dag = NULL;
 	dag_node_t *n;
 	int r;
+
+	/* Filter unsound fusion groups before contraction. A rejected
+	 * group has its members' group_ids cleared, which makes the
+	 * builder treat them as singletons. The downstream
+	 * cycle-detection fallback still catches the (now smaller)
+	 * residue of cases where the runtime data is insufficient to
+	 * decide soundness. */
+	reconcile_filter_unsound_groups(state_dag);
 
 	r = reconcile_build_contracted_from_dag(state_dag, period_ns,
 			period_ns, &cg);

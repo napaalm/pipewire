@@ -685,11 +685,18 @@ static dag_t *reconcile_state_peek_dag(reconcile_state_t *s);
  * layout to production callers. Implemented at the bottom of the
  * file so it can include reconcile.c's private struct. */
 
-PWTEST(reconcile_g1_shared_tid_creates_group)
+PWTEST(reconcile_g1_shared_tid_non_convex_is_rejected)
 {
-	/* Two followers share TID 100; one has its own TID. After
-	 * reconcile, the two shared ones land on the same group id
-	 * (the lowest of the pair) and the third stays ungrouped. */
+	/* The prototype's chain-merge would put 10 and 12 in one
+	 * group when they share a TID, even though 11 sits between
+	 * them in the chain 10->11->12. That fusion is precedence-
+	 * non-convex (Sarkar 1989 §5.3): the path 10 -> 11 -> 12
+	 * leaves the candidate group F = {10, 12} via 11 and
+	 * re-enters via 12. The fusion validator now rejects the
+	 * group and the reconcile layer strips the shared group_id,
+	 * so 10, 11 and 12 each land as a singleton. The old
+	 * assertion (group_id = 10 on both) was pinning the
+	 * unsound prototype behaviour. */
 	struct topo5 t;
 	reconcile_state_t *s = make_state_persistent(0.01);
 	struct cb_ctx cb = { 0 };
@@ -697,7 +704,6 @@ PWTEST(reconcile_g1_shared_tid_creates_group)
 
 	pwtest_ptr_notnull(s);
 	topo5_init(&t);
-	/* Override TIDs: 10 and 12 share TID 200; 11 has TID 201. */
 	t.followers[0].tid = 200;
 	t.followers[1].tid = 201;
 	t.followers[2].tid = 200;
@@ -715,14 +721,11 @@ PWTEST(reconcile_g1_shared_tid_creates_group)
 	pwtest_ptr_notnull(n11);
 	pwtest_ptr_notnull(n12);
 
-	/* 10 and 12 share TID -> group = min(10,12) = 10. */
-	pwtest_int_eq(n10->group_id, 10u);
-	pwtest_int_eq(n12->group_id, 10u);
-	/* 11 has unique TID -> ungrouped. */
+	/* The non-convex group {10, 12} is rejected; both members
+	 * fall back to singleton scheduling. */
+	pwtest_int_eq(n10->group_id, 0u);
+	pwtest_int_eq(n12->group_id, 0u);
 	pwtest_int_eq(n11->group_id, 0u);
-
-	/* Co-location effect: 10 and 12 must share a CPU. */
-	pwtest_int_eq((int)n10->cpu, (int)n12->cpu);
 
 	reconcile_fini(s);
 	return PWTEST_PASS;
@@ -791,9 +794,17 @@ PWTEST(reconcile_g3_chain_share_tid_collapses_to_one_cpu)
 PWTEST(reconcile_g4_chain_break_reverts_group)
 {
 	/* First pass: three followers share a TID (chain-merged).
+	 * The full chain {10, 11, 12} on edges 10->11->12 is
+	 * precedence-convex (the whole chain is in F) so the
+	 * validator accepts it.
+	 *
 	 * Second pass: the middle node's TID changes (chain broke).
-	 * The new DAG should show the two remaining shared-TID
-	 * followers grouped and the middle node ungrouped. */
+	 * The remaining shared-TID followers are {10, 12} -- and
+	 * that is precedence-non-convex (11 sits between them). The
+	 * fusion validator rejects the residual group; 10, 11 and
+	 * 12 all end as singletons. The old expectation (10 and 12
+	 * still share group_id 10) pinned the prototype's unsound
+	 * behaviour. */
 	struct topo5 t;
 	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
@@ -817,9 +828,9 @@ PWTEST(reconcile_g4_chain_break_reverts_group)
 	dag_node_t *n10 = dag_find_node(dag, 10);
 	dag_node_t *n11 = dag_find_node(dag, 11);
 	dag_node_t *n12 = dag_find_node(dag, 12);
-	pwtest_int_eq(n10->group_id, 10u);  /* 10 and 12 still share */
-	pwtest_int_eq(n12->group_id, 10u);
-	pwtest_int_eq(n11->group_id, 0u);   /* 11 is alone now */
+	pwtest_int_eq(n10->group_id, 0u);  /* non-convex {10,12} rejected */
+	pwtest_int_eq(n12->group_id, 0u);
+	pwtest_int_eq(n11->group_id, 0u);   /* 11 was alone already */
 
 	reconcile_fini(s);
 	return PWTEST_PASS;
@@ -863,22 +874,27 @@ PWTEST(reconcile_g5_zero_tid_does_not_group)
  * (so module-deadline's downstream summation is reasoning from
  * sound inputs). */
 
-PWTEST(reconcile_g6_two_independent_chains_distinct_groups)
+PWTEST(reconcile_g6_two_chain_clusters_first_passes_second_rejected)
 {
 	/* Five followers in a single linear chain (the topo5 edge set
-	 * is 10 -> 11 -> 12 -> 13 -> 14), but the TID pattern splits
-	 * them into two clusters: {10, 11} share TID 700 and
-	 * {12, 13, 14} share TID 800. Each cluster must collapse to
-	 * its own group; within each group the members must co-locate.
+	 * is 10 -> 11 -> 12 -> 13 -> 14), TIDs split them into two
+	 * clusters: {10, 11} share TID 700 and {12, 13, 14} share
+	 * TID 800.
 	 *
-	 * Note: the two groups can legitimately land on the same CPU
-	 * here -- in a linear chain every node is related to every
-	 * other, so the unrelated-set admission lets the two groups
-	 * stack on one CPU. The contract is "group members share a
-	 * CPU"; "distinct groups occupy distinct CPUs" is only
-	 * required when the groups are pairwise unrelated and have a
-	 * worst-fit alternative, which a single-chain topology
-	 * doesn't offer. */
+	 * Group {10, 11}: a chain prefix anchored at the graph
+	 * source 10. Every member's predecessor is either inside
+	 * the group or is the source 10 -- predecessor closure
+	 * passes; precedence convexity passes (chain is fully
+	 * contained); externally atomic passes (terminal 11 has
+	 * external successor 12). Accepted.
+	 *
+	 * Group {12, 13, 14}: starts mid-chain at 12, whose
+	 * predecessor 11 is neither inside the group nor a graph
+	 * source. Predecessor closure rejects with
+	 * WOULD_SELF_SUSPEND -- the group would otherwise have to
+	 * wait for 11 mid-job. The old test expectation (both
+	 * groups stay grouped) pinned the prototype's unsound
+	 * behaviour. */
 	struct topo5 t;
 	reconcile_state_t *s = reconcile_init(4, 0.95, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
@@ -903,15 +919,15 @@ PWTEST(reconcile_g6_two_independent_chains_distinct_groups)
 	dag_node_t *n13 = dag_find_node(dag, 13);
 	dag_node_t *n14 = dag_find_node(dag, 14);
 
+	/* {10, 11} cluster accepted -> shared group_id 10. */
 	pwtest_int_eq(n10->group_id, 10u);
 	pwtest_int_eq(n11->group_id, 10u);
-	pwtest_int_eq(n12->group_id, 12u);
-	pwtest_int_eq(n13->group_id, 12u);
-	pwtest_int_eq(n14->group_id, 12u);
-
 	pwtest_int_eq((int)n10->cpu, (int)n11->cpu);
-	pwtest_int_eq((int)n12->cpu, (int)n13->cpu);
-	pwtest_int_eq((int)n12->cpu, (int)n14->cpu);
+
+	/* {12, 13, 14} cluster rejected -> singletons. */
+	pwtest_int_eq(n12->group_id, 0u);
+	pwtest_int_eq(n13->group_id, 0u);
+	pwtest_int_eq(n14->group_id, 0u);
 
 	reconcile_fini(s);
 	return PWTEST_PASS;
@@ -1231,12 +1247,12 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_e3_zero_cpus_rejected, PWTEST_NOARG);
 	pwtest_add(reconcile_e7_fini_null_safe, PWTEST_NOARG);
 
-	pwtest_add(reconcile_g1_shared_tid_creates_group, PWTEST_NOARG);
+	pwtest_add(reconcile_g1_shared_tid_non_convex_is_rejected, PWTEST_NOARG);
 	pwtest_add(reconcile_g2_unique_tids_no_grouping, PWTEST_NOARG);
 	pwtest_add(reconcile_g3_chain_share_tid_collapses_to_one_cpu, PWTEST_NOARG);
 	pwtest_add(reconcile_g4_chain_break_reverts_group, PWTEST_NOARG);
 	pwtest_add(reconcile_g5_zero_tid_does_not_group, PWTEST_NOARG);
-	pwtest_add(reconcile_g6_two_independent_chains_distinct_groups, PWTEST_NOARG);
+	pwtest_add(reconcile_g6_two_chain_clusters_first_passes_second_rejected, PWTEST_NOARG);
 	pwtest_add(reconcile_g7_new_member_joins_existing_group, PWTEST_NOARG);
 	pwtest_add(reconcile_g8_idempotent_reapply_keeps_group, PWTEST_NOARG);
 	pwtest_add(reconcile_g9_legacy_path_also_groups, PWTEST_NOARG);
