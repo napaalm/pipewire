@@ -89,7 +89,9 @@ struct mbpta {
 	enum mbpta_state state;
 
 	double   ks_stat;
+	double   ks_pvalue;
 	double   runs_z;
+	double   runs_pvalue;
 	double   crps;
 	uint32_t convergence_streak;
 	uint32_t iid_reject_streak;
@@ -150,6 +152,8 @@ mbpta_t *mbpta_create(const struct mbpta_config *cfg)
 		return NULL;
 	}
 	e->state = MBPTA_INSUFFICIENT_DATA;
+	e->ks_pvalue = 1.0;
+	e->runs_pvalue = 1.0;
 	return e;
 }
 
@@ -174,7 +178,9 @@ void mbpta_invalidate_with_reason(mbpta_t *e,
 	e->samples_since_eval = 0;
 	e->state = MBPTA_INSUFFICIENT_DATA;
 	e->ks_stat = 0.0;
+	e->ks_pvalue = 1.0;
 	e->runs_z = 0.0;
+	e->runs_pvalue = 1.0;
 	e->crps = 0.0;
 	e->convergence_streak = 0;
 	e->iid_reject_streak = 0;
@@ -273,6 +279,60 @@ static double ks_critical(double alpha, uint32_t m, uint32_t n)
 	else if (alpha <= 0.20)
 		c = 1.07;
 	return c * sqrt((double)(m + n) / ((double)m * (double)n));
+}
+
+/* Asymptotic two-sample Kolmogorov-Smirnov p-value (Smirnov 1948,
+ * via the Stephens 1970 small-sample correction):
+ *
+ *     Q(lambda) = 2 * sum_{k=1..inf} (-1)^(k-1) * exp(-2 k^2 lambda^2)
+ *     lambda   = (sqrt(n_eff) + 0.12 + 0.11 / sqrt(n_eff)) * D
+ *     n_eff    = m * n / (m + n)
+ *
+ * Returns p in [0, 1]; degenerate inputs (D == 0, m or n < 2)
+ * return 1.0 because there is no evidence against H_0. The series
+ * converges very fast for typical D values (~5 terms is plenty);
+ * the loop bails at 100 iterations to stay bounded under
+ * pathological inputs. */
+static double ks_pvalue(double d_stat, uint32_t m, uint32_t n)
+{
+	double n_eff, sqrt_neff, lambda, term, sum;
+	int sign, k;
+
+	if (d_stat <= 0.0 || m < 2 || n < 2)
+		return 1.0;
+
+	n_eff = ((double)m * (double)n) / ((double)m + (double)n);
+	sqrt_neff = sqrt(n_eff);
+	lambda = (sqrt_neff + 0.12 + 0.11 / sqrt_neff) * d_stat;
+
+	sum = 0.0;
+	sign = 1;
+	for (k = 1; k <= 100; k++) {
+		term = exp(-2.0 * (double)k * (double)k * lambda * lambda);
+		sum += (double)sign * term;
+		if (term < 1.0e-12)
+			break;
+		sign = -sign;
+	}
+	sum *= 2.0;
+	if (sum < 0.0) sum = 0.0;
+	if (sum > 1.0) sum = 1.0;
+	return sum;
+}
+
+/* Two-sided p-value for the Wald-Wolfowitz runs-test Z under the
+ * asymptotic normal approximation:
+ *
+ *     p = 2 * Q(|z|) = erfc(|z| / sqrt(2))
+ *
+ * Returns 1.0 for z == 0 (no evidence against independence) and
+ * collapses smoothly to 0 for large |z|. */
+static double runs_pvalue(double z)
+{
+	double az = z < 0.0 ? -z : z;
+	if (az == 0.0)
+		return 1.0;
+	return erfc(az / sqrt(2.0));
 }
 
 /* Wald-Wolfowitz runs test on sign(x_{i+1} - x_i). Returns Z =
@@ -450,8 +510,12 @@ static void mbpta_step(mbpta_t *e)
 	e->ks_stat = ks_statistic_two_sample(e);
 	e->runs_z = runs_z(e);
 
-	double ks_crit = ks_critical(e->cfg.alpha_iid,
-			e->window_count / 2, e->window_count - e->window_count / 2);
+	uint32_t m_half = e->window_count / 2;
+	uint32_t n_half = e->window_count - m_half;
+	e->ks_pvalue = ks_pvalue(e->ks_stat, m_half, n_half);
+	e->runs_pvalue = runs_pvalue(e->runs_z);
+
+	double ks_crit = ks_critical(e->cfg.alpha_iid, m_half, n_half);
 	bool ks_ok = e->ks_stat <= ks_crit;
 	bool runs_ok = (e->runs_z > -1.96 && e->runs_z < 1.96);
 	iid_ok = ks_ok && runs_ok;
@@ -577,7 +641,9 @@ uint32_t mbpta_block_count(const mbpta_t *e)
 double mbpta_mu(const mbpta_t *e)        { return e ? e->mu : 0.0; }
 double mbpta_sigma(const mbpta_t *e)     { return e ? e->sigma : 0.0; }
 double mbpta_ks_stat(const mbpta_t *e)   { return e ? e->ks_stat : 0.0; }
+double mbpta_ks_pvalue(const mbpta_t *e) { return e ? e->ks_pvalue : 1.0; }
 double mbpta_runs_z(const mbpta_t *e)    { return e ? e->runs_z : 0.0; }
+double mbpta_runs_pvalue(const mbpta_t *e) { return e ? e->runs_pvalue : 1.0; }
 double mbpta_crps(const mbpta_t *e)      { return e ? e->crps : 0.0; }
 uint32_t mbpta_convergence_streak(const mbpta_t *e)
 {

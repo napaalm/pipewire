@@ -384,6 +384,83 @@ PWTEST(mbpta_eps_node_above_floor_passes_through)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_ks_runs_pvalues_default_to_one)
+{
+	/* Before the first re-evaluation round runs there is no
+	 * evidence against H_0 (identical distribution / independence),
+	 * so the two p-values default to 1.0 at creation. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+	pwtest_bool_true(mbpta_ks_pvalue(e) == 1.0);
+	pwtest_bool_true(mbpta_runs_pvalue(e) == 1.0);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_ks_pvalue_low_under_distribution_shift)
+{
+	/* A step-shift in mean drives the KS statistic well above
+	 * critical and the two-sided KS p-value below alpha=0.05. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t i;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	/* First half: tight stationary stream around 100. */
+	for (i = 0; i < c.sample_window / 2; i++)
+		mbpta_add_sample(e, 100 + (i % 5));
+	/* Second half: shifted stream around 100_000. */
+	for (i = 0; i < c.sample_window / 2; i++)
+		mbpta_add_sample(e, 100000 + (i % 5));
+
+	/* Force a few more samples to land an evaluation round. */
+	for (i = 0; i < c.n_delta; i++)
+		mbpta_add_sample(e, 100000 + (i % 5));
+
+	pwtest_bool_true(mbpta_ks_stat(e) > 0.0);
+	pwtest_bool_true(mbpta_ks_pvalue(e) < 0.05);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_runs_pvalue_low_under_clustered_transitions)
+{
+	/* The Wald-Wolfowitz runs test needs both up and down
+	 * transitions to evaluate (a purely monotone stream has
+	 * one sign and the implementation collapses Z to 0); the
+	 * informative reject case is a stream whose up- and
+	 * down-runs cluster into long blocks instead of
+	 * alternating randomly. Build a window of long monotone
+	 * up-blocks followed by long monotone down-blocks: there
+	 * are only ~2 runs in a window of hundreds of transitions,
+	 * which sits far below E[R] under H_0 and pushes the
+	 * runs-test two-sided p-value below 0.05. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint32_t i;
+	uint64_t v = 1000;
+
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 4 * c.sample_window; i++) {
+		if ((i / 50) % 2 == 0)
+			v += 1;
+		else
+			v -= 1;
+		mbpta_add_sample(e, v);
+	}
+
+	pwtest_bool_true(mbpta_runs_pvalue(e) < 0.05);
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_mbpta)
 {
 	pwtest_add(mbpta_state_name_stable, PWTEST_NOARG);
@@ -400,6 +477,11 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_eps_node_at_floor_is_not_capped, PWTEST_NOARG);
 	pwtest_add(mbpta_eps_node_below_floor_is_clamped, PWTEST_NOARG);
 	pwtest_add(mbpta_eps_node_above_floor_passes_through, PWTEST_NOARG);
+	pwtest_add(mbpta_ks_runs_pvalues_default_to_one, PWTEST_NOARG);
+	pwtest_add(mbpta_ks_pvalue_low_under_distribution_shift,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_runs_pvalue_low_under_clustered_transitions,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

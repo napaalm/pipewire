@@ -2492,7 +2492,9 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_mu = mbpta_mu(mn->mbpta);
 			pn.mbpta_sigma = mbpta_sigma(mn->mbpta);
 			pn.mbpta_ks_stat = mbpta_ks_stat(mn->mbpta);
+			pn.mbpta_ks_pvalue = mbpta_ks_pvalue(mn->mbpta);
 			pn.mbpta_runs_z = mbpta_runs_z(mn->mbpta);
+			pn.mbpta_runs_pvalue = mbpta_runs_pvalue(mn->mbpta);
 			pn.mbpta_crps = mbpta_crps(mn->mbpta);
 			pn.mbpta_convergence_streak =
 				mbpta_convergence_streak(mn->mbpta);

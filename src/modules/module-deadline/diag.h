@@ -432,7 +432,9 @@ struct rt_diag_param_node {
 	 * mbpta_mu / mbpta_sigma. All zero until the first re-eval
 	 * round runs. */
 	double   mbpta_ks_stat;
+	double   mbpta_ks_pvalue;
 	double   mbpta_runs_z;
+	double   mbpta_runs_pvalue;
 	double   mbpta_crps;
 	double   mbpta_mu;
 	double   mbpta_sigma;

@@ -481,7 +481,9 @@ PWTEST(diag_params_render_text_golden)
 		" budget_kind=empirical_quantile budget_samples=128"
 		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
 		" mbpta_mu=0 mbpta_sigma=0"
-		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
+		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
+		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
+		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false"
 		" mbpta_last_invalidation=none\n"
@@ -490,7 +492,9 @@ PWTEST(diag_params_render_text_golden)
 		" budget_kind=bootstrap_fallback budget_samples=0"
 		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
 		" mbpta_mu=0 mbpta_sigma=0"
-		" mbpta_ks=0.000000 mbpta_runs_z=0.000000 mbpta_crps=0.000000"
+		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
+		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
+		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true"
 		" mbpta_last_invalidation=period\n";
@@ -607,7 +611,8 @@ PWTEST(diag_json_full_golden)
 		"\"budget_samples\":512,"
 		"\"mbpta\":{\"state\":\"pwcet_valid\",\"pwcet_ns\":91234,\"blocks\":50,"
 		"\"mu\":120000,\"sigma\":3500,"
-		"\"ks_stat\":0.041000,\"runs_z\":-0.230000,"
+		"\"ks_stat\":0.041000,\"ks_pvalue\":0.500000,"
+		"\"runs_z\":-0.230000,\"runs_pvalue\":0.818000,"
 		"\"crps\":0.072000,"
 		"\"convergence_streak\":4,"
 		"\"iid_reject_streak\":0,"
@@ -667,7 +672,9 @@ PWTEST(diag_json_full_golden)
 	pn.mbpta_mu = 120000.0;
 	pn.mbpta_sigma = 3500.0;
 	pn.mbpta_ks_stat = 0.041;
+	pn.mbpta_ks_pvalue = 0.5;
 	pn.mbpta_runs_z = -0.23;
+	pn.mbpta_runs_pvalue = 0.818;
 	pn.mbpta_crps = 0.072;
 	pn.mbpta_convergence_streak = 4;
 	pn.mbpta_iid_reject_streak = 0;

@@ -587,8 +587,12 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 		diag_fprintf_double(out, 0, n->mbpta_sigma);
 		fputs(" mbpta_ks=", out);
 		diag_fprintf_double(out, 6, n->mbpta_ks_stat);
+		fputs(" mbpta_ks_p=", out);
+		diag_fprintf_double(out, 6, n->mbpta_ks_pvalue);
 		fputs(" mbpta_runs_z=", out);
 		diag_fprintf_double(out, 6, n->mbpta_runs_z);
+		fputs(" mbpta_runs_p=", out);
+		diag_fprintf_double(out, 6, n->mbpta_runs_pvalue);
 		fputs(" mbpta_crps=", out);
 		diag_fprintf_double(out, 6, n->mbpta_crps);
 		fprintf(out,
@@ -856,8 +860,12 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			diag_fprintf_double(out, 0, n->mbpta_sigma);
 			fputs(",\"ks_stat\":", out);
 			diag_fprintf_double(out, 6, n->mbpta_ks_stat);
+			fputs(",\"ks_pvalue\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_ks_pvalue);
 			fputs(",\"runs_z\":", out);
 			diag_fprintf_double(out, 6, n->mbpta_runs_z);
+			fputs(",\"runs_pvalue\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_runs_pvalue);
 			fputs(",\"crps\":", out);
 			diag_fprintf_double(out, 6, n->mbpta_crps);
 			fprintf(out,

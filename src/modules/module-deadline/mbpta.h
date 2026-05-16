@@ -178,9 +178,16 @@ double mbpta_mu(const mbpta_t *e);
 double mbpta_sigma(const mbpta_t *e);
 
 /* The most recent KS statistic and runs-test Z, plus the last
- * CRPS value. Useful for diagnostics. */
+ * CRPS value. Useful for diagnostics. The associated two-sided
+ * p-values are derived from the same evaluation round: ks_pvalue
+ * uses the Smirnov asymptotic series (Stephens 1970 small-sample
+ * correction); runs_pvalue uses the normal-approximation
+ * erfc(|z|/sqrt(2)). Both default to 1.0 (no evidence against
+ * H_0) before the first evaluation round runs. */
 double mbpta_ks_stat(const mbpta_t *e);
+double mbpta_ks_pvalue(const mbpta_t *e);
 double mbpta_runs_z(const mbpta_t *e);
+double mbpta_runs_pvalue(const mbpta_t *e);
 double mbpta_crps(const mbpta_t *e);
 uint32_t mbpta_convergence_streak(const mbpta_t *e);
 uint32_t mbpta_iid_reject_streak(const mbpta_t *e);
