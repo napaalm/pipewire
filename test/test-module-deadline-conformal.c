@@ -997,6 +997,69 @@ PWTEST(conformal_burst_penalty_validator_rejects_below_one)
 	return PWTEST_PASS;
 }
 
+/* ---------------------------------------------------------------- */
+/* Section I: fusion-group invalidation.                             */
+/* ---------------------------------------------------------------- */
+
+PWTEST(conformal_fusion_group_invalidation_resets_state)
+{
+	/* When a follower's macro-node membership changes (the
+	 * reconcile dispatcher detects a different fusion-leader id
+	 * across two reconcile passes), the conformal estimator must
+	 * reset to RT_CONF_INSUFFICIENT_DATA and stamp the typed
+	 * RT_CONF_INVALIDATED_FUSION_GROUP reason -- the sample
+	 * distribution observed under the old contraction is no longer
+	 * representative of the new macro-node. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e = rt_conformal_create(&cfg);
+	uint32_t i;
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 100; i++)
+		rt_conformal_observe(e, 50000);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_VALID);
+
+	rt_conformal_invalidate(e, RT_CONF_INVALIDATED_FUSION_GROUP);
+
+	pwtest_int_eq((int)rt_conformal_state(e),
+			(int)RT_CONF_INSUFFICIENT_DATA);
+	pwtest_int_eq((int)rt_conformal_last_invalidation_reason(e),
+			(int)RT_CONF_INVALIDATED_FUSION_GROUP);
+	pwtest_int_eq((int)rt_conformal_samples_used(e), 0);
+
+	/* After the reset the estimator returns to BOOTSTRAP on the
+	 * very first new sample, then VALID once enough samples have
+	 * accumulated -- the same lifecycle a freshly-created macro
+	 * sees. */
+	rt_conformal_observe(e, 80000);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_BOOTSTRAP);
+	for (i = 0; i < cfg.bootstrap_min_samples + 4u; i++)
+		rt_conformal_observe(e, 80000);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_VALID);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_topology_generation_invalidation_resets_state)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e = rt_conformal_create(&cfg);
+	uint32_t i;
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 50; i++)
+		rt_conformal_observe(e, 40000);
+
+	rt_conformal_invalidate(e,
+			RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
+	pwtest_int_eq((int)rt_conformal_last_invalidation_reason(e),
+			(int)RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST(conformal_compatible_history_field_round_trips)
 {
 	/* compatible_history is a parsed boolean; defaults to true.
@@ -1069,6 +1132,11 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_burst_penalty_amplifies_negative_step,
 			PWTEST_NOARG);
 	pwtest_add(conformal_burst_penalty_validator_rejects_below_one,
+			PWTEST_NOARG);
+
+	pwtest_add(conformal_fusion_group_invalidation_resets_state,
+			PWTEST_NOARG);
+	pwtest_add(conformal_topology_generation_invalidation_resets_state,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;

@@ -415,6 +415,22 @@ int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
 				members[i].id, members[i].tid,
 				members[i].wcet_ns)) < 0)
 			goto fail;
+		/*
+		 * Macro-node bootstrap budget. The contracted node's
+		 * WCET is the sum of its members' wcets plus the measured
+		 * group overhead (added below from the caller's
+		 * `overhead_ns` field). When the macro is fresh -- the
+		 * group has just been formed -- every member's
+		 * per-follower estimator is in its own BOOTSTRAP state,
+		 * so each member.wcet_ns is the per-follower bootstrap
+		 * value. The macro thus inherits a sound bootstrap as
+		 * the sum of its members' budgets plus the overhead --
+		 * the same shape Romano-Patterson-Candes 2019 §3 calls
+		 * "compatible-history" bootstrapping for a freshly-keyed
+		 * estimator. A future commit may extend this with an
+		 * in-process cache so a previously-seen macro signature
+		 * skips the bootstrap window altogether.
+		 */
 		cn->wcet_ns += members[i].wcet_ns;
 		owner[i] = cn;
 	}
