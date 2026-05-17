@@ -46,6 +46,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -197,6 +198,107 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg);
  *   recalc_period >= 1
  */
 int rt_conformal_config_validate(const struct rt_conformal_config *cfg);
+
+/*
+ * Opaque estimator handle. Owns its own configuration snapshot, its
+ * score and runtime ring buffers, the EWMA location/scale pair, the
+ * adaptive alpha state and the cached sorted-score quantile. The
+ * sizeof() is reported via rt_conformal_state_data_size() so a unit
+ * test can pin the per-follower memory cost.
+ */
+typedef struct rt_conformal rt_conformal_t;
+
+/*
+ * Build a fresh estimator. Returns NULL when cfg is invalid (the
+ * validator is run before any allocation), or on out-of-memory. The
+ * estimator owns a private copy of cfg; the caller may free its own
+ * after the call returns.
+ */
+rt_conformal_t *rt_conformal_create(const struct rt_conformal_config *cfg);
+
+/* NULL-safe. */
+void rt_conformal_destroy(rt_conformal_t *e);
+
+/* Drop every cached sample, reset the score ring, return the
+ * estimator to RT_CONF_INSUFFICIENT_DATA and stamp the typed
+ * invalidation reason. The estimator-config snapshot is preserved.
+ * NULL-safe. */
+void rt_conformal_invalidate(rt_conformal_t *e,
+		enum rt_conformal_invalidation_reason reason);
+
+/*
+ * Record one observed per-activation runtime in nanoseconds. The
+ * observation flow follows the prequential discipline (no
+ * look-ahead): the score s_t for this sample is computed from the
+ * EWMA state as it existed BEFORE this call (mu_pred, scale_pred),
+ * then s_t is inserted into the score ring; only after that does the
+ * EWMA pair get updated by x_t. This keeps rt_conformal_budget()
+ * usable as a one-step-ahead prediction (it consumes the ring as it
+ * stood when the prior budget was emitted, not as it stands after
+ * the matching observation arrived). Returns true if the call
+ * triggered a deferred-quantile recompute (every recalc_period
+ * samples).
+ *
+ * Samples below the configured runtime_floor_ns are clamped to the
+ * floor; the score is computed on the clamped value so a degenerate
+ * zero sample (a follower that ran for less than the clock
+ * resolution) does not skew the EWMA scale.
+ *
+ * NULL-safe (returns false); zero / negative / non-finite samples
+ * are rejected silently.
+ */
+bool rt_conformal_observe(rt_conformal_t *e, uint64_t runtime_ns);
+
+/*
+ * Publish the one-sided runtime budget for the next activation, in
+ * nanoseconds:
+ *
+ *   prediction = mu + Q * (scale + sigma_floor)
+ *   guarded    = prediction * (1 + guard_percent) + guard_ns
+ *   budget     = clamp(ceil(guarded), runtime_floor_ns, period_ns)
+ *
+ * where Q is the empirical quantile at level (1 - alpha_eff) of the
+ * current score ring, using the finite-sample conformal index
+ * convention ceil((n + 1) * (1 - alpha_eff)) clamped to [1, n]. When
+ * the estimator is in RT_CONF_BOOTSTRAP the configured
+ * bootstrap_runtime_ns is published (still clamped to
+ * [runtime_floor_ns, period_ns]); when in RT_CONF_DISABLED the
+ * function returns 0.
+ *
+ * period_ns is the kernel-side period the budget will be clamped
+ * against; pass 0 to disable the upper clamp (the caller will then
+ * impose its own).
+ */
+uint64_t rt_conformal_budget(rt_conformal_t *e, uint64_t period_ns);
+
+/*
+ * Diagnostic accessors. All are NULL-safe (return 0 / default).
+ */
+enum rt_conformal_state rt_conformal_state(const rt_conformal_t *e);
+uint64_t rt_conformal_samples_seen(const rt_conformal_t *e);
+uint64_t rt_conformal_samples_used(const rt_conformal_t *e);
+uint64_t rt_conformal_overruns_seen(const rt_conformal_t *e);
+uint64_t rt_conformal_recent_overruns(const rt_conformal_t *e);
+uint64_t rt_conformal_max_overrun_burst(const rt_conformal_t *e);
+uint64_t rt_conformal_current_overrun_burst(const rt_conformal_t *e);
+double   rt_conformal_alpha_eff(const rt_conformal_t *e);
+double   rt_conformal_mu_ns(const rt_conformal_t *e);
+double   rt_conformal_scale_ns(const rt_conformal_t *e);
+double   rt_conformal_last_prediction_ns(const rt_conformal_t *e);
+double   rt_conformal_last_score(const rt_conformal_t *e);
+uint64_t rt_conformal_last_budget_ns(const rt_conformal_t *e);
+uint64_t rt_conformal_last_runtime_ns(const rt_conformal_t *e);
+double   rt_conformal_score_quantile(const rt_conformal_t *e);
+uint64_t rt_conformal_guard_ns_effective(const rt_conformal_t *e);
+enum rt_conformal_invalidation_reason
+	rt_conformal_last_invalidation_reason(const rt_conformal_t *e);
+
+/*
+ * Returns the byte size of one estimator instance. Used by the unit
+ * suite to pin the per-follower memory cost; the budget the algorithm
+ * reference quotes is "a few KB".
+ */
+size_t rt_conformal_state_data_size(void);
 
 #ifdef __cplusplus
 }
