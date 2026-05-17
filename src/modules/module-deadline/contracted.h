@@ -131,6 +131,22 @@ struct contracted_node {
 	uint64_t local_deadline_ns;
 	int      cpu;
 
+	/* Macro-node completion timestamp for the most recent
+	 * activation. The fused thread executes its members in
+	 * topological order; the timestamp at which the LAST member
+	 * finishes is the macro completion. Externally atomic groups
+	 * expose exactly one such timestamp per cycle so downstream
+	 * observers (a trace consumer, an external-successor
+	 * activation tracker) see one rising edge per group activation,
+	 * not one per member. The field is updated by the runtime hook
+	 * after every cycle; analysis-layer code does not consume it.
+	 *
+	 * Stored in CLOCK_MONOTONIC nanoseconds for parity with the
+	 * impl-node cycle-counter convention. Default 0 means "no
+	 * cycle observed yet". */
+	uint64_t macro_completion_ns;
+	uint64_t macro_completion_count;
+
 	/* Structural flags. is_fusion_group is true iff n_members > 1
 	 * (a singleton macro-node mirrors an un-fused original node).
 	 * externally_atomic is the validator's verdict on whether
@@ -398,6 +414,28 @@ uint64_t contracted_node_effective_wcet(const contracted_node_t *cn);
  */
 int contracted_node_observe_macro_runtime(contracted_node_t *cn,
 		uint64_t observed_macro_runtime_ns);
+
+/*
+ * Record one macro completion event. Called by the runtime hook
+ * when the fused thread finishes its last in-cycle member: the
+ * timestamp is the moment that final member's process() returned
+ * (CLOCK_MONOTONIC ns). For a singleton macro-node this collapses
+ * to the original-node completion time; for a fused chain it is
+ * the chain tail's completion. Either way the macro-node now has
+ * a single rising edge per cycle that downstream observers can
+ * sync on without iterating members.
+ *
+ * The count is bumped on every call so an external-successor
+ * tracker can detect a missed cycle (count gap). Successive calls
+ * with non-monotonic timestamps are not rejected: the runtime
+ * may emit out-of-order cycles in rare conditions (e.g. across a
+ * topology generation flip); the cleaner observation strategy is
+ * to compare against the previous count, not assume monotonicity.
+ *
+ * Returns 0 on success, -EINVAL on NULL cn.
+ */
+int contracted_node_observe_macro_completion(contracted_node_t *cn,
+		uint64_t timestamp_ns);
 
 /*
  * Bridge between the contracted DAG and the existing scheduling-DAG

@@ -157,6 +157,16 @@ int contracted_node_observe_macro_runtime(contracted_node_t *cn,
 	return 0;
 }
 
+int contracted_node_observe_macro_completion(contracted_node_t *cn,
+		uint64_t timestamp_ns)
+{
+	if (cn == NULL)
+		return -EINVAL;
+	cn->macro_completion_ns = timestamp_ns;
+	cn->macro_completion_count++;
+	return 0;
+}
+
 int contracted_dag_add_edge(contracted_dag_t *cg,
 		contracted_node_t *src, contracted_node_t *dst)
 {

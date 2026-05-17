@@ -994,6 +994,39 @@ PWTEST(contracted_observe_macro_runtime_null_and_zero)
 	return PWTEST_PASS;
 }
 
+PWTEST(contracted_observe_macro_completion_records_one_edge_per_cycle)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 0), 0);
+	pwtest_int_eq(contracted_node_add_member(n, 2, 100, 0), 0);
+
+	pwtest_int_eq((int)n->macro_completion_ns, 0);
+	pwtest_int_eq((int)n->macro_completion_count, 0);
+
+	/* Cycle 1: macro completes at 100. */
+	pwtest_int_eq(contracted_node_observe_macro_completion(n, 100), 0);
+	pwtest_int_eq((int)n->macro_completion_ns, 100);
+	pwtest_int_eq((int)n->macro_completion_count, 1);
+
+	/* Cycle 2: macro completes at 250 -- one rising edge per
+	 * activation, not one per member. */
+	pwtest_int_eq(contracted_node_observe_macro_completion(n, 250), 0);
+	pwtest_int_eq((int)n->macro_completion_ns, 250);
+	pwtest_int_eq((int)n->macro_completion_count, 2);
+
+	/* A non-monotonic timestamp is not rejected: observers use the
+	 * count, not the timestamp, to detect missed cycles. */
+	pwtest_int_eq(contracted_node_observe_macro_completion(n, 200), 0);
+	pwtest_int_eq((int)n->macro_completion_ns, 200);
+	pwtest_int_eq((int)n->macro_completion_count, 3);
+
+	pwtest_int_eq(contracted_node_observe_macro_completion(NULL, 1), -EINVAL);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -1032,6 +1065,8 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_edge_add_meta_null_safe, PWTEST_NOARG);
 	pwtest_add(contracted_observe_macro_runtime_non_zero_residual, PWTEST_NOARG);
 	pwtest_add(contracted_observe_macro_runtime_null_and_zero, PWTEST_NOARG);
+	pwtest_add(contracted_observe_macro_completion_records_one_edge_per_cycle,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
