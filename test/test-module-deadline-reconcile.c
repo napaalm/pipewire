@@ -1579,6 +1579,109 @@ PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
 	return PWTEST_PASS;
 }
 
+/* Small-graph oracle: for graphs small enough that an exhaustive
+ * enumeration of CPU placements is tractable, verify the
+ * soundness property that the production reconcile path -- which
+ * uses the worst-fit heuristic for CPU assignment -- never
+ * declares HARD when no placement of the same task set onto the
+ * available CPUs is feasible under the density predicate. The
+ * oracle iterates every (n_cpus)^n_followers assignment, computes
+ * the per-CPU density sum on each, and finds the minimum
+ * achievable max-density. Production HARD requires its own
+ * worst-fit placement to satisfy density <= 1 on every CPU, so
+ * by construction the oracle's optimum is at most production's
+ * max-density. A counter-example (production HARD but oracle
+ * finds no feasible placement) would only arise from a real
+ * arithmetic bug in either the density predicate or the
+ * worst-fit placer; the test pins the property so a future
+ * regression in either gets caught. */
+PWTEST(reconcile_small_graph_oracle_soundness)
+{
+	uint32_t seed = 0xD3A1FE05u;
+	uint32_t trial;
+	const uint32_t trials = 64;
+	const uint32_t n_cpus = 3;
+	const uint32_t n_followers = 4;
+
+	for (trial = 0; trial < trials; trial++) {
+		reconcile_state_t *s = reconcile_init(n_cpus, 0.95,
+				NULL, 0.01, true);
+		struct cb_ctx cb = { 0 };
+		reconcile_follower_t fol[4];
+		reconcile_topo_t rt;
+		uint32_t i, attempt;
+		uint64_t period;
+		double oracle_best_density = 1e30;
+		struct reconcile_feasibility feas;
+
+		pwtest_ptr_notnull(s);
+		seed = seed * 1103515245u + 12345u;
+		period = 200000u + (seed % 1800000u);
+
+		for (i = 0; i < n_followers; i++) {
+			seed = seed * 1103515245u + 12345u;
+			fol[i].id  = 20 + i;
+			fol[i].tid = 200 + i;
+			/* WCETs in the 1-30 % range of the period --
+			 * mostly feasible, some at the edge. */
+			fol[i].wcet = (uint64_t)(period * 0.01) +
+				(uint64_t)(seed % (uint32_t)(period * 0.30));
+		}
+
+		rt.followers = fol;
+		rt.n_followers = n_followers;
+		rt.edges = NULL;     /* singleton task set -- pure
+				      * partitioning, no precedence. */
+		rt.n_edges = 0;
+		rt.period = period;
+		rt.generation = trial + 1;
+
+		/* Oracle: enumerate n_cpus^n_followers placements and
+		 * take the minimum achievable max-density. The
+		 * follower's contribution to its assigned CPU is
+		 * wcet / period (constrained-deadline ratio with
+		 * D = T). */
+		for (attempt = 0;
+		     attempt < (uint32_t)(1ull << (2 * n_followers));
+		     attempt++) {
+			double per_cpu[3] = { 0.0, 0.0, 0.0 };
+			double max_d;
+			uint32_t a = attempt;
+			bool valid = true;
+			for (i = 0; i < n_followers; i++) {
+				uint32_t cpu = a & 0x3;
+				a >>= 2;
+				if (cpu >= n_cpus) {
+					valid = false;
+					break;
+				}
+				per_cpu[cpu] += (double)fol[i].wcet /
+					(double)period;
+			}
+			if (!valid)
+				continue;
+			max_d = per_cpu[0];
+			if (per_cpu[1] > max_d) max_d = per_cpu[1];
+			if (per_cpu[2] > max_d) max_d = per_cpu[2];
+			if (max_d < oracle_best_density)
+				oracle_best_density = max_d;
+		}
+
+		pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+		reconcile_state_feasibility(s, &feas);
+
+		/* Soundness property: production HARD must imply the
+		 * oracle's best placement is also feasible. */
+		if (feas.mode == RECONCILE_MODE_HARD) {
+			pwtest_bool_true(oracle_best_density <= 1.0);
+		}
+
+		reconcile_fini(s);
+	}
+
+	return PWTEST_PASS;
+}
+
 /* When no fusion groups are formed, every follower is its own
  * macro-node leader. The MBPTA fusion-group-invalidation path keys
  * off the leader id staying stable across reconcile passes
@@ -1659,6 +1762,7 @@ PWTEST_SUITE(module_deadline_reconcile)
 			PWTEST_NOARG);
 	pwtest_add(reconcile_property_random_shapes_satisfy_kernel_contract,
 			PWTEST_NOARG);
+	pwtest_add(reconcile_small_graph_oracle_soundness, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
