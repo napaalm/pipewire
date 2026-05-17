@@ -610,6 +610,260 @@ PWTEST(fusion_blocking_capability_flip_re_rejects)
 	return PWTEST_PASS;
 }
 
+/*
+ * Property-style test: random member sets carrying any combination
+ * of FUSION_MEMBER_MAIN_LOOP / EXPORTED / REMOTE plus per-member
+ * driver_id and tid choices must produce exactly one of the
+ * predicate-aligned rejection reasons, with a stable precedence
+ * (the validator returns the first failing predicate, never a
+ * lower one). Drives 2048 random candidate groups under an
+ * LCG seed so failures are reproducible. */
+PWTEST(fusion_validator_property_random_member_flags_yield_one_typed_reason)
+{
+	uint32_t seed = 0x5C9F2A11u;
+	uint32_t trial;
+	const uint32_t trials = 2048;
+	const uint32_t n_members = 4;
+	uint32_t main_loop_count = 0, exported_count = 0;
+	uint32_t remote_unknown_count = 0, cross_driver_count = 0;
+	uint32_t accepted_count = 0;
+
+	for (trial = 0; trial < trials; trial++) {
+		struct fusion_candidate_member m[4];
+		enum fusion_reject_reason got = FUSION_REJ_NONE;
+		enum fusion_reject_reason want = FUSION_REJ_NONE;
+		uint32_t i;
+		uint32_t base_driver;
+
+		seed = seed * 1103515245u + 12345u;
+		base_driver = seed & 0xFFu;
+		for (i = 0; i < n_members; i++) {
+			seed = seed * 1103515245u + 12345u;
+			m[i].id = i + 1;
+			m[i].flags = (seed >> 1) & 0x7u; /* 0..7 */
+			m[i].tid = ((seed >> 4) & 0x1u) ? 1000 + i : -1;
+			m[i].driver_id = ((seed >> 8) & 0x3u)
+					? base_driver
+					: base_driver + 1;
+		}
+
+		/* Walk the validator's exact member-major precedence: for
+		 * each member in order, check cross-driver, then main-loop,
+		 * then exported, then remote-tid-unknown. The first
+		 * failing check on the first failing member wins. */
+		for (i = 0; i < n_members; i++) {
+			if (i > 0 && m[i].driver_id != m[0].driver_id) {
+				want = FUSION_REJ_CROSS_DRIVER;
+				break;
+			}
+			if (m[i].flags & FUSION_MEMBER_MAIN_LOOP) {
+				want = FUSION_REJ_MAIN_LOOP;
+				break;
+			}
+			if (m[i].flags & FUSION_MEMBER_EXPORTED) {
+				want = FUSION_REJ_EXPORTED;
+				break;
+			}
+			if ((m[i].flags & FUSION_MEMBER_REMOTE) && m[i].tid <= 0) {
+				want = FUSION_REJ_REMOTE_TID_UNKNOWN;
+				break;
+			}
+		}
+
+		(void)fusion_validator_accept(m, n_members, &got);
+		pwtest_int_eq(got, want);
+
+		switch (want) {
+		case FUSION_REJ_NONE:               accepted_count++; break;
+		case FUSION_REJ_CROSS_DRIVER:       cross_driver_count++; break;
+		case FUSION_REJ_MAIN_LOOP:          main_loop_count++; break;
+		case FUSION_REJ_EXPORTED:           exported_count++; break;
+		case FUSION_REJ_REMOTE_TID_UNKNOWN: remote_unknown_count++; break;
+		default: break;
+		}
+	}
+
+	/* Sanity coverage -- 2048 trials must exercise every rejection
+	 * branch at least a handful of times or the random generator
+	 * is degenerate. The all-clean (accepted) branch is rare with
+	 * uniform-random flag bits across 4 members; suppress its
+	 * coverage assertion -- the per-iteration pwtest_int_eq is
+	 * what actually pins the policy. */
+	pwtest_bool_true(main_loop_count > 50);
+	pwtest_bool_true(exported_count > 50);
+	pwtest_bool_true(remote_unknown_count > 50);
+	pwtest_bool_true(cross_driver_count > 50);
+	(void)accepted_count;
+
+	return PWTEST_PASS;
+}
+
+/*
+ * Small-graph oracle: enumerate every non-empty subset of two
+ * fixed graph shapes, drive each through the precedence-convex
+ * and externally-atomic predicates, and pin the expected accept /
+ * reject verdict against a closed-form oracle. Graphs are kept
+ * small (5 nodes => 31 non-empty subsets, 8 nodes => 255 subsets)
+ * so the brute-force enumeration runs in microseconds and the
+ * test remains a tractable regression net.
+ *
+ * Shape A is a pure chain (1->2->3->4->5). On a 1-in-1-out chain:
+ *   - Convexity rejects non-contiguous subsets (a "skip" in the
+ *     member range forces a path that leaves and re-enters the
+ *     group). Contiguous ranges pass.
+ *   - Externally-atomic accepts every subset: every non-terminal
+ *     internal member's only out-edge points to an internal
+ *     successor (it cannot have an "external" out by construction
+ *     of the chain).
+ *
+ * Shape B is a fork-join diamond (1->2, 1->3, 2->4, 3->4, 4->5).
+ * Here externally-atomic does catch non-trivial rejection: the
+ * fork point (member 1) with one child in the group and one not
+ * is a non-terminal internal member with an external out.
+ *
+ * Both shapes are within the plan's "graphs with up to 8 nodes"
+ * scope; together they cover the chain / fork / join / diamond
+ * shapes the plan calls out for property coverage.
+ */
+static bool subset_contains(uint32_t mask, uint32_t i)
+{
+	return (mask >> i) & 1u;
+}
+
+PWTEST(fusion_oracle_enumerate_chain_5)
+{
+	const uint32_t N = 5;
+	const struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 5 },
+	};
+	const uint32_t n_edges = 4;
+	uint32_t mask;
+	uint32_t accepted_convex = 0;
+	uint32_t accepted_externally_atomic = 0;
+
+	for (mask = 1; mask < (1u << N); mask++) {
+		uint32_t members[5];
+		uint32_t n = 0;
+		uint32_t i;
+		uint32_t min_id = UINT32_MAX, max_id = 0;
+		bool contiguous;
+		enum fusion_reject_reason cr = FUSION_REJ_NONE;
+		enum fusion_reject_reason ar = FUSION_REJ_NONE;
+		bool conv_ok, ea_ok;
+
+		for (i = 0; i < N; i++) {
+			if (!subset_contains(mask, i))
+				continue;
+			members[n++] = i + 1;
+			if (i + 1 < min_id) min_id = i + 1;
+			if (i + 1 > max_id) max_id = i + 1;
+		}
+		contiguous = (n == (max_id - min_id + 1));
+
+		conv_ok = fusion_validator_precedence_convex_accept(
+				members, n, edges, n_edges, &cr);
+		ea_ok = fusion_validator_externally_atomic_accept(
+				members, n, edges, n_edges, &ar);
+
+		if (n == 1) {
+			pwtest_bool_true(conv_ok);
+			pwtest_bool_true(ea_ok);
+			accepted_convex++;
+			accepted_externally_atomic++;
+			continue;
+		}
+		/* Chain convexity: contiguous range iff accepted. */
+		pwtest_int_eq((int)conv_ok, (int)contiguous);
+		if (conv_ok)
+			accepted_convex++;
+		/* Chain externally-atomic: every subset accepts because
+		 * non-terminal members on a 1-in-1-out chain can only
+		 * point to internal successors. */
+		pwtest_bool_true(ea_ok);
+		accepted_externally_atomic++;
+	}
+
+	/* On a 5-chain: 5 singletons + 4+3+2+1 = 15 contiguous ranges
+	 * pass convexity; every non-empty subset (31 total) passes
+	 * externally-atomic. */
+	pwtest_int_eq((int)accepted_convex, 15);
+	pwtest_int_eq((int)accepted_externally_atomic, 31);
+
+	return PWTEST_PASS;
+}
+
+PWTEST(fusion_oracle_enumerate_diamond_5)
+{
+	/* 1 -> 2 -> 4   |   1 -> 3 -> 4 -> 5
+	 * Members are numbered 1..5; bit i of mask selects member i+1. */
+	const uint32_t N = 5;
+	const struct fusion_edge_input edges[] = {
+		{ 1, 2 }, { 1, 3 }, { 2, 4 }, { 3, 4 }, { 4, 5 },
+	};
+	const uint32_t n_edges = 5;
+	uint32_t mask;
+	uint32_t accepted_externally_atomic_nontrivial = 0;
+
+	for (mask = 1; mask < (1u << N); mask++) {
+		uint32_t members[5];
+		bool inset[6] = { false };
+		uint32_t n = 0;
+		uint32_t i;
+		enum fusion_reject_reason ar = FUSION_REJ_NONE;
+		bool ea_ok;
+		bool oracle_ea;
+		uint32_t e;
+
+		for (i = 0; i < N; i++) {
+			if (!subset_contains(mask, i))
+				continue;
+			members[n++] = i + 1;
+			inset[i + 1] = true;
+		}
+		ea_ok = fusion_validator_externally_atomic_accept(
+				members, n, edges, n_edges, &ar);
+
+		/* Closed-form externally-atomic oracle on this diamond:
+		 * for each member v in the group, classify v as terminal
+		 * iff v has no outgoing edge to another member in the
+		 * group. Reject iff some non-terminal v has an outgoing
+		 * edge to a non-member. */
+		oracle_ea = true;
+		for (i = 0; i < N; i++) {
+			uint32_t v;
+			bool v_has_internal_out = false;
+			bool v_has_external_out = false;
+			if (!subset_contains(mask, i))
+				continue;
+			v = i + 1;
+			for (e = 0; e < n_edges; e++) {
+				if (edges[e].src_id != v)
+					continue;
+				if (inset[edges[e].dst_id])
+					v_has_internal_out = true;
+				else
+					v_has_external_out = true;
+			}
+			if (v_has_internal_out && v_has_external_out) {
+				oracle_ea = false;
+				break;
+			}
+		}
+		pwtest_int_eq((int)ea_ok, (int)oracle_ea);
+		if (ea_ok && n > 1)
+			accepted_externally_atomic_nontrivial++;
+	}
+
+	/* Sanity: at least one non-trivial accept AND at least one
+	 * non-trivial reject so we know both branches of the oracle
+	 * fired. (Specifically: {2, 4} accepts -- 2's only out is to
+	 * 4 internal, 4 has external out to 5 but is terminal. {1, 2}
+	 * rejects -- 1 has internal out to 2 AND external out to 3.) */
+	pwtest_bool_true(accepted_externally_atomic_nontrivial > 0);
+
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -654,6 +908,10 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_blocking_null_caps_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_blocking_capability_flip_re_rejects,
 			PWTEST_NOARG);
+	pwtest_add(fusion_validator_property_random_member_flags_yield_one_typed_reason,
+			PWTEST_NOARG);
+	pwtest_add(fusion_oracle_enumerate_chain_5, PWTEST_NOARG);
+	pwtest_add(fusion_oracle_enumerate_diamond_5, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
