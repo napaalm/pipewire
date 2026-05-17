@@ -644,6 +644,24 @@ struct impl {
 	 * fresh one but never a torn document. NULL or empty string
 	 * disables emission. */
 	char                 *debug_snapshot_json_path;
+
+	/*
+	 * Adaptive-conformal calibration trace export. When
+	 * impl->conformal_cfg.trace_export is true and trace_path is
+	 * non-NULL/non-empty, the worker appends one JSON line per
+	 * accepted sample to the file. The line carries the fields a
+	 * prequential replay tool needs to reconstruct the
+	 * estimator's progression off-line: timestamp, follower id,
+	 * mode-key fingerprint, period, observed runtime in
+	 * reference-CPU units, the conformal-published budget that
+	 * was active for this activation, and the selected
+	 * budget_kind token. Open lazily on the first export; closed
+	 * at module_destroy. The RT path never touches this file --
+	 * writes happen on the audio recalc worker, same lifecycle as
+	 * the JSON snapshot emission.
+	 */
+	char                 *conformal_trace_path;
+	FILE                 *conformal_trace_fp;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -739,6 +757,11 @@ static void module_destroy(void *data)
 	free(impl->relative_capacity);
 	free(impl->relative_capacity_nominal);
 	free(impl->debug_snapshot_json_path);
+	if (impl->conformal_trace_fp != NULL) {
+		fclose(impl->conformal_trace_fp);
+		impl->conformal_trace_fp = NULL;
+	}
+	free(impl->conformal_trace_path);
 	cpu_topology_destroy(&impl->topology);
 	sched_groups_fini(&impl->sched_groups);
 	free(impl);
@@ -1733,6 +1756,56 @@ static void apply_sample(struct impl *impl, struct node *n,
 				impl, n, sample_ref_u64, peak_hold, period);
 		n->wcet = sel.value_ns;
 		n->budget_kind = sel.kind;
+	}
+
+	/*
+	 * Optional calibration trace export. When enabled the worker
+	 * appends one JSON line per sample to the configured path; a
+	 * Python replay tool (live-test/conformal_calibrate.py)
+	 * consumes the file to reproduce the estimator's progression
+	 * under alternative parameter grids without touching the
+	 * production daemon. The RT path is unaffected -- this code
+	 * runs on the audio recalc worker. The hook only emits when
+	 * the conformal estimator actually accepted the sample
+	 * (sample_ref > 0). */
+	if (impl->conformal_cfg.trace_export &&
+	    impl->conformal_trace_path != NULL &&
+	    sample_ref > 0.0 && n->conformal != NULL) {
+		if (impl->conformal_trace_fp == NULL) {
+			impl->conformal_trace_fp = fopen(
+					impl->conformal_trace_path, "a");
+			if (impl->conformal_trace_fp == NULL)
+				pw_log_warn("conformal trace fopen %s failed: %m",
+					impl->conformal_trace_path);
+		}
+		if (impl->conformal_trace_fp != NULL) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			fprintf(impl->conformal_trace_fp,
+				"{\"timestamp_ns\":%llu,"
+				"\"entity_id\":%u,"
+				"\"period_ns\":%llu,"
+				"\"runtime_ns\":%llu,"
+				"\"budget_ns\":%llu,"
+				"\"budget_kind\":\"%s\","
+				"\"conformal_state\":\"%s\","
+				"\"conformal_alpha_eff\":%g,"
+				"\"conformal_samples_used\":%llu}\n",
+				(unsigned long long)
+					((uint64_t)ts.tv_sec * 1000000000ULL +
+					 (uint64_t)ts.tv_nsec),
+				n->node ? n->node->info.id : (uint32_t)-1,
+				(unsigned long long)period,
+				(unsigned long long)(sample_ref > 0.0 ?
+					(uint64_t)sample_ref : 0),
+				(unsigned long long)n->wcet,
+				rt_diag_budget_kind_name(n->budget_kind),
+				rt_conformal_state_name(
+					rt_conformal_state(n->conformal)),
+				rt_conformal_alpha_eff(n->conformal),
+				(unsigned long long)
+					rt_conformal_samples_used(n->conformal));
+		}
 	}
 
 	n->period = period;
@@ -3758,6 +3831,23 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->conformal_cfg.trace_export = pw_properties_get_bool(props,
 			"deadline.conformal.trace_export",
 			impl->conformal_cfg.trace_export);
+	if (impl->conformal_cfg.trace_export) {
+		const char *tp = pw_properties_get(props,
+				"deadline.conformal.trace_path");
+		if (tp != NULL && tp[0] != '\0') {
+			impl->conformal_trace_path = strdup(tp);
+			if (impl->conformal_trace_path == NULL)
+				pw_log_warn("strdup of conformal trace path failed: %m");
+			else
+				pw_log_info("deadline.conformal.trace_path = %s",
+					impl->conformal_trace_path);
+		} else {
+			pw_log_warn("deadline.conformal.trace_export=true but"
+					" deadline.conformal.trace_path is empty;"
+					" trace export disabled");
+			impl->conformal_cfg.trace_export = false;
+		}
+	}
 	if ((s = pw_properties_get(props, "deadline.conformal.risk_allocation")) != NULL) {
 		if (spa_streq(s, "uniform"))
 			impl->conformal_cfg.risk_allocation = RT_CONF_RISK_ALLOC_UNIFORM;
