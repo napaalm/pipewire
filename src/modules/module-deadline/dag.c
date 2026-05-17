@@ -2586,6 +2586,32 @@ bool dag_compute_local_deadlines(dag_t *g)
 			n->local_deadline = n->cumulative_deadline - max_pred;
 		}
 
+		/* Source nodes (no real predecessor) must publish a
+		 * strictly positive cumulative deadline: they're
+		 * released at the graph's activation and have to
+		 * complete by some time > 0. Sink-side reach is the
+		 * complementary constraint -- every sink's cumulative
+		 * deadline must fit inside the end-to-end deadline D,
+		 * which the model takes equal to the driver period.
+		 * The deadline-splitter is the authority for both; the
+		 * checks here are a belt-and-braces guard against a
+		 * future splitter regression slipping past
+		 * dag_recalculate(). */
+		if (!has_real_pred && n->cumulative_deadline == 0) {
+			pw_log_error("node %u: source has zero cumulative "
+				     "deadline", n->id);
+			errno = EINVAL;
+			return false;
+		}
+		if (n->cumulative_deadline > g->period) {
+			pw_log_error("node %u: cumulative deadline %"
+				     PRIu64 " exceeds end-to-end deadline %"
+				     PRIu64, n->id,
+				     n->cumulative_deadline, g->period);
+			errno = EINVAL;
+			return false;
+		}
+
 		if (n->local_deadline == 0) {
 			pw_log_error("node %u has zero local deadline after "
 				     "cumulative-to-local conversion", n->id);
