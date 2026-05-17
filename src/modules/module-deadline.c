@@ -42,6 +42,7 @@
 
 #include "config.h"
 
+#include "module-deadline/conformal.h"
 #include "module-deadline/cpu_topology.h"
 #include "module-deadline/dag.h"
 #include "module-deadline/diag.h"
@@ -698,6 +699,35 @@ struct impl {
 	double   mbpta_gumbel_r2_threshold;
 	double   mbpta_alpha_et;
 	bool     mbpta_accept_probabilistic_hard;
+
+	/*
+	 * Runtime budget-source preference. The runtime selection
+	 * predicate walks manual-override -> deterministic-WCET ->
+	 * adaptive-conformal -> empirical-quantile -> bootstrap-fallback
+	 * in declining order of provenance strength; this knob picks the
+	 * automatic source the operator wants the predicate to consider.
+	 * MBPTA_PWCET cannot drive runtime unless
+	 * mbpta_accept_probabilistic_hard is also true.
+	 */
+	enum rt_budget_source {
+		BUDGET_SOURCE_AUTO              = 0,
+		BUDGET_SOURCE_MANUAL            = 1,
+		BUDGET_SOURCE_DETERMINISTIC     = 2,
+		BUDGET_SOURCE_ADAPTIVE_CONFORMAL = 3,
+		BUDGET_SOURCE_EMPIRICAL_QUANTILE = 4,
+		BUDGET_SOURCE_MBPTA              = 5,
+		BUDGET_SOURCE_BOOTSTRAP          = 6,
+	}        budget_source;
+
+	/*
+	 * Adaptive-conformal estimator configuration. Defaults are the
+	 * calibration starting points from rt_conformal_config_defaults;
+	 * the per-knob deadline.conformal.* options override them. The
+	 * estimator's own state lives per-follower; this block carries
+	 * the module-wide configuration that initialises every new
+	 * estimator instance.
+	 */
+	struct rt_conformal_config conformal_cfg;
 
 	/* Persistent-DAG path on the worker (default). When false the
 	 * worker still runs but reconcile_apply takes the legacy
@@ -3862,6 +3892,177 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	}
 	impl->mbpta_accept_probabilistic_hard = pw_properties_get_bool(props,
 			"deadline.mbpta.accept_probabilistic_hard", false);
+
+	/*
+	 * Adaptive-conformal estimator configuration. Defaults match
+	 * the rt_conformal_config_defaults starting points; the
+	 * deadline.conformal.* keys override each knob and the parsed
+	 * block is run through rt_conformal_config_validate so an
+	 * unsound combination is refused at parse time rather than
+	 * arming a broken estimator later.
+	 */
+	rt_conformal_config_defaults(&impl->conformal_cfg);
+	if ((s = pw_properties_get(props, "deadline.conformal.alpha_graph")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.alpha_target = v;
+		else
+			pw_log_warn("deadline.conformal.alpha_graph %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.alpha_min")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.alpha_min = v;
+		else
+			pw_log_warn("deadline.conformal.alpha_min %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.alpha_max")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.alpha_max = v;
+		else
+			pw_log_warn("deadline.conformal.alpha_max %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.eta")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.eta = v;
+		else
+			pw_log_warn("deadline.conformal.eta %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.window")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 2 && v <= RT_CONFORMAL_MAX_WINDOW)
+			impl->conformal_cfg.window = (uint32_t)v;
+		else
+			pw_log_warn("deadline.conformal.window %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.recalc_period")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 1)
+			impl->conformal_cfg.recalc_period = (uint32_t)v;
+		else
+			pw_log_warn("deadline.conformal.recalc_period %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.ewma_location_lambda")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.ewma_location_lambda = v;
+		else
+			pw_log_warn("deadline.conformal.ewma_location_lambda %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.ewma_scale_lambda")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v > 0.0 && v < 1.0)
+			impl->conformal_cfg.ewma_scale_lambda = v;
+		else
+			pw_log_warn("deadline.conformal.ewma_scale_lambda %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.guard_ns")) != NULL) {
+		char *end; unsigned long long v = strtoull(s, &end, 10);
+		if (end != s)
+			impl->conformal_cfg.guard_ns = (uint64_t)v;
+		else
+			pw_log_warn("deadline.conformal.guard_ns %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.guard_percent")) != NULL) {
+		char *end; double v = strtod(s, &end);
+		if (end != s && v >= 0.0 && v < 1.0)
+			impl->conformal_cfg.guard_percent = v;
+		else
+			pw_log_warn("deadline.conformal.guard_percent %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.sigma_floor_ns")) != NULL) {
+		char *end; unsigned long long v = strtoull(s, &end, 10);
+		if (end != s && v >= 1)
+			impl->conformal_cfg.sigma_floor_ns = (uint64_t)v;
+		else
+			pw_log_warn("deadline.conformal.sigma_floor_ns %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.runtime_floor_ns")) != NULL) {
+		char *end; unsigned long long v = strtoull(s, &end, 10);
+		if (end != s)
+			impl->conformal_cfg.runtime_floor_ns = (uint64_t)v;
+		else
+			pw_log_warn("deadline.conformal.runtime_floor_ns %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.bootstrap_min_samples")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 2)
+			impl->conformal_cfg.bootstrap_min_samples = (uint32_t)v;
+		else
+			pw_log_warn("deadline.conformal.bootstrap_min_samples %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.bootstrap_runtime_ns")) != NULL) {
+		char *end; unsigned long long v = strtoull(s, &end, 10);
+		if (end != s)
+			impl->conformal_cfg.bootstrap_runtime_ns = (uint64_t)v;
+		else
+			pw_log_warn("deadline.conformal.bootstrap_runtime_ns %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.max_update_cost_ns")) != NULL) {
+		char *end; unsigned long long v = strtoull(s, &end, 10);
+		if (end != s)
+			impl->conformal_cfg.max_update_cost_ns = (uint64_t)v;
+		else
+			pw_log_warn("deadline.conformal.max_update_cost_ns %s ignored", s);
+	}
+	impl->conformal_cfg.compatible_history = pw_properties_get_bool(props,
+			"deadline.conformal.compatible_history",
+			impl->conformal_cfg.compatible_history);
+	impl->conformal_cfg.trace_export = pw_properties_get_bool(props,
+			"deadline.conformal.trace_export",
+			impl->conformal_cfg.trace_export);
+	if ((s = pw_properties_get(props, "deadline.conformal.risk_allocation")) != NULL) {
+		if (spa_streq(s, "uniform"))
+			impl->conformal_cfg.risk_allocation = RT_CONF_RISK_ALLOC_UNIFORM;
+		else if (spa_streq(s, "density_weighted"))
+			impl->conformal_cfg.risk_allocation = RT_CONF_RISK_ALLOC_DENSITY_WEIGHTED;
+		else if (spa_streq(s, "slope_weighted"))
+			impl->conformal_cfg.risk_allocation = RT_CONF_RISK_ALLOC_SLOPE_WEIGHTED;
+		else
+			pw_log_warn("deadline.conformal.risk_allocation %s ignored", s);
+	}
+	if (rt_conformal_config_validate(&impl->conformal_cfg) != 0) {
+		pw_log_warn("deadline.conformal.* parsed values do not pass"
+				" validation; reverting to defaults");
+		rt_conformal_config_defaults(&impl->conformal_cfg);
+	}
+
+	/*
+	 * Runtime budget-source preference. Accepts the same token set
+	 * the diag layer surfaces in the JSON snapshot plus the
+	 * automatic-default sentinel and the MBPTA opt-in. MBPTA is
+	 * special-cased: requesting it without also setting
+	 * deadline.mbpta.accept_probabilistic_hard=true logs a warning
+	 * and downgrades the request to the automatic default. Strict
+	 * hard-realtime operation needs manual / static / hybrid
+	 * budgets (Bernat, Burns & Llamosi 2001 §III).
+	 */
+	impl->budget_source = BUDGET_SOURCE_AUTO;
+	if ((s = pw_properties_get(props, "deadline.budget.source")) != NULL) {
+		if (spa_streq(s, "manual"))
+			impl->budget_source = BUDGET_SOURCE_MANUAL;
+		else if (spa_streq(s, "deterministic"))
+			impl->budget_source = BUDGET_SOURCE_DETERMINISTIC;
+		else if (spa_streq(s, "adaptive_conformal"))
+			impl->budget_source = BUDGET_SOURCE_ADAPTIVE_CONFORMAL;
+		else if (spa_streq(s, "empirical_quantile"))
+			impl->budget_source = BUDGET_SOURCE_EMPIRICAL_QUANTILE;
+		else if (spa_streq(s, "bootstrap"))
+			impl->budget_source = BUDGET_SOURCE_BOOTSTRAP;
+		else if (spa_streq(s, "mbpta")) {
+			if (impl->mbpta_accept_probabilistic_hard) {
+				impl->budget_source = BUDGET_SOURCE_MBPTA;
+			} else {
+				pw_log_warn("deadline.budget.source=mbpta requires"
+						" deadline.mbpta.accept_probabilistic_hard=true;"
+						" falling back to automatic selection");
+			}
+		} else {
+			pw_log_warn("deadline.budget.source %s ignored", s);
+		}
+	}
 
 	impl->debug_dump_raw_graph = pw_properties_get_bool(props,
 			"debug.dump-raw-graph", false);
