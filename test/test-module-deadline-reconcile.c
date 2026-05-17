@@ -1620,6 +1620,100 @@ PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
 	return PWTEST_PASS;
 }
 
+/* Typed reasons for the three remaining one-shot soft-degraded
+ * demotion paths the scheduling-model reference enumerates:
+ *
+ *   node_unanalyzable -- a contracted node carries a member the
+ *     daemon cannot place under SCHED_DEADLINE (main-loop,
+ *     uncontrolled exported, remote-TID-unknown, multithreaded
+ *     plugin worker set). Hard EDF feasibility cannot bound such
+ *     work; the graph still runs but the published mode is soft.
+ *   wcet_confidence_low -- the MBPTA estimator has not converged
+ *     and the sketch's minimum-samples gate has not cleared, so
+ *     the kernel runtime field would carry a bootstrap fallback.
+ *     A hard claim that the runtime field bounds the work is not
+ *     defensible (Cucu-Grosjean 2012 §III).
+ *   process_blocked_inside_rt -- the runtime blocking
+ *     instrumentation observed a wait inside a process() call the
+ *     validator had accepted as non-blocking. The macro-node is a
+ *     self-suspending task and the EDF proof does not apply
+ *     (Chen et al. 2019 §III).
+ *
+ * The tests pin the typed reason vocabulary (the constants exist
+ * and reconcile_state_force_soft copies them verbatim into the
+ * snapshot's reason column) so the JSON snapshot's reason values
+ * stay enumerable. Wiring the detection at the call site is
+ * separate work; this test pins the contract the wiring will
+ * satisfy. */
+PWTEST(reconcile_force_soft_node_unanalyzable_reason)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	struct reconcile_feasibility feas;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_HARD);
+
+	reconcile_state_force_soft(s, RECONCILE_SOFT_REASON_NODE_UNANALYZABLE);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason, "node_unanalyzable");
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_force_soft_wcet_confidence_low_reason)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	struct reconcile_feasibility feas;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	reconcile_state_force_soft(s, RECONCILE_SOFT_REASON_WCET_CONFIDENCE_LOW);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason, "wcet_confidence_low");
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_force_soft_process_blocked_inside_rt_reason)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	struct reconcile_feasibility feas;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+	reconcile_state_force_soft(s,
+			RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason, "process_blocked_inside_rt");
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 /* Hard-mode cumulative deadlines are monotonic along every
  * contracted edge: for every input edge u -> v, the cumulative
  * deadline stamped on u must be <= the cumulative deadline
@@ -1975,6 +2069,12 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_singleton_fusion_leader_equals_follower_id,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_invalid_params_demotes_to_soft_degraded,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_force_soft_node_unanalyzable_reason,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_force_soft_wcet_confidence_low_reason,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_force_soft_process_blocked_inside_rt_reason,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_property_random_chains_satisfy_kernel_contract,
 			PWTEST_NOARG);

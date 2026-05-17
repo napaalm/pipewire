@@ -230,6 +230,51 @@ void reconcile_state_feasibility(const reconcile_state_t *state,
  */
 void reconcile_state_force_soft(reconcile_state_t *state, const char *reason);
 
+/*
+ * Typed reason vocabulary for one-shot soft-degraded demotions.
+ *
+ * Five reasons originate inside reconcile_apply (placer_rejected,
+ * edf_infeasible, density_above_one, dbf_overload) and one
+ * (kernel_rejected_or_invalid_params) at the apply path's
+ * sched_setattr boundary. The constants below name the three
+ * remaining triggers documented by the project's scheduling-model
+ * reference -- a runtime-detected analyzability hole, an
+ * insufficient-confidence estimator, and a runtime-detected
+ * suspension inside a hard-mode group -- so callers do not invent
+ * fresh strings on each call site and the JSON snapshot keeps a
+ * closed vocabulary of reason tokens.
+ *
+ * The constants are plain C strings to avoid an enum-to-string
+ * lookup; the reason field that records them is itself a
+ * fixed-size char[] copy.
+ *
+ *   RECONCILE_SOFT_REASON_NODE_UNANALYZABLE -- a contracted node
+ *     carries a member the daemon cannot place under
+ *     SCHED_DEADLINE (a main-loop node, an exported node with no
+ *     controllable reservation, a remote node whose processing
+ *     TID is unknown, a multithreaded plugin's uncontrolled
+ *     worker set) but the graph still needs to run. The hard EDF
+ *     proof does not cover such work; soft mode is the only
+ *     honest classification (Chen et al. 2019 on the limits of
+ *     suspension-aware analysis).
+ *   RECONCILE_SOFT_REASON_WCET_CONFIDENCE_LOW -- the MBPTA
+ *     estimator has not converged AND the empirical sketch has
+ *     not yet cleared its minimum-samples gate, so the budget the
+ *     analysis would consume is a bootstrap fallback. A hard
+ *     claim that the kernel runtime field bounds the work would
+ *     not be defensible (Cucu-Grosjean 2012 §III on the
+ *     minimum-number-of-observations result).
+ *   RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT -- the runtime
+ *     blocking instrumentation observed a wait inside a process()
+ *     call that the validator had accepted as non-blocking. The
+ *     macro-node is therefore a self-suspending task and the EDF
+ *     feasibility proof does not apply (Chen et al. 2019 §III).
+ */
+#define RECONCILE_SOFT_REASON_NODE_UNANALYZABLE       "node_unanalyzable"
+#define RECONCILE_SOFT_REASON_WCET_CONFIDENCE_LOW     "wcet_confidence_low"
+#define RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT \
+		"process_blocked_inside_rt"
+
 #ifdef __cplusplus
 }
 #endif
