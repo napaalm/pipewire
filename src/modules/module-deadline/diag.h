@@ -464,6 +464,18 @@ struct rt_diag_param_node {
 	 * cause-of-rebuild signal when a follower's estimator keeps
 	 * dropping back to INSUFFICIENT_DATA. */
 	char     mbpta_last_invalidation_reason[32];
+
+	/* Composite estimator-key fingerprint -- FNV-1a-ish hash of
+	 * the components the plan calls out as estimator-key
+	 * dimensions: (driver period, fusion-group leader id,
+	 * topology generation, placement CPU). Two estimators with
+	 * the same fingerprint were observed under the same
+	 * sampling regime; a change in fingerprint between snapshots
+	 * is the cause-of-invalidation signal an operator can
+	 * cross-reference against the last-invalidation reason.
+	 * Zero when the follower has not yet been touched by a
+	 * reconcile pass. */
+	uint64_t mbpta_estimator_key;
 };
 
 struct rt_diag_params_snapshot {

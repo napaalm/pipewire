@@ -487,7 +487,8 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false"
-		" mbpta_last_invalidation=none\n"
+		" mbpta_last_invalidation=none"
+		" mbpta_estimator_key=0x0000000000000000\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
 		" budget_kind=bootstrap_fallback budget_samples=0"
@@ -499,7 +500,8 @@ PWTEST(diag_params_render_text_golden)
 		" mbpta_crps=0.000000"
 		" mbpta_conv=0 mbpta_iid_reject=0"
 		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true"
-		" mbpta_last_invalidation=period\n";
+		" mbpta_last_invalidation=period"
+		" mbpta_estimator_key=0xfedcba9876543210\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -526,6 +528,7 @@ PWTEST(diag_params_render_text_golden)
 	snprintf(n.mbpta_last_invalidation_reason,
 		sizeof(n.mbpta_last_invalidation_reason), "%s",
 		"period");
+	n.mbpta_estimator_key = 0xfedcba9876543210ULL;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 
 	fp = open_memstream(&buf, &len);
@@ -621,7 +624,8 @@ PWTEST(diag_json_full_golden)
 		"\"iid_reject_streak\":0,"
 		"\"effective_eps_node\":0.0000000010000000,"
 		"\"eps_node_capped\":false,"
-		"\"last_invalidation_reason\":\"fusion_group\"}}],"
+		"\"last_invalidation_reason\":\"fusion_group\","
+		"\"estimator_key\":\"0x0123456789abcdef\"}}],"
 		"\"pwcet_path_coverage_note\":\""
 		"pWCET claims do not extend to untriggered branches; "
 		"the result is only valid for paths actually observed "
@@ -688,6 +692,7 @@ PWTEST(diag_json_full_golden)
 	snprintf(pn.mbpta_last_invalidation_reason,
 		sizeof(pn.mbpta_last_invalidation_reason), "%s",
 		"fusion_group");
+	pn.mbpta_estimator_key = 0x0123456789abcdefULL;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;

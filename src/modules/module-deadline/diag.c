@@ -605,10 +605,12 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			n->mbpta_convergence_streak,
 			n->mbpta_iid_reject_streak);
 		diag_fprintf_double(out, 16, n->mbpta_effective_eps_node);
-		fprintf(out, " mbpta_eps_capped=%s mbpta_last_invalidation=%s\n",
+		fprintf(out, " mbpta_eps_capped=%s mbpta_last_invalidation=%s"
+			" mbpta_estimator_key=0x%016llx\n",
 			n->mbpta_eps_node_capped ? "true" : "false",
 			n->mbpta_last_invalidation_reason[0] != '\0'
-				? n->mbpta_last_invalidation_reason : "none");
+				? n->mbpta_last_invalidation_reason : "none",
+			(unsigned long long)n->mbpta_estimator_key);
 	}
 }
 
@@ -891,6 +893,14 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			json_write_escaped(out,
 				n->mbpta_last_invalidation_reason[0] != '\0'
 				? n->mbpta_last_invalidation_reason : "none");
+			{
+				char keybuf[32];
+				snprintf(keybuf, sizeof(keybuf),
+					"0x%016llx",
+					(unsigned long long)n->mbpta_estimator_key);
+				fputs(",\"estimator_key\":", out);
+				json_write_escaped(out, keybuf);
+			}
 			fputs("}}", out);
 		}
 	}

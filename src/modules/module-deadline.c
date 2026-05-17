@@ -2561,6 +2561,29 @@ static int populate_params_snapshot(struct impl *impl,
 						"%s", name);
 				}
 			}
+			/* Composite estimator-key fingerprint. FNV-1a
+			 * over (period, fusion-leader, topo-gen, CPU)
+			 * -- the dimensions the plan calls out. A
+			 * change between snapshots means the
+			 * estimator's distributional assumptions have
+			 * shifted; the last-invalidation reason tells
+			 * which dimension flipped. */
+			{
+				uint64_t h = 0xcbf29ce484222325ULL;
+				h ^= mn->last_period;
+				h *= 0x100000001b3ULL;
+				h ^= (uint64_t)mn->last_fusion_group_leader;
+				h *= 0x100000001b3ULL;
+				h ^= mn->last_topo_generation;
+				h *= 0x100000001b3ULL;
+				h ^= (uint64_t)mn->last_cpu;
+				h *= 0x100000001b3ULL;
+				if (mn->last_period == 0 &&
+				    !mn->last_fusion_group_seen &&
+				    !mn->last_topo_generation_seen)
+					h = 0;
+				pn.mbpta_estimator_key = h;
+			}
 		} else {
 			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
 			pn.mbpta_pwcet_ns = 0;
