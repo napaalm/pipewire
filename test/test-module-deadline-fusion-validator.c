@@ -578,6 +578,38 @@ PWTEST(fusion_blocking_null_caps_rejects)
 	return PWTEST_PASS;
 }
 
+/* A node that was previously accepted as nonblocking can later
+ * have its capability bit revoked (a plugin loaded a callback
+ * that may suspend, the operator reconfigured the node, an
+ * automation toggle flipped the capability). The validator must
+ * re-evaluate on each call; what's accepted at admission time
+ * t1 must be rejected at t2 if the cap bits have flipped. This
+ * pins that contract: a (NONBLOCKING_PROCESS, NONBLOCKING_PROCESS)
+ * group accepts, then the same group with the second member's
+ * bit cleared rejects with BLOCKING_RISK. The validator carries
+ * no internal cache that could keep the stale admission alive. */
+PWTEST(fusion_blocking_capability_flip_re_rejects)
+{
+	uint32_t caps[] = {
+		FUSION_CAP_NONBLOCKING_PROCESS,
+		FUSION_CAP_NONBLOCKING_PROCESS,
+	};
+	enum fusion_reject_reason r1 = FUSION_REJ_NON_CONVEX;
+	enum fusion_reject_reason r2 = FUSION_REJ_NONE;
+
+	pwtest_bool_true(fusion_validator_blocking_closure_accept(
+				caps, 2, &r1));
+	pwtest_int_eq(r1, FUSION_REJ_NONE);
+
+	/* Capability flip: the second member is no longer
+	 * nonblocking. */
+	caps[1] = 0;
+	pwtest_bool_false(fusion_validator_blocking_closure_accept(
+				caps, 2, &r2));
+	pwtest_int_eq(r2, FUSION_REJ_BLOCKING_RISK);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -620,6 +652,8 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 	pwtest_add(fusion_blocking_unknown_capability_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_blocking_explicit_blocker_rejects, PWTEST_NOARG);
 	pwtest_add(fusion_blocking_null_caps_rejects, PWTEST_NOARG);
+	pwtest_add(fusion_blocking_capability_flip_re_rejects,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
