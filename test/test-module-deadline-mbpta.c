@@ -222,6 +222,39 @@ PWTEST(mbpta_invalidate_resets_state)
 	return PWTEST_PASS;
 }
 
+/* When a follower's fusion-group membership changes the
+ * estimator-key fingerprint flips and the surviving fit no
+ * longer corresponds to the running workload. The fusion-leader
+ * tracker in module-deadline.c calls
+ * mbpta_invalidate_with_reason(FUSION_GROUP) on the transition;
+ * this test pins the contract that the invalidation actually
+ * resets the estimator and stamps the typed reason so an
+ * operator inspecting the snapshot can identify which dimension
+ * flipped. */
+PWTEST(mbpta_invalidate_fusion_group_resets_and_tags_reason)
+{
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e = mbpta_create(&c);
+	uint32_t i;
+
+	pwtest_ptr_notnull(e);
+	for (i = 0; i < 2 * c.sample_window; i++)
+		mbpta_add_sample(e, 100 + (i % 31) * 3);
+	pwtest_bool_true(mbpta_sample_count(e) > 0);
+
+	mbpta_invalidate_with_reason(e, MBPTA_INVALIDATED_FUSION_GROUP);
+	pwtest_int_eq((int)mbpta_sample_count(e), 0);
+	pwtest_int_eq(mbpta_state(e), MBPTA_INSUFFICIENT_DATA);
+	pwtest_int_eq(mbpta_last_invalidation_reason(e),
+			MBPTA_INVALIDATED_FUSION_GROUP);
+	pwtest_str_eq(mbpta_invalidation_reason_name(
+				mbpta_last_invalidation_reason(e)),
+			"fusion_group");
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 /* Drive an estimator to PWCET_VALID, then continuously feed
  * non-stationary data: after n_iid_reject consecutive evaluation
  * rounds with KS rejection the state moves to DRIFT (not back to
@@ -672,6 +705,8 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_stationary_stream_converges_to_pwcet_valid, PWTEST_NOARG);
 	pwtest_add(mbpta_distribution_shift_lands_iid_pending, PWTEST_NOARG);
 	pwtest_add(mbpta_invalidate_resets_state, PWTEST_NOARG);
+	pwtest_add(mbpta_invalidate_fusion_group_resets_and_tags_reason,
+			PWTEST_NOARG);
 	pwtest_add(mbpta_drift_after_sustained_iid_rejection, PWTEST_NOARG);
 	pwtest_add(mbpta_non_gumbel_distribution_rejects_fit, PWTEST_NOARG);
 	pwtest_add(mbpta_runs_test_rejects_monotone_trend, PWTEST_NOARG);
