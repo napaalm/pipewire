@@ -100,13 +100,44 @@ Kernel-API contract:
 0 < runtime_budget_ns[v] <= local_deadline_ns[v] <= period_ns
 ```
 
+## Runtime budget kind
+
+The `runtime_budget_ns` shipped to `sched_setattr` comes from one
+of four sources, identified per-node in the JSON snapshot under
+`budget_kind`:
+
+  * **`pwcet`** -- the MBPTA estimator has reached `PWCET_VALID`
+    and the operator has opted in via
+    `deadline.mbpta.accept_probabilistic_hard = true`. The
+    runtime is `pWCET(eps_node) = mu - sigma * ln(-ln(1 - eps_node))`
+    at the configured per-node exceedance target
+    (Cucu-Grosjean 2012 §III-D).
+  * **`empirical_quantile`** -- the t-digest sketch's
+    configured quantile (default p95). This is **soft
+    telemetry**, not a worst-case execution time: it cannot be
+    used to claim hard real-time guarantees and the budget
+    label is named accordingly so no public field, log line,
+    or JSON value ever advertises a p95 quantile as WCET.
+  * **`bootstrap_fallback`** -- a conservative default applied
+    while a freshly-created node has not yet accumulated enough
+    samples for either MBPTA or the sketch to produce a value.
+  * **`deterministic_wcet`** -- a configured static WCET, for
+    operator-known plugins.
+
 ## Hard mode
 
-The published schedule is in **hard mode** when both:
+The published schedule is in **hard mode** when *all* of:
 
-  * the contracted DAG analysis admitted the schedule (cumulative
-    monotonicity, positive local deadlines, path sums within
-    `D`), and
+  * the per-node runtime budget is a deterministic WCET or an
+    MBPTA pWCET (the only two kinds that admit a hard claim --
+    an empirical quantile is by definition a probabilistic
+    soft-telemetry value, not a worst-case bound);
+  * every member of every fused group is non-blocking inside
+    its `process()` call (the fusion validator's blocking-
+    closure predicate rejects groups whose members fail this);
+  * the contracted DAG analysis admitted the schedule
+    (cumulative monotonicity, positive local deadlines, path
+    sums within `D`); and
   * the per-CPU partition passes the configured feasibility
     test (density-sufficient or DBF-exact).
 
