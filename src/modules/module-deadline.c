@@ -46,7 +46,6 @@
 #include "module-deadline/cpu_topology.h"
 #include "module-deadline/dag.h"
 #include "module-deadline/diag.h"
-#include "module-deadline/mbpta.h"
 #include "module-deadline/reconcile.h"
 #include "module-deadline/sched_groups.h"
 
@@ -351,26 +350,11 @@ struct node {
 	uint64_t wcet;
 	uint64_t period;
 
-	/* MBPTA pWCET estimator running alongside the t-digest
-	 * sketch. The estimator owns its own sample window and
-	 * runs the full Cucu-Grosjean et al. 2012 pipeline (KS,
-	 * runs test, block maxima, Gumbel fit, CRPS convergence)
-	 * on the same samples the sketch sees. Reserved for
-	 * RT_DIAG_BUDGET_PWCET provenance; surfaced in the JSON
-	 * snapshot for observability. NULL until the first sample
-	 * arrives (lazy init). */
-	mbpta_t  *mbpta;
-
 	/* Adaptive-conformal upper-runtime-budget estimator
 	 * (Romano, Patterson & Candes 2019; Gibbs & Candes 2021).
-	 * Runs alongside MBPTA and the t-digest on the same
-	 * reference-CPU-normalised sample stream; publishes a soft
-	 * / weakly-hard (Bernat, Burns & Llamosi 2001) one-sided
-	 * budget. The runtime selection predicate prefers this
-	 * estimator over MBPTA by default; MBPTA only drives the
-	 * kernel runtime when the operator opts in via
-	 * deadline.mbpta.accept_probabilistic_hard. NULL until the
-	 * first sample arrives (lazy init). */
+	 * Consumes the per-cycle CPU-time samples and publishes a
+	 * soft / weakly-hard (Bernat, Burns & Llamosi 2001) one-sided
+	 * budget. NULL until the first sample arrives (lazy init). */
 	rt_conformal_t *conformal;
 
 	/* Per-follower budget kind chosen by runtime_select_for_node
@@ -541,43 +525,22 @@ struct impl {
 
 	/* WCET estimator configuration; see module-options doc above. */
 
-	/* MBPTA pWCET estimator configuration. Cucu-Grosjean et al.
-	 * 2012 ECRTS shapes the pipeline; the defaults below are
-	 * the plan's starting points pending calibration. The
-	 * estimator runs unconditionally for observability; the
-	 * accept_probabilistic_hard flag will gate whether
-	 * RT_BUDGET_PWCET is allowed to drive the kernel runtime
-	 * once that integration lands. */
-	uint32_t mbpta_sample_window;
-	uint32_t mbpta_warmup_discard;
-	uint32_t mbpta_block_size;
-	uint32_t mbpta_min_blocks;
-	double   mbpta_alpha_iid;
-	uint32_t mbpta_n_delta;
-	uint32_t mbpta_n_conv;
-	double   mbpta_crps_threshold;
-	double   mbpta_eps_node;
-	uint32_t mbpta_n_iid_reject;
-	double   mbpta_gumbel_r2_threshold;
-	double   mbpta_alpha_et;
-	bool     mbpta_accept_probabilistic_hard;
 
 	/*
 	 * Runtime budget-source preference. The runtime selection
 	 * predicate walks manual-override -> deterministic-WCET ->
-	 * adaptive-conformal -> empirical-quantile -> bootstrap-fallback
-	 * in declining order of provenance strength; this knob picks the
-	 * automatic source the operator wants the predicate to consider.
-	 * MBPTA_PWCET cannot drive runtime unless
-	 * mbpta_accept_probabilistic_hard is also true.
+	 * adaptive-conformal -> bootstrap-fallback in declining order
+	 * of provenance strength; this knob picks the automatic source
+	 * the operator wants the predicate to consider. Bernat, Burns
+	 * & Llamosi 2001 §III: strict hard-realtime operation requires
+	 * manual / static / hybrid WCETs -- the adaptive-conformal
+	 * estimator is soft / weakly-hard only.
 	 */
 	enum rt_budget_source {
 		BUDGET_SOURCE_AUTO              = 0,
 		BUDGET_SOURCE_MANUAL            = 1,
 		BUDGET_SOURCE_DETERMINISTIC     = 2,
 		BUDGET_SOURCE_ADAPTIVE_CONFORMAL = 3,
-		BUDGET_SOURCE_EMPIRICAL_QUANTILE = 4,
-		BUDGET_SOURCE_MBPTA              = 5,
 		BUDGET_SOURCE_BOOTSTRAP          = 6,
 	}        budget_source;
 
@@ -758,10 +721,6 @@ static void module_destroy(void *data)
 		if (n->reconcile) {
 			reconcile_fini(n->reconcile);
 			n->reconcile = NULL;
-		}
-		if (n->mbpta != NULL) {
-			mbpta_destroy(n->mbpta);
-			n->mbpta = NULL;
 		}
 		if (n->conformal != NULL) {
 			rt_conformal_destroy(n->conformal);
@@ -983,9 +942,6 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		 * without invalidating; subsequent passes compare. */
 		if (mn->last_fusion_group_seen &&
 		    mn->last_fusion_group_leader != fusion_group_leader_id) {
-			if (mn->mbpta != NULL)
-				mbpta_invalidate_with_reason(mn->mbpta,
-						MBPTA_INVALIDATED_FUSION_GROUP);
 			if (mn->conformal != NULL)
 				rt_conformal_invalidate(mn->conformal,
 						RT_CONF_INVALIDATED_FUSION_GROUP);
@@ -1615,30 +1571,19 @@ static inline double wcet_sample_to_reference(struct impl *impl,
  *   2. RT_DIAG_BUDGET_DETERMINISTIC_WCET -- a hard static bound
  *      supplied by the plugin (no plumbing yet; reserved for a
  *      future plugin attribute). Used when the plugin exports it.
- *   3. RT_DIAG_BUDGET_PWCET -- MBPTA tail extrapolation. Only
- *      considered when the operator has explicitly opted in via
- *      deadline.mbpta.accept_probabilistic_hard=true; the MBPTA
- *      estimator must additionally be PWCET_VALID. By default
- *      MBPTA is telemetry-only and this branch never fires.
- *   4. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- adaptive-conformal
+ *   3. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- adaptive-conformal
  *      one-sided upper budget. Used when the conformal estimator
  *      is in RT_CONF_VALID (or SHIFT, since SHIFT is still
  *      publishable; the diagnostic surface flags the drift).
- *   5. RT_DIAG_BUDGET_EMPIRICAL_QUANTILE -- t-digest sketch quantile
- *      once sample count >= sketch_min_samples. Soft-real-time
- *      estimate only (Dunning & Ertl 2019 does not produce a
- *      worst-case bound).
- *   6. RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK -- peak-hold of observed
+ *   4. RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK -- peak-hold of observed
  *      samples while the higher-provenance sources are not yet
  *      ready. Always defined.
  *
  * The operator can constrain the hierarchy via deadline.budget.source:
  * BUDGET_SOURCE_BOOTSTRAP always returns peak-hold; the manual /
- * deterministic / mbpta / empirical_quantile / adaptive_conformal
- * values skip the kinds above the requested one. BUDGET_SOURCE_AUTO
- * (the default) walks the full hierarchy. The MBPTA branch is
- * additionally gated by the opt-in flag regardless of
- * budget_source.
+ * deterministic / adaptive_conformal values skip the kinds above
+ * the requested one. BUDGET_SOURCE_AUTO (the default) walks the
+ * full hierarchy.
  *
  * Pure function: no PipeWire side effects, no global state mutation.
  * sample_ref is the reference-CPU-normalised most-recent sample;
@@ -1692,35 +1637,13 @@ static struct runtime_select_result runtime_select_for_node(
 		return r;
 
 	/*
-	 * MBPTA pWCET. Only considered when the operator has opted in
-	 * AND the estimator is PWCET_VALID. The hierarchy step is
-	 * skipped when budget_source restricts further.
-	 */
-	if (n->mbpta != NULL && impl->mbpta_accept_probabilistic_hard &&
-	    mbpta_runtime_uses_pwcet(mbpta_state(n->mbpta), true) &&
-	    (pref == BUDGET_SOURCE_AUTO || pref == BUDGET_SOURCE_MBPTA)) {
-		uint64_t p = mbpta_pwcet_ns(n->mbpta);
-		r.kind = RT_DIAG_BUDGET_PWCET;
-		r.value_ns = SPA_MAX(p, sample_ref);
-		r.sample_count = mbpta_sample_count(n->mbpta);
-		return r;
-	}
-	if (pref == BUDGET_SOURCE_MBPTA) {
-		/* Operator requested MBPTA but its gate is not open. Fall
-		 * through to the next layer rather than returning a stale
-		 * value; the JSON diagnostic surfaces the actual kind so
-		 * the operator can see that the request was downgraded. */
-	}
-
-	/*
 	 * Adaptive-conformal upper budget. Used when the estimator
 	 * has cleared bootstrap (state == VALID, SHIFT). SHIFT is
 	 * still publishable: the value remains a valid one-sided
 	 * bound; the drift flag rides in the diagnostic surface.
 	 */
 	if (n->conformal != NULL &&
-	    (pref == BUDGET_SOURCE_AUTO ||
-	     pref == BUDGET_SOURCE_ADAPTIVE_CONFORMAL)) {
+	    pref != BUDGET_SOURCE_BOOTSTRAP) {
 		enum rt_conformal_state cs = rt_conformal_state(n->conformal);
 		if (cs == RT_CONF_VALID || cs == RT_CONF_SHIFT) {
 			uint64_t c = rt_conformal_budget(n->conformal, 0);
@@ -1766,40 +1689,10 @@ static void apply_sample(struct impl *impl, struct node *n,
 		uint32_t sample_cpu, uint64_t period)
 {
 	if (n->period != period) {
-		if (n->mbpta != NULL)
-			mbpta_invalidate_with_reason(n->mbpta,
-					MBPTA_INVALIDATED_PERIOD);
 		if (n->conformal != NULL)
 			rt_conformal_invalidate(n->conformal,
 					RT_CONF_INVALIDATED_PERIOD);
 		n->wcet = 0;
-	}
-
-	/* Lazy-init MBPTA from impl's configured knobs on first
-	 * sample. The estimator is observational today (does not
-	 * yet drive sched_setattr); its state surfaces in the JSON
-	 * snapshot so an operator can see whether each follower has
-	 * reached PWCET_VALID and what pWCET would be published if
-	 * the operator opted in to probabilistic guarantees. */
-	if (n->mbpta == NULL) {
-		struct mbpta_config c = {
-			.sample_window  = impl->mbpta_sample_window,
-			.warmup_discard = impl->mbpta_warmup_discard,
-			.block_size     = impl->mbpta_block_size,
-			.min_blocks     = impl->mbpta_min_blocks,
-			.alpha_iid      = impl->mbpta_alpha_iid,
-			.n_delta        = impl->mbpta_n_delta,
-			.n_conv         = impl->mbpta_n_conv,
-			.crps_threshold = impl->mbpta_crps_threshold,
-			.eps_node       = impl->mbpta_eps_node,
-			.n_iid_reject   = impl->mbpta_n_iid_reject,
-			.gumbel_r2_threshold = impl->mbpta_gumbel_r2_threshold,
-			.alpha_et       = impl->mbpta_alpha_et,
-		};
-		n->mbpta = mbpta_create(&c);
-		if (n->mbpta == NULL)
-			pw_log_warn("node %d: MBPTA estimator init failed",
-				n->node ? n->node->info.id : (uint32_t)-1);
 	}
 
 	/* Lazy-init the adaptive-conformal estimator with the module's
@@ -1820,14 +1713,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 	double sample_ref = wcet_cycles_to_reference_ns(impl, cycles, sample_cpu);
 	if (sample_ref <= 0.0)
 		sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
-
-	/* Feed the MBPTA estimator the same reference-CPU-normalised
-	 * sample. The estimator stays in INSUFFICIENT_DATA until it
-	 * has enough samples for a block-maxima fit; until it
-	 * declares PWCET_VALID nothing here changes the kernel-side
-	 * behaviour. */
-	if (runtime > 0 && n->mbpta != NULL && sample_ref > 0.0)
-		(void)mbpta_add_sample(n->mbpta, (uint64_t)sample_ref);
 
 	/* Feed the conformal estimator the same sample. The observation
 	 * flow obeys the prequential discipline internally (score
@@ -2742,85 +2627,21 @@ static int populate_params_snapshot(struct impl *impl,
 		} else {
 			pn.applied = false;
 		}
-		/* Budget provenance. The Dunning & Ertl 2019 t-digest
-		 * sliding-window quantile sketch is the active source
-		 * for the kernel runtime budget today: when enough
-		 * samples have accumulated past the bootstrap-min
-		 * gate, the runtime comes from the configured
-		 * empirical quantile; until then the node runs under
-		 * the bootstrap fallback. Calling either a "WCET"
-		 * would conflate provenance with magnitude, which
-		 * Cucu-Grosjean et al. 2012 explicitly warns against.
+		/*
+		 * Budget provenance. The adaptive-conformal estimator
+		 * (Romano, Patterson & Candes 2019; Gibbs & Candes
+		 * 2021) is the active source for the kernel runtime
+		 * budget today; the predicate runtime_select_for_node
+		 * stamped the per-follower budget_kind at sample time.
 		 *
-		 * The MBPTA pWCET estimator runs in parallel and its
-		 * state is surfaced separately under mbpta_*. Once
-		 * its state reaches PWCET_VALID and the operator opts
-		 * in via deadline.mbpta.accept_probabilistic_hard,
-		 * the kernel runtime will switch to mbpta_pwcet_ns
-		 * and the budget_kind will flip to PWCET. */
-		if (mn != NULL && mn->mbpta != NULL) {
-			pn.mbpta_state =
-				(enum rt_diag_mbpta_state)mbpta_state(mn->mbpta);
-			pn.mbpta_pwcet_ns = mbpta_pwcet_ns(mn->mbpta);
-			pn.mbpta_block_count = mbpta_block_count(mn->mbpta);
-			pn.mbpta_mu = mbpta_mu(mn->mbpta);
-			pn.mbpta_sigma = mbpta_sigma(mn->mbpta);
-			pn.mbpta_ks_stat = mbpta_ks_stat(mn->mbpta);
-			pn.mbpta_ks_pvalue = mbpta_ks_pvalue(mn->mbpta);
-			pn.mbpta_runs_z = mbpta_runs_z(mn->mbpta);
-			pn.mbpta_runs_pvalue = mbpta_runs_pvalue(mn->mbpta);
-			pn.mbpta_et_pvalue = mbpta_et_pvalue(mn->mbpta);
-			pn.mbpta_gev_shape_k = mbpta_gev_shape_k(mn->mbpta);
-			pn.mbpta_gumbel_r2 = mbpta_gumbel_r2(mn->mbpta);
-			pn.mbpta_gumbel_rse = mbpta_gumbel_rse(mn->mbpta);
-			pn.mbpta_crps = mbpta_crps(mn->mbpta);
-			pn.mbpta_convergence_streak =
-				mbpta_convergence_streak(mn->mbpta);
-			pn.mbpta_iid_reject_streak =
-				mbpta_iid_reject_streak(mn->mbpta);
-			pn.mbpta_effective_eps_node =
-				mbpta_effective_eps_node(mn->mbpta);
-			pn.mbpta_eps_node_capped =
-				mbpta_eps_node_capped(mn->mbpta);
-			{
-				enum mbpta_invalidation_reason r =
-					mbpta_last_invalidation_reason(mn->mbpta);
-				if (r != MBPTA_INVALIDATED_NONE) {
-					const char *name =
-						mbpta_invalidation_reason_name(r);
-					snprintf(pn.mbpta_last_invalidation_reason,
-						sizeof(pn.mbpta_last_invalidation_reason),
-						"%s", name);
-				}
-			}
-			/* Composite estimator-key fingerprint. FNV-1a
-			 * over (period, fusion-leader, topo-gen, CPU)
-			 * -- the dimensions the plan calls out. A
-			 * change between snapshots means the
-			 * estimator's distributional assumptions have
-			 * shifted; the last-invalidation reason tells
-			 * which dimension flipped. */
-			{
-				uint64_t h = 0xcbf29ce484222325ULL;
-				h ^= mn->last_period;
-				h *= 0x100000001b3ULL;
-				h ^= (uint64_t)mn->last_fusion_group_leader;
-				h *= 0x100000001b3ULL;
-				h ^= mn->last_topo_generation;
-				h *= 0x100000001b3ULL;
-				h ^= (uint64_t)mn->last_cpu;
-				h *= 0x100000001b3ULL;
-				if (mn->last_period == 0 &&
-				    !mn->last_fusion_group_seen &&
-				    !mn->last_topo_generation_seen)
-					h = 0;
-				pn.mbpta_estimator_key = h;
-			}
-		} else {
-			pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
-			pn.mbpta_pwcet_ns = 0;
-			pn.mbpta_block_count = 0;
-		}
+		 * MBPTA legacy telemetry fields stay zero. The mbpta
+		 * sub-object is pruned from the JSON snapshot by a
+		 * later commit; until then, the diag layer renders
+		 * the placeholder defaults.
+		 */
+		pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
+		pn.mbpta_pwcet_ns = 0;
+		pn.mbpta_block_count = 0;
 		/*
 		 * The budget-source predicate stamped the per-follower
 		 * fields when the last sample arrived; surface them
@@ -3302,9 +3123,6 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 				continue;
 			if (n->last_topo_generation_seen &&
 			    n->last_topo_generation != this_gen) {
-				if (n->mbpta != NULL)
-					mbpta_invalidate_with_reason(n->mbpta,
-						MBPTA_INVALIDATED_TOPOLOGY_GENERATION);
 				if (n->conformal != NULL)
 					rt_conformal_invalidate(n->conformal,
 						RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
@@ -3830,86 +3648,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	const char *s;
 
-	/* MBPTA defaults follow the plan's starting points. They
-	 * are placeholders pending a calibration pass; the
-	 * per-knob deadline.mbpta.* options below override them. */
-	impl->mbpta_sample_window     = 2048;
-	impl->mbpta_warmup_discard    = 64;
-	impl->mbpta_block_size        = 32;
-	impl->mbpta_min_blocks        = 50;
-	impl->mbpta_alpha_iid         = 0.05;
-	impl->mbpta_n_delta           = 50;
-	impl->mbpta_n_conv            = 5;
-	impl->mbpta_crps_threshold    = 0.1;
-	impl->mbpta_eps_node          = 1e-9;
-	impl->mbpta_n_iid_reject      = 3;
-	impl->mbpta_gumbel_r2_threshold = 0.90;
-	impl->mbpta_alpha_et          = 0.05;
-	impl->mbpta_accept_probabilistic_hard = false;
-
-	if ((s = pw_properties_get(props, "deadline.mbpta.sample_window")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 2 && v <= UINT32_MAX)
-			impl->mbpta_sample_window = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.warmup_discard")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v <= UINT32_MAX)
-			impl->mbpta_warmup_discard = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.block_size")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 2 && v <= UINT32_MAX)
-			impl->mbpta_block_size = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.min_blocks")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 2 && v <= UINT32_MAX)
-			impl->mbpta_min_blocks = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.alpha_iid")) != NULL) {
-		char *end; double v = strtod(s, &end);
-		if (end != s && v > 0.0 && v < 1.0)
-			impl->mbpta_alpha_iid = v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.n_delta")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 1 && v <= UINT32_MAX)
-			impl->mbpta_n_delta = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.n_conv")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 1 && v <= UINT32_MAX)
-			impl->mbpta_n_conv = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.crps_threshold")) != NULL) {
-		char *end; double v = strtod(s, &end);
-		if (end != s && v > 0.0)
-			impl->mbpta_crps_threshold = v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.eps_node")) != NULL) {
-		char *end; double v = strtod(s, &end);
-		if (end != s && v > 0.0 && v < 1.0)
-			impl->mbpta_eps_node = v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.n_iid_reject")) != NULL) {
-		char *end; unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 1 && v <= UINT32_MAX)
-			impl->mbpta_n_iid_reject = (uint32_t)v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.gumbel_r2_threshold")) != NULL) {
-		char *end; double v = strtod(s, &end);
-		if (end != s && v >= 0.0 && v <= 1.0)
-			impl->mbpta_gumbel_r2_threshold = v;
-	}
-	if ((s = pw_properties_get(props, "deadline.mbpta.alpha_et")) != NULL) {
-		char *end; double v = strtod(s, &end);
-		if (end != s && v >= 0.0 && v < 1.0)
-			impl->mbpta_alpha_et = v;
-	}
-	impl->mbpta_accept_probabilistic_hard = pw_properties_get_bool(props,
-			"deadline.mbpta.accept_probabilistic_hard", false);
-
 	/*
 	 * Adaptive-conformal estimator configuration. Defaults match
 	 * the rt_conformal_config_defaults starting points; the
@@ -4049,12 +3787,13 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	/*
 	 * Runtime budget-source preference. Accepts the same token set
 	 * the diag layer surfaces in the JSON snapshot plus the
-	 * automatic-default sentinel and the MBPTA opt-in. MBPTA is
-	 * special-cased: requesting it without also setting
-	 * deadline.mbpta.accept_probabilistic_hard=true logs a warning
-	 * and downgrades the request to the automatic default. Strict
-	 * hard-realtime operation needs manual / static / hybrid
-	 * budgets (Bernat, Burns & Llamosi 2001 §III).
+	 * automatic-default sentinel. The mbpta and empirical_quantile
+	 * tokens, plus every deadline.mbpta.* / wcet.* key, are
+	 * handled by the legacy-key deprecation pass in the next
+	 * commit; right now they log a warning and fall through to
+	 * the automatic default. Strict hard-realtime operation needs
+	 * manual / static / hybrid budgets (Bernat, Burns & Llamosi
+	 * 2001 §III).
 	 */
 	impl->budget_source = BUDGET_SOURCE_AUTO;
 	if ((s = pw_properties_get(props, "deadline.budget.source")) != NULL) {
@@ -4064,19 +3803,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->budget_source = BUDGET_SOURCE_DETERMINISTIC;
 		else if (spa_streq(s, "adaptive_conformal"))
 			impl->budget_source = BUDGET_SOURCE_ADAPTIVE_CONFORMAL;
-		else if (spa_streq(s, "empirical_quantile"))
-			impl->budget_source = BUDGET_SOURCE_EMPIRICAL_QUANTILE;
 		else if (spa_streq(s, "bootstrap"))
 			impl->budget_source = BUDGET_SOURCE_BOOTSTRAP;
-		else if (spa_streq(s, "mbpta")) {
-			if (impl->mbpta_accept_probabilistic_hard) {
-				impl->budget_source = BUDGET_SOURCE_MBPTA;
-			} else {
-				pw_log_warn("deadline.budget.source=mbpta requires"
-						" deadline.mbpta.accept_probabilistic_hard=true;"
-						" falling back to automatic selection");
-			}
-		} else {
+		else {
 			pw_log_warn("deadline.budget.source %s ignored", s);
 		}
 	}
