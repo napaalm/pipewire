@@ -49,7 +49,6 @@
 #include "module-deadline/mbpta.h"
 #include "module-deadline/reconcile.h"
 #include "module-deadline/sched_groups.h"
-#include "module-deadline/wcet_sketch.h"
 
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
@@ -131,48 +130,6 @@
  *                       sketch has not under-bounded the worst
  *                       case; not recommended for production audio
  *                       graphs.
- * - `wcet.window-size`: Number of recent driver-completion cycles whose
- *                       runtime samples are retained per node. Counts
- *                       cycles, not time -- the sketch sees exactly one
- *                       sample per cycle so the same value behaves
- *                       consistently across rates and quanta. The
- *                       effective window oscillates between window-size/2
- *                       and window-size cycles because of the two-digest
- *                       rotation. Larger windows produce more stable
- *                       budgets but adapt more slowly to workload changes
- *                       (track switch, filter parameter change); smaller
- *                       windows track changes faster but are noisier.
- *                       Default 512.
- * - `wcet.quantile`:    The tail quantile of the per-node runtime
- *                       distribution reported as the SCHED_DEADLINE
- *                       runtime budget. Must lie strictly in (0, 1).
- *                       0.999 means roughly one budget overrun per 1000
- *                       cycles in steady state; SCHED_FLAG_RECLAIM (GRUB)
- *                       absorbs occasional overruns on graphs that are
- *                       not saturated. Note the coupling with
- *                       wcet.window-size: any q such that
- *                       (1 - q) * window-size < 1 reports approximately
- *                       the maximum observed sample, so to extract a
- *                       quantile distinct from peak-hold the window must
- *                       grow proportionally with the tightness of q.
- *                       Default 0.999.
- * - `wcet.compression`: t-digest compression parameter delta -- accuracy
- *                       vs. memory trade-off. Higher gives more
- *                       centroids and finer tail estimation. Per Dunning
- *                       & Ertl (arXiv:1902.04023, Figure 8) absolute
- *                       quantile error scales as 1/delta^2 below the
- *                       knee (delta around 100-200 for tail quantiles)
- *                       and as 1/sqrt(delta) above; 100 sits at the
- *                       knee and is the value the paper recommends for
- *                       general use. Memory footprint at delta=100 is
- *                       roughly 11 kB per node sketch. Default 100.
- * - `wcet.min-samples`: Bootstrap threshold. Until this many samples have
- *                       been observed for a node the module falls back
- *                       to plain peak-hold (max of recent runtimes)
- *                       instead of querying the sketch quantile, which
- *                       protects against a sketch quantile collapsing
- *                       the budget from a few early atypical samples.
- *                       Default 32.
  * - `recalc.sync`:      If true (default false), run the parameter
  *                       recalculation synchronously on the driver's RT
  *                       data-loop thread, as the module did before the
@@ -233,100 +190,7 @@
 
 #define MAX_CPUS 128
 
-/* ---------------------------------------------------------------------
- * WCET-sketch defaults
- *
- * All four knobs below are rate- and quantum-independent. The sketch
- * receives exactly one sample per driver-completion cycle, so where
- * the text says "samples" it always means cycles of the audio graph,
- * not seconds. The same default values therefore behave consistently
- * whether the graph runs at 8-frame quanta at 48 kHz or at 1024-frame
- * quanta at 96 kHz.
- *
- * The choices were re-evaluated against the design discussion of
- * Dunning & Ertl, arXiv:1902.04023 (the paper this sketch implements),
- * and Cucinotta & Palopoli, "QoS Management Through Adaptive
- * Reservations", Real-Time Systems 41(1), 2009.
- * --------------------------------------------------------------------- */
-
-/* Sliding-window length, in graph cycles.
- *
- * The sketch keeps the most recent ~window-size cycles' runtime
- * samples and reports the configured quantile over them. Two t-digests
- * alternate: incoming samples go into "cur"; once cur has window-size/2
- * samples we rotate (prev <- cur, cur empty). Queries answer over
- * prev union cur, so the effective window oscillates between
- * window-size/2 (just after a rotation) and window-size (just before
- * the next).
- *
- * Smaller window: the quantile estimate has higher variance, the
- *   SCHED_DEADLINE budget can oscillate from cycle to cycle, and brief
- *   stationarity windows in the input are less well represented.
- * Larger window: smoother budget, but slower to react to genuine
- *   workload shifts (audio source change, filter reconfiguration).
- *
- * 512 cycles is roughly 85 ms at 48 kHz with an 8-frame quantum and
- * about 10 s at the same rate with a 1024-frame quantum; in both
- * regimes it captures enough samples for the tail estimate to be
- * stable without lagging structural workload changes that matter for
- * audio (those occur on hundreds-of-ms to seconds timescales). */
-#define WCET_DEFAULT_WINDOW_SIZE	512u
-
-/* Tail quantile reported as the WCET budget.
- *
- * The sketch returns the q-quantile of the runtime samples it holds;
- * module-deadline uses that value (with the existing *1.05 safety
- * margin from the pre-existing code) as the SCHED_DEADLINE runtime
- * budget.
- *
- * Lower q: tighter budget, more frequent overruns. At 0.99 we expect
- *   one overrun every 100 cycles, audible as xruns under load.
- * Higher q: looser budget, approaches peak-hold and becomes wasteful
- *   of CPU reservation.
- *
- * 0.999 yields roughly one expected overrun per 1000 cycles. With
- * SCHED_FLAG_RECLAIM enabled (we already set it in set_deadline_sched)
- * the kernel's GRUB mechanism reclaims slack from other deadline tasks
- * to cover such overruns on non-saturated graphs (Abeni, Lelli,
- * Scordino, Palopoli, "Greedy CPU Reclaiming for SCHED_DEADLINE",
- * RTLWS 2014; Lelli, Scordino, Abeni, Faggioli, "Deadline scheduling
- * in the Linux kernel", SP&E 46(6), 2016).
- *
- * The coupling between window-size and quantile matters. For the
- * sketch to return a tail value distinct from the observed maximum
- * we need at least one sample above q in the window, i.e. roughly
- * (1 - q) * window-size >= 1. With window=512:
- *   q = 0.99   -> expected 5 samples above the threshold (meaningful
- *                 tail estimate)
- *   q = 0.999  -> expected 0.5 samples above (the sketch effectively
- *                 returns the max-observed, interpolated)
- *   q = 0.9999 -> the sketch is functionally peak-hold within this
- *                 window
- * 0.999 is chosen as the practical sweet spot: tight enough that the
- * sketch tracks tail movement, loose enough that audible overruns are
- * rare and absorbable by GRUB. Tightening past 0.999 only helps if
- * the window is also enlarged. */
-#define WCET_DEFAULT_QUANTILE		0.999
-
-/* t-digest compression parameter (delta in the paper, eq. 3 / 7).
- *
- * Bounds the number of centroids the digest retains -- at most
- * ceil(delta) clusters in a fully merged digest. Higher delta gives
- * more centroids, finer tail resolution and proportionally more memory.
- *
- * Per Figure 8 of the paper, mean absolute quantile error decays like
- *   1 / delta^2     for delta below the knee (delta ~50-200 for the
- *                   tail quantiles we care about)
- *   1 / sqrt(delta) for delta above the knee
- * 100 sits at the knee and is the value Dunning & Ertl recommend as a
- * general-purpose default. Going to 200 would buy roughly 4x lower
- * tail error at 2x the memory; below 50 errors grow noticeably.
- *
- * Memory at delta=100, per node:
- *   2 digests * (101 centroid_t @ 16 B + 505 buffer slot @ 8 B)
- *   ~= 11 kB. For 30 nodes in a graph, ~330 kB total -- negligible. */
-#define WCET_DEFAULT_COMPRESSION	100.0
-
+/* --- */
 /* Async worker defaults. */
 
 /* SCHED_FIFO priority of the worker thread. Strictly lower than every
@@ -351,25 +215,6 @@
  * allocation. */
 #define TOPO_INITIAL_NODES		64u
 #define TOPO_INITIAL_EDGES		128u
-
-/* Bootstrap threshold, in cycles.
- *
- * Below this number of samples the module ignores the sketch quantile
- * and falls back to plain peak-hold (n->wcet = max(n->wcet, runtime)),
- * matching the pre-existing behaviour. Above the threshold the sketch
- * quantile takes over.
- *
- * The rationale is conservatism on cold start: with very few samples
- * the empirical distribution is not representative of steady state,
- * and a high-quantile query on a thin tail can return a value that is
- * unrealistically small. Peak-hold guarantees we never under-budget
- * relative to anything we have already observed.
- *
- * 32 is short -- ~5 ms at 48 kHz with an 8-frame quantum -- so the
- * sketch takes over quickly. Increasing this makes startup more
- * conservative (and the initial reservation larger) without changing
- * steady-state behaviour. */
-#define WCET_DEFAULT_MIN_SAMPLES	32u
 
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
@@ -497,12 +342,14 @@ struct node {
 	bool enabled:1;
 	bool is_driver:1;
 
-	/* Per-node WCET estimator. Only meaningful for follower nodes
-	 * (is_driver=false); the driver sentinel keeps zeros. */
+	/* Per-node peak-hold WCET, in reference-CPU units. Only
+	 * meaningful for follower nodes (is_driver=false); the driver
+	 * sentinel keeps zeros. The conformal estimator below owns the
+	 * online prediction; n->wcet retains the running max so the
+	 * selection predicate can fall back on a peak-hold floor while
+	 * the estimator is in its bootstrap window. */
 	uint64_t wcet;
 	uint64_t period;
-	wcet_sketch_t sketch;
-	bool sketch_ready;
 
 	/* MBPTA pWCET estimator running alongside the t-digest
 	 * sketch. The estimator owns its own sample window and
@@ -693,10 +540,6 @@ struct impl {
 	bool sched_reclaim;
 
 	/* WCET estimator configuration; see module-options doc above. */
-	uint32_t sketch_window_size;
-	double   sketch_quantile;
-	double   sketch_compression;
-	uint32_t sketch_min_samples;
 
 	/* MBPTA pWCET estimator configuration. Cucu-Grosjean et al.
 	 * 2012 ECRTS shapes the pipeline; the defaults below are
@@ -916,8 +759,6 @@ static void module_destroy(void *data)
 			reconcile_fini(n->reconcile);
 			n->reconcile = NULL;
 		}
-		if (n->sketch_ready)
-			wcet_sketch_fini(&n->sketch);
 		if (n->mbpta != NULL) {
 			mbpta_destroy(n->mbpta);
 			n->mbpta = NULL;
@@ -1893,32 +1734,14 @@ static struct runtime_select_result runtime_select_for_node(
 	}
 	/* If the operator requested adaptive_conformal explicitly and
 	 * the estimator is not yet ready, the predicate falls through
-	 * to the lower layers rather than holding the budget back. */
+	 * to the peak-hold floor rather than holding the budget back. */
 
-	/*
-	 * Empirical-quantile sketch (t-digest). Soft-real-time
-	 * provenance only; available once enough samples have been
-	 * digested.
-	 */
-	if (n->sketch_ready &&
-	    (pref == BUDGET_SOURCE_AUTO ||
-	     pref == BUDGET_SOURCE_EMPIRICAL_QUANTILE ||
-	     pref == BUDGET_SOURCE_ADAPTIVE_CONFORMAL ||
-	     pref == BUDGET_SOURCE_MBPTA)) {
-		uint32_t count = wcet_sketch_count(&n->sketch);
-		if (count >= impl->sketch_min_samples) {
-			double q = wcet_sketch_quantile(&n->sketch);
-			if (q > 0.0 && q < (double)UINT64_MAX) {
-				r.kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
-				r.value_ns = SPA_MAX((uint64_t)q, sample_ref);
-				r.sample_count = count;
-				return r;
-			}
-		}
-		r.sample_count = count;
-	}
-
-	/* Bootstrap fallback: keep peak-hold value (default of r). */
+	/* Bootstrap fallback: peak-hold value (default of r). The
+	 * conformal estimator owns its own bootstrap-with-immediate-
+	 * start path, so a freshly-created follower lands here only
+	 * for the very first activation; subsequent activations either
+	 * stay on this path until the conformal estimator clears
+	 * bootstrap, or switch to RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL. */
 	return r;
 }
 
@@ -1942,21 +1765,7 @@ static void apply_sample(struct impl *impl, struct node *n,
 		uint64_t runtime, uint64_t cycles,
 		uint32_t sample_cpu, uint64_t period)
 {
-	if (!n->sketch_ready) {
-		if (wcet_sketch_init(&n->sketch,
-				     impl->sketch_window_size,
-				     impl->sketch_compression,
-				     impl->sketch_quantile) == 0) {
-			n->sketch_ready = true;
-		} else {
-			pw_log_warn("node %d: WCET sketch init failed; using peak-hold",
-				    n->node ? n->node->info.id : (uint32_t)-1);
-		}
-	}
-
 	if (n->period != period) {
-		if (n->sketch_ready)
-			wcet_sketch_reset(&n->sketch);
 		if (n->mbpta != NULL)
 			mbpta_invalidate_with_reason(n->mbpta,
 					MBPTA_INVALIDATED_PERIOD);
@@ -2011,9 +1820,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 	double sample_ref = wcet_cycles_to_reference_ns(impl, cycles, sample_cpu);
 	if (sample_ref <= 0.0)
 		sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
-
-	if (runtime > 0 && n->sketch_ready)
-		wcet_sketch_add(&n->sketch, sample_ref);
 
 	/* Feed the MBPTA estimator the same reference-CPU-normalised
 	 * sample. The estimator stays in INSUFFICIENT_DATA until it
@@ -3762,8 +3568,6 @@ static void context_driver_removed(void *data, struct pw_impl_node *node)
 		reconcile_fini(n->reconcile);
 		n->reconcile = NULL;
 	}
-	if (n->sketch_ready)
-		wcet_sketch_fini(&n->sketch);
 	free(n->ring_slots);
 	free(n->topo.nodes);
 	free(n->topo.edges);
@@ -4024,44 +3828,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			" check both ignore the GRUB reclaim flag)",
 			impl->sched_reclaim ? "true" : "false");
 
-	impl->sketch_window_size = WCET_DEFAULT_WINDOW_SIZE;
-	impl->sketch_quantile = WCET_DEFAULT_QUANTILE;
-	impl->sketch_compression = WCET_DEFAULT_COMPRESSION;
-	impl->sketch_min_samples = WCET_DEFAULT_MIN_SAMPLES;
-
 	const char *s;
-	if ((s = pw_properties_get(props, "wcet.window-size")) != NULL) {
-		char *end;
-		unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v >= 2 && v <= UINT32_MAX)
-			impl->sketch_window_size = (uint32_t)v;
-		else
-			pw_log_warn("wcet.window-size %s ignored", s);
-	}
-	if ((s = pw_properties_get(props, "wcet.quantile")) != NULL) {
-		char *end;
-		double v = strtod(s, &end);
-		if (end != s && v > 0.0 && v < 1.0)
-			impl->sketch_quantile = v;
-		else
-			pw_log_warn("wcet.quantile %s ignored", s);
-	}
-	if ((s = pw_properties_get(props, "wcet.compression")) != NULL) {
-		char *end;
-		double v = strtod(s, &end);
-		if (end != s && v > 0.0)
-			impl->sketch_compression = v;
-		else
-			pw_log_warn("wcet.compression %s ignored", s);
-	}
-	if ((s = pw_properties_get(props, "wcet.min-samples")) != NULL) {
-		char *end;
-		unsigned long v = strtoul(s, &end, 10);
-		if (end != s && v <= UINT32_MAX)
-			impl->sketch_min_samples = (uint32_t)v;
-		else
-			pw_log_warn("wcet.min-samples %s ignored", s);
-	}
 
 	/* MBPTA defaults follow the plan's starting points. They
 	 * are placeholders pending a calibration pass; the
