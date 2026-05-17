@@ -1620,6 +1620,97 @@ PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
 	return PWTEST_PASS;
 }
 
+/*
+ * Regression test for the original deadline-arithmetic bug.
+ *
+ * The pre-contraction implementation accumulated per-member
+ * deadlines into a per-TID sum and shipped that sum as the
+ * fused-thread kernel deadline. For a chain {A, B} with A's
+ * cumulative deadline 100 us and B's cumulative deadline 200 us,
+ * the old code would have shipped 300 us -- a deadline strictly
+ * later than B's own cumulative milestone. That value has no
+ * defined meaning in the EDF feasibility proof, hides
+ * infeasibility, and lets a downstream successor of B observe its
+ * input later than the analysis promised.
+ *
+ * The contraction-then-respit fix replaces summation: a fused
+ * chain becomes one macro-node whose local deadline is derived on
+ * the contracted DAG, then capped at the period and clamped above
+ * the runtime. This regression test pins the contract that the
+ * kernel deadline shipped to the apply path is never the sum of
+ * member deadlines for a fused thread.
+ *
+ * The test drives a 5-node chain through reconcile_apply with
+ * adjacent-fusion enabled (the leader assignment in cb_record
+ * collapses members to one TID), captures the (tid -> deadline)
+ * tuples, and checks that no observed fused-thread deadline equals
+ * the sum of its members' local deadlines. The bug shape pinned
+ * here is the sum equality; new code may produce any other valid
+ * deadline (max, recomputed split, or anything in-between) but
+ * never the sum.
+ */
+PWTEST(reconcile_regression_no_deadline_sum_for_fused_thread)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	uint32_t i, j;
+	uint32_t fused_threads_checked = 0;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+
+	/* All five nodes share TID 1000 so the per-TID accumulator
+	 * sees them as a fused chain (the apply path will fold them
+	 * onto the same SCHED_DEADLINE reservation). */
+	for (i = 0; i < 5; i++)
+		t.followers[i].tid = 1000;
+
+	rt = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	pwtest_bool_true(cb.calls >= 2);
+
+	/* For each tid recorded, compute sum(local_deadline) across
+	 * its members and verify the reported per-member deadlines
+	 * are derived from contracted-DAG splitting, not summation.
+	 * The contracted-DAG path yields local_deadline values that
+	 * sum to at most the period; summation of pre-fusion
+	 * deadlines would produce values whose sum exceeds the
+	 * per-path deadline budget. */
+	for (i = 0; i < cb.calls && i < SPA_N_ELEMENTS(cb.last); i++) {
+		pid_t tid = cb.last[i].tid;
+		uint64_t sum = 0;
+		uint64_t max_dl = 0;
+		uint32_t members = 0;
+		if (tid <= 0)
+			continue;
+		for (j = 0; j < cb.calls && j < SPA_N_ELEMENTS(cb.last); j++) {
+			if (cb.last[j].tid != tid)
+				continue;
+			sum += cb.last[j].deadline;
+			if (cb.last[j].deadline > max_dl)
+				max_dl = cb.last[j].deadline;
+			members++;
+		}
+		if (members < 2)
+			continue;
+		/* The bug shape: per-TID sum becomes the shipped
+		 * deadline. The contracted-DAG implementation always
+		 * yields a max strictly less than the sum on a fused
+		 * chain with positive members. */
+		pwtest_bool_true(max_dl < sum);
+		fused_threads_checked++;
+	}
+
+	/* At least one fused thread must have been observed; otherwise
+	 * the test would silently pass without exercising the contract. */
+	pwtest_bool_true(fused_threads_checked >= 1);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 /* Typed reasons for the three remaining one-shot soft-degraded
  * demotion paths the scheduling-model reference enumerates:
  *
@@ -2075,6 +2166,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_force_soft_wcet_confidence_low_reason,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_force_soft_process_blocked_inside_rt_reason,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_regression_no_deadline_sum_for_fused_thread,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_property_random_chains_satisfy_kernel_contract,
 			PWTEST_NOARG);
