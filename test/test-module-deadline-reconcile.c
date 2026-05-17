@@ -1805,6 +1805,49 @@ PWTEST(reconcile_force_soft_process_blocked_inside_rt_reason)
 	return PWTEST_PASS;
 }
 
+/* Blocking-observation hook: simulates the runtime detecting a
+ * voluntary context switch inside process() on a tid that the
+ * static blocking-closure predicate had accepted as nonblocking.
+ * A non-zero growth count demotes the schedule to SOFT_DEGRADED
+ * with the typed process_blocked_inside_rt reason; a zero count
+ * is a no-op so the hook can fire unconditionally without first
+ * filtering. */
+PWTEST(reconcile_report_blocking_observation_demotes_on_nonzero_switch_growth)
+{
+	struct topo5 t;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_topo_t rt;
+	struct reconcile_feasibility feas;
+
+	pwtest_ptr_notnull(s);
+	topo5_init(&t);
+	rt = make_topo(&t, 5, 4, 1);
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_HARD);
+
+	/* Zero switches: no-op, mode stays HARD. */
+	pwtest_int_eq(reconcile_state_report_blocking_observation(s,
+				1234, 0), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_HARD);
+
+	/* Non-zero switches: demote to SOFT_DEGRADED. */
+	pwtest_int_eq(reconcile_state_report_blocking_observation(s,
+				1234, 1), 0);
+	reconcile_state_feasibility(s, &feas);
+	pwtest_int_eq((int)feas.mode, (int)RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(feas.reason, "process_blocked_inside_rt");
+
+	/* NULL state returns -EINVAL. */
+	pwtest_int_eq(reconcile_state_report_blocking_observation(NULL,
+				1234, 1), -EINVAL);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 /* Hard-mode cumulative deadlines are monotonic along every
  * contracted edge: for every input edge u -> v, the cumulative
  * deadline stamped on u must be <= the cumulative deadline
@@ -2166,6 +2209,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_force_soft_wcet_confidence_low_reason,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_force_soft_process_blocked_inside_rt_reason,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_report_blocking_observation_demotes_on_nonzero_switch_growth,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_regression_no_deadline_sum_for_fused_thread,
 			PWTEST_NOARG);

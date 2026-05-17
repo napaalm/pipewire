@@ -275,6 +275,35 @@ void reconcile_state_force_soft(reconcile_state_t *state, const char *reason);
 #define RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT \
 		"process_blocked_inside_rt"
 
+/*
+ * Runtime-blocking observation hook.
+ *
+ * The blocking-closure validator (fusion_validator_blocking_closure_accept)
+ * accepts a candidate group only if every member declares
+ * FUSION_CAP_NONBLOCKING_PROCESS. The check is static and a member
+ * may declare itself non-blocking yet, in production, suspend
+ * inside process() (a sleep, a futex wait, a blocking syscall, an
+ * unbounded lock acquisition). The macro-node is then a self-
+ * suspending task and the EDF feasibility proof does not apply
+ * (Chen et al. 2019 §III).
+ *
+ * The runtime detects this by sampling /proc/<tid>/status's
+ * voluntary_ctxt_switches before and after each process()
+ * invocation: a non-zero growth between the two reads means the
+ * thread voluntarily yielded inside the activation window.
+ *
+ * reconcile_state_report_blocking_observation is the integration
+ * point: the runtime hook calls it with the observed growth count.
+ * When growth > 0 the state is demoted to SOFT_DEGRADED with
+ * RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT so the snapshot
+ * surfaces the violation; growth == 0 is a no-op so the hook can
+ * call unconditionally without filtering.
+ *
+ * Returns 0 on success, -EINVAL on NULL state.
+ */
+int reconcile_state_report_blocking_observation(reconcile_state_t *state,
+		pid_t tid, uint32_t voluntary_switches);
+
 #ifdef __cplusplus
 }
 #endif

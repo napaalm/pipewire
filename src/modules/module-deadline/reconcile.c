@@ -132,6 +132,22 @@ void reconcile_state_force_soft(reconcile_state_t *state, const char *reason)
 				"%s", reason);
 }
 
+int reconcile_state_report_blocking_observation(reconcile_state_t *state,
+		pid_t tid, uint32_t voluntary_switches)
+{
+	if (state == NULL)
+		return -EINVAL;
+	if (voluntary_switches == 0)
+		return 0;
+	pw_log_warn("reconcile: tid=%d voluntary_ctxt_switches += %u "
+			"inside process() -- thread suspended in a "
+			"declared-nonblocking job; demoting to soft-degraded",
+			(int)tid, voluntary_switches);
+	reconcile_state_force_soft(state,
+			RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT);
+	return 0;
+}
+
 void reconcile_drop(reconcile_state_t *state)
 {
 	if (!state)
