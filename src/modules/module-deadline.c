@@ -536,6 +536,20 @@ struct node {
 	uint32_t last_fusion_group_leader;
 	bool     last_fusion_group_seen;
 
+	/* Driver topology generation last observed by this
+	 * follower. Bumps whenever the snapshot fingerprint changes
+	 * (added/removed nodes or edges, period change). MBPTA's
+	 * sample-distribution can shift with topology even when the
+	 * follower's own fusion-leader stays put -- a new parallel
+	 * path can change cache pressure, a removed downstream sink
+	 * can change back-pressure. Invalidate on the transition
+	 * with MBPTA_INVALIDATED_TOPOLOGY_GENERATION so a stale fit
+	 * doesn't carry into the new graph. _seen=false on first
+	 * exposure -- the initial generation is recorded but not
+	 * treated as a change. */
+	uint64_t last_topo_generation;
+	bool     last_topo_generation_seen;
+
 	/* Per-driver async state. Only valid when is_driver=true. */
 	/* SPSC sample ring: producer is this driver's data-loop thread
 	 * (inside the complete/incomplete RT hook), consumer is the
@@ -2904,12 +2918,27 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 		return;
 	}
 
-	for (i = 0; i < t->n_nodes; i++) {
-		struct node *n = find_node_by_id(impl, t->nodes[i].id);
+	{
+		uint64_t this_gen = SPA_ATOMIC_LOAD(t->generation);
+		for (i = 0; i < t->n_nodes; i++) {
+			struct node *n = find_node_by_id(impl,
+					t->nodes[i].id);
 
-		followers[i].id = t->nodes[i].id;
-		followers[i].tid = t->nodes[i].tid;
-		followers[i].wcet = n ? n->wcet : 0;
+			followers[i].id = t->nodes[i].id;
+			followers[i].tid = t->nodes[i].tid;
+			followers[i].wcet = n ? n->wcet : 0;
+
+			if (n == NULL)
+				continue;
+			if (n->last_topo_generation_seen &&
+			    n->last_topo_generation != this_gen &&
+			    n->mbpta != NULL) {
+				mbpta_invalidate_with_reason(n->mbpta,
+					MBPTA_INVALIDATED_TOPOLOGY_GENERATION);
+			}
+			n->last_topo_generation = this_gen;
+			n->last_topo_generation_seen = true;
+		}
 	}
 	for (i = 0; i < t->n_edges; i++) {
 		edges[i].src = t->edges[i].src;
