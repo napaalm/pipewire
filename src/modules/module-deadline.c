@@ -1849,7 +1849,27 @@ static void apply_sample(struct impl *impl, struct node *n,
 		}
 		if (impl->conformal_trace_fp != NULL) {
 			struct timespec ts;
+			char alpha_buf[32];
+			int an;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
+			/* JSON requires '.' as the decimal separator
+			 * (RFC 8259 §6). snprintf honours LC_NUMERIC,
+			 * so a daemon launched under e.g. it_IT would
+			 * otherwise emit "1,5e-05" and break every
+			 * downstream parser. Format the alpha_eff
+			 * through a private buffer and rewrite any
+			 * comma into a dot before emission -- the same
+			 * trick the JSON-snapshot path uses. */
+			an = snprintf(alpha_buf, sizeof(alpha_buf), "%g",
+					rt_conformal_alpha_eff(n->conformal));
+			if (an < 0 || (size_t)an >= sizeof(alpha_buf)) {
+				alpha_buf[0] = '0';
+				alpha_buf[1] = '\0';
+			} else {
+				for (char *p = alpha_buf; *p != '\0'; p++)
+					if (*p == ',')
+						*p = '.';
+			}
 			fprintf(impl->conformal_trace_fp,
 				"{\"timestamp_ns\":%llu,"
 				"\"entity_id\":%u,"
@@ -1858,12 +1878,12 @@ static void apply_sample(struct impl *impl, struct node *n,
 				"\"budget_ns\":%llu,"
 				"\"budget_kind\":\"%s\","
 				"\"conformal_state\":\"%s\","
-				"\"conformal_alpha_eff\":%g,"
+				"\"conformal_alpha_eff\":%s,"
 				"\"conformal_samples_used\":%llu}\n",
 				(unsigned long long)
 					((uint64_t)ts.tv_sec * 1000000000ULL +
 					 (uint64_t)ts.tv_nsec),
-				n->node ? n->node->info.id : (uint32_t)-1,
+				n->node_id,
 				(unsigned long long)period,
 				(unsigned long long)(sample_ref > 0.0 ?
 					(uint64_t)sample_ref : 0),
@@ -1871,7 +1891,7 @@ static void apply_sample(struct impl *impl, struct node *n,
 				rt_diag_budget_kind_name(n->budget_kind),
 				rt_conformal_state_name(
 					rt_conformal_state(n->conformal)),
-				rt_conformal_alpha_eff(n->conformal),
+				alpha_buf,
 				(unsigned long long)
 					rt_conformal_samples_used(n->conformal));
 		}
