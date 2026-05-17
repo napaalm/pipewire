@@ -1451,9 +1451,10 @@ PWTEST(reconcile_property_random_chains_satisfy_kernel_contract)
 	return PWTEST_PASS;
 }
 
-/* Property-based test extended to the fork, join, and diamond
- * graph families. For each family we generate 60 random
- * instances and assert the hard-mode kernel contract
+/* Property-based test extended to the fork, join, diamond,
+ * nested-diamond, and random-layered-DAG graph families. For
+ * each family we generate 60 random instances and assert the
+ * hard-mode kernel contract
  * `0 < runtime <= local_deadline <= period`. The underlying
  * mechanism is identical to the chain property test; only the
  * edge layout changes between families. WCETs stay bounded so
@@ -1464,16 +1465,17 @@ PWTEST(reconcile_property_random_shapes_satisfy_kernel_contract)
 	uint32_t shape, trial;
 	uint32_t total_violations = 0;
 	const uint32_t trials_per_shape = 60;
-	const uint32_t n_shapes = 3; /* fork / join / diamond */
+	const uint32_t n_shapes = 5; /* fork / join / diamond /
+				       * nested-diamond / layered */
 
 	for (shape = 0; shape < n_shapes; shape++) {
 	for (trial = 0; trial < trials_per_shape; trial++) {
 		reconcile_state_t *s = make_state_persistent(0.01);
 		struct cb_ctx cb = { 0 };
 		reconcile_topo_t rt;
-		reconcile_follower_t fol[5];
-		reconcile_edge_t edges[5];
-		uint32_t n_followers = 0, n_edges = 0, i;
+		reconcile_follower_t fol[7];
+		reconcile_edge_t edges[16];
+		uint32_t n_followers = 0, n_edges = 0, i, j;
 		uint64_t period;
 		struct reconcile_feasibility feas;
 
@@ -1502,6 +1504,44 @@ PWTEST(reconcile_property_random_shapes_satisfy_kernel_contract)
 			edges[3] = (reconcile_edge_t){ .src = 12, .dst = 13 };
 			n_edges = 4;
 			break;
+		case 3: /* nested diamond on 7 nodes: outer split at the
+			 * source, inner split on the left arm, inner
+			 * join, outer join. */
+			n_followers = 7;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			edges[2] = (reconcile_edge_t){ .src = 11, .dst = 13 };
+			edges[3] = (reconcile_edge_t){ .src = 11, .dst = 14 };
+			edges[4] = (reconcile_edge_t){ .src = 13, .dst = 15 };
+			edges[5] = (reconcile_edge_t){ .src = 14, .dst = 15 };
+			edges[6] = (reconcile_edge_t){ .src = 15, .dst = 16 };
+			edges[7] = (reconcile_edge_t){ .src = 12, .dst = 16 };
+			n_edges = 8;
+			break;
+		case 4: { /* random layered DAG: 7 nodes, edges only
+			   * forward by id, each forward pair included
+			   * with 50 % probability; topologically sorted
+			   * by construction (id ordering = layer order),
+			   * which keeps the contracted-DAG analysis
+			   * happy without needing a separate cycle
+			   * detector pass. */
+			n_followers = 7;
+			n_edges = 0;
+			for (i = 0; i < n_followers; i++) {
+				for (j = i + 1; j < n_followers; j++) {
+					seed = seed * 1103515245u + 12345u;
+					if ((seed & 0x1) == 0)
+						continue;
+					if (n_edges >= 16)
+						continue;
+					edges[n_edges++] =
+						(reconcile_edge_t){
+							.src = 10 + i,
+							.dst = 10 + j };
+				}
+			}
+			break;
+		}
 		}
 
 		for (i = 0; i < n_followers; i++) {
