@@ -159,3 +159,38 @@ rather than just throughput. The Cucinotta et al. 2024 P-EDF
 formulation provides the algebra; the in-process implementation
 would need a new placement policy plus diagnostics for class
 membership.
+
+## MBPTA Frechet / Weibull branch
+
+The MBPTA pipeline in `src/modules/module-deadline/mbpta.c`
+implements the Gumbel sub-family of GEV: the Hosking-PWM ET
+test on the shape parameter k routes a rejection to
+`NON_GUMBEL`, at which point the node falls back to empirical
+or fallback budgets. Extending to the heavy-tailed Frechet
+(k > 0) and bounded Weibull (k < 0) branches of GEV would let
+those rejections still produce a probabilistic budget, with the
+appropriate shape-aware tail extrapolation
+`pWCET(eps) = mu + sigma / k * ((-log(1 - eps))^(-k) - 1)`
+in place of the Gumbel inverse CDF. Cucu-Grosjean 2012 §II-A
+sketches the full GEV machinery; an implementation needs
+shape-aware fit, a confidence interval on k, and a separate
+goodness-of-fit test per branch. The current "Gumbel-or-bust"
+behaviour is sound but pessimistic for workloads whose
+extremes follow either of the other two sub-families.
+
+## Tree-based compositional pWCET aggregation
+
+The current MBPTA fit treats each contracted node as a single
+MBPTA subject: a sample is the per-cycle execution time of one
+data-loop thread, and the pWCET is the distribution's
+extrapolated quantile. Cucu-Grosjean 2012 §IV describes a
+tree-based compositional aggregation that lets a system-level
+pWCET be derived from per-segment pWCETs (echoing the
+Bernat/Burns analyses), trading some per-node pessimism for
+graph-level tightness. Implementing it in this code base would
+require per-segment sample collection (today every contracted
+node emits one sample per cycle), a composition operator on
+two Gumbel distributions that respects the dependency
+structure of the contracted DAG, and a worked example
+demonstrating that the composed pWCET is tighter than the
+per-node sum under realistic workloads.
