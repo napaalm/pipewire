@@ -510,6 +510,32 @@ struct rt_diag_param_node {
 	 * Zero when the follower has not yet been touched by a
 	 * reconcile pass. */
 	uint64_t mbpta_estimator_key;
+
+	/* Macro-node release-barrier count: the number of distinct
+	 * in-period predecessors the contracted scheduling-DAG node
+	 * for this follower must observe completing before its data
+	 * loop may begin its job. Sources of the contracted DAG
+	 * report 0; a chain mid-section that has been fused with its
+	 * predecessor also reports 0 because the contracting collapsed
+	 * the internal edge. The runtime hook (when wired) arms the
+	 * per-cycle pending counter from this value at cycle start
+	 * and decrements it on each external-predecessor completion;
+	 * today's snapshot exposes it for diagnostics so an operator
+	 * can confirm the contracting layer's predecessor accounting. */
+	uint32_t required_external_inputs;
+
+	/* Runtime-detected voluntary context switches inside
+	 * process(). Surfaced from the blocking-observation hook
+	 * (reconcile_state_report_blocking_observation): a non-zero
+	 * value means the follower's thread voluntarily yielded
+	 * inside an activation window, which violates the
+	 * blocking-closure predicate's static accept. Zero is the
+	 * expected value on a healthy schedule. The runtime samples
+	 * /proc/<tid>/status's voluntary_ctxt_switches around the
+	 * process() call; growth lands in this counter and triggers
+	 * a soft-degraded demotion via the typed
+	 * RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT reason. */
+	uint64_t voluntary_ctxt_switches_in_process;
 };
 
 struct rt_diag_params_snapshot {

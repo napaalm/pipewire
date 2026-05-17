@@ -143,6 +143,24 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 bool reconcile_state_has_persistent_dag(const reconcile_state_t *state);
 
 /*
+ * Query the count of in-period predecessors (incoming edges) of the
+ * scheduling-DAG node with the given follower id, as a uint32_t.
+ * This is the `required_external_inputs` value the per-cycle macro-
+ * node release barrier needs: how many predecessors must complete
+ * the current period before the follower's data loop may begin its
+ * job. The result reflects the contracted scheduling DAG (fusion
+ * collapsed where applicable), so a follower whose chain has been
+ * fused with its predecessor returns 0 (the predecessor is now
+ * internal and disappears from the contracted edge set).
+ *
+ * Returns 0 on NULL state, an unset persistent DAG, or an unknown
+ * follower id; a return of 0 with state != NULL is a legitimate
+ * "no in-period predecessors" answer for a graph source.
+ */
+uint32_t reconcile_state_node_required_external_inputs(
+		const reconcile_state_t *state, uint32_t follower_id);
+
+/*
  * Free everything reconcile_init allocated, plus any persistent
  * DAG state. Safe to call on a NULL pointer. Called by module-
  * deadline.c at driver_removed and module_destroy; no other

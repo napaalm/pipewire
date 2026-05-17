@@ -536,6 +536,25 @@ struct node {
 	uint32_t last_fusion_group_leader;
 	bool     last_fusion_group_seen;
 
+	/* Voluntary-context-switch counter sampled from
+	 * /proc/<tid>/status. The recalc worker reads the counter
+	 * once per reconcile pass; the delta against
+	 * `voluntary_ctxt_switches_last_sample` is the count of
+	 * yields the follower thread issued during the recalc
+	 * interval. A SCHED_DEADLINE thread issues one voluntary
+	 * yield per activation (the deadline wait at cycle end), so
+	 * growth above (activations during the interval + tolerance)
+	 * is the signal that the thread suspended INSIDE process().
+	 * The current cycle's accumulated growth lives in
+	 * `voluntary_ctxt_switches_in_process` for snapshot exposure;
+	 * a non-zero value across a recalc interval triggers
+	 * reconcile_state_report_blocking_observation and the typed
+	 * RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT demotion. */
+	uint64_t voluntary_ctxt_switches_last_sample;
+	uint64_t voluntary_ctxt_switches_last_sample_time_ns;
+	bool     voluntary_ctxt_switches_seen;
+	uint64_t voluntary_ctxt_switches_in_process;
+
 	/* Driver topology generation last observed by this
 	 * follower. Bumps whenever the snapshot fingerprint changes
 	 * (added/removed nodes or edges, period change). MBPTA's
@@ -1062,6 +1081,121 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
  * Singleton TIDs (n_members == 1) take exactly the same code path
  * as multi-member groups -- the original one-node-one-thread case
  * is just the degenerate single-member group. */
+/*
+ * Read voluntary_ctxt_switches for a given pid from /proc/<tid>/status.
+ * Returns 0 on success with *out populated, -errno on failure. The
+ * field name in the file is "voluntary_ctxt_switches:"; the value is
+ * a decimal counter that increments every time the thread voluntarily
+ * yields the CPU (sleeps, futex_wait, blocking I/O, deadline wait at
+ * cycle end on SCHED_DEADLINE).
+ */
+static int read_voluntary_ctxt_switches(pid_t tid, uint64_t *out)
+{
+	char path[64];
+	char line[256];
+	FILE *fp;
+	int r = -ENOENT;
+
+	if (tid <= 0 || out == NULL)
+		return -EINVAL;
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)tid);
+	fp = fopen(path, "r");
+	if (fp == NULL)
+		return -errno;
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		unsigned long long v;
+		if (sscanf(line, "voluntary_ctxt_switches: %llu", &v) == 1) {
+			*out = (uint64_t)v;
+			r = 0;
+			break;
+		}
+	}
+	fclose(fp);
+	return r;
+}
+
+/*
+ * Per-recalc voluntary-context-switch sampling for blocking
+ * detection. Called from the worker after reconcile_apply has
+ * returned. For each follower with a known tid and period, samples
+ * voluntary_ctxt_switches from /proc, computes the delta since the
+ * previous sample, and compares against the expected count (one
+ * deadline wait per activation across the recalc interval). The
+ * EXCESS is the count of yields the thread issued INSIDE process();
+ * a non-zero excess violates the static blocking-closure predicate's
+ * accept and is reported through reconcile_state_report_blocking_observation
+ * for the soft-degraded demotion.
+ *
+ * The cost is O(followers) file opens per recalc; the recalc rate is
+ * far below the cycle rate so the open-per-recalc cost is amortised.
+ * The check runs off the RT path.
+ */
+static void sample_voluntary_ctxt_switches_main(struct impl *impl,
+		struct node *drv)
+{
+	struct pw_impl_node *dnode;
+	struct pw_impl_node *n_iter;
+	struct timespec ts;
+	uint64_t now_ns;
+
+	if (impl == NULL || drv == NULL || drv->node == NULL ||
+	    drv->reconcile == NULL)
+		return;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+		return;
+	now_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+
+	dnode = drv->node;
+	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+		struct node *mn;
+		pid_t tid;
+		uint64_t cur, delta, expected, excess, interval_ns, period_ns;
+
+		if (n_iter == dnode)
+			continue;
+		tid = pw_properties_get_int32(n_iter->properties,
+				PW_KEY_NODE_LOOP_TID, -1);
+		if (tid <= 0)
+			continue;
+		if (read_voluntary_ctxt_switches(tid, &cur) < 0)
+			continue;
+		mn = find_node_by_id(impl, n_iter->info.id);
+		if (mn == NULL)
+			continue;
+		if (!mn->voluntary_ctxt_switches_seen) {
+			mn->voluntary_ctxt_switches_last_sample = cur;
+			mn->voluntary_ctxt_switches_last_sample_time_ns = now_ns;
+			mn->voluntary_ctxt_switches_seen = true;
+			mn->voluntary_ctxt_switches_in_process = 0;
+			continue;
+		}
+		delta = cur - mn->voluntary_ctxt_switches_last_sample;
+		interval_ns = now_ns -
+			mn->voluntary_ctxt_switches_last_sample_time_ns;
+		period_ns = mn->last_period;
+		if (period_ns == 0)
+			period_ns = mn->period;
+		if (period_ns == 0) {
+			/* Without a period we cannot estimate the legitimate
+			 * yield count; record raw delta as observational. */
+			expected = 0;
+		} else {
+			/* One voluntary yield per activation on
+			 * SCHED_DEADLINE (the deadline wait), plus a small
+			 * tolerance for scheduler bookkeeping. */
+			expected = interval_ns / period_ns + 2;
+		}
+		excess = delta > expected ? delta - expected : 0;
+		mn->voluntary_ctxt_switches_in_process = excess;
+		mn->voluntary_ctxt_switches_last_sample = cur;
+		mn->voluntary_ctxt_switches_last_sample_time_ns = now_ns;
+		if (excess > 0 && excess < UINT32_MAX) {
+			(void)reconcile_state_report_blocking_observation(
+					drv->reconcile, tid, (uint32_t)excess);
+		}
+	}
+}
+
 static void apply_sched_groups(struct impl *impl, struct node *drv)
 {
 	uint32_t i;
@@ -1810,6 +1944,7 @@ static void recalc_params_sync(struct node *drv)
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
 	apply_sched_groups(impl, drv);
+	sample_voluntary_ctxt_switches_main(impl, drv);
 
 	free(followers);
 	free(edges);
@@ -2608,6 +2743,21 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
 			pn.budget_sample_count = 0;
 		}
+		/* Release-barrier and blocking-observation surfacing.
+		 * required_external_inputs comes from the contracted DAG
+		 * (the post-contraction predecessor count for this
+		 * follower's macro-node); voluntary_ctxt_switches_in_process
+		 * carries the most recent excess yields per recalc
+		 * interval as computed by the per-recalc
+		 * /proc/<tid>/status sampler. A non-zero excess has
+		 * already triggered a soft-degraded demotion at sample
+		 * time; surfacing it here lets an operator correlate the
+		 * mode transition with the offending follower. */
+		pn.required_external_inputs =
+			reconcile_state_node_required_external_inputs(
+				drv->reconcile, n_iter->info.id);
+		pn.voluntary_ctxt_switches_in_process =
+			(mn != NULL) ? mn->voluntary_ctxt_switches_in_process : 0;
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
 			return r;
@@ -2982,6 +3132,7 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
 	apply_sched_groups(impl, drv);
+	sample_voluntary_ctxt_switches_main(impl, drv);
 
 	free(followers);
 	free(edges);

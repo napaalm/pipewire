@@ -926,7 +926,11 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				fputs(",\"estimator_key\":", out);
 				json_write_escaped(out, keybuf);
 			}
-			fputs("}}", out);
+			fprintf(out,
+				"},\"required_external_inputs\":%u,"
+				"\"voluntary_ctxt_switches_in_process\":%llu}",
+				n->required_external_inputs,
+				(unsigned long long)n->voluntary_ctxt_switches_in_process);
 		}
 	}
 	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is

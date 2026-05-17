@@ -104,6 +104,25 @@ bool reconcile_state_has_persistent_dag(const reconcile_state_t *state)
 	return state != NULL && state->persistent && state->dag != NULL;
 }
 
+uint32_t reconcile_state_node_required_external_inputs(
+		const reconcile_state_t *state, uint32_t follower_id)
+{
+	dag_node_t *dn;
+	dag_edge_t *e;
+	uint32_t n = 0;
+
+	if (state == NULL || state->dag == NULL)
+		return 0;
+	dn = dag_find_node((struct dag *)state->dag, follower_id);
+	if (dn == NULL)
+		return 0;
+	spa_list_for_each(e, &dn->incoming, dst_link) {
+		(void)e;
+		n++;
+	}
+	return n;
+}
+
 void reconcile_state_feasibility(const reconcile_state_t *state,
 		struct reconcile_feasibility *out)
 {
