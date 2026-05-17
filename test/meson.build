@@ -109,9 +109,10 @@ test('test-module-deadline-sched-groups',
 test('test-module-deadline-diag',
     executable('test-module-deadline-diag',
                'test-module-deadline-diag.c',
+               '../src/modules/module-deadline/conformal.c',
                '../src/modules/module-deadline/diag.c',
                include_directories: pwtest_inc,
-               dependencies: [ spa_dep, pipewire_dep ],
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
                link_with: pwtest_lib)
 )
 

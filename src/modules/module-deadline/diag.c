@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "conformal.h"
 #include "diag.h"
 
 /* JSON requires '.' as the decimal separator (RFC 8259 §6); the
@@ -929,9 +930,53 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			}
 			fprintf(out,
 				"},\"required_external_inputs\":%u,"
-				"\"voluntary_ctxt_switches_in_process\":%llu}",
+				"\"voluntary_ctxt_switches_in_process\":%llu,"
+				"\"conformal\":{\"state\":\"%s\","
+				"\"samples_seen\":%llu,\"samples_used\":%llu,"
+				"\"overruns_seen\":%llu,"
+				"\"recent_overruns\":%llu,"
+				"\"max_overrun_burst\":%llu,"
+				"\"current_overrun_burst\":%llu,"
+				"\"alpha_target\":",
 				n->required_external_inputs,
-				(unsigned long long)n->voluntary_ctxt_switches_in_process);
+				(unsigned long long)n->voluntary_ctxt_switches_in_process,
+				rt_conformal_state_name(
+					(enum rt_conformal_state)n->conformal_state),
+				(unsigned long long)n->conformal_samples_seen,
+				(unsigned long long)n->conformal_samples_used,
+				(unsigned long long)n->conformal_overruns_seen,
+				(unsigned long long)n->conformal_recent_overruns,
+				(unsigned long long)n->conformal_max_overrun_burst,
+				(unsigned long long)n->conformal_current_overrun_burst);
+			diag_fprintf_double(out, 6, n->conformal_alpha_target);
+			fputs(",\"alpha_eff\":", out);
+			diag_fprintf_double(out, 6, n->conformal_alpha_eff);
+			fprintf(out, ",\"window\":%u,\"ewma_location_ns\":",
+				n->conformal_window);
+			diag_fprintf_double(out, 0, n->conformal_ewma_location_ns);
+			fputs(",\"ewma_scale_ns\":", out);
+			diag_fprintf_double(out, 0, n->conformal_ewma_scale_ns);
+			fputs(",\"score_quantile\":", out);
+			diag_fprintf_double(out, 6, n->conformal_score_quantile);
+			fprintf(out, ",\"guard_ns\":%llu,\"guard_percent\":",
+				(unsigned long long)n->conformal_guard_ns);
+			diag_fprintf_double(out, 6, n->conformal_guard_percent);
+			fprintf(out,
+				",\"runtime_floor_ns\":%llu,"
+				"\"last_runtime_ns\":%llu,"
+				"\"last_prediction_ns\":",
+				(unsigned long long)n->conformal_runtime_floor_ns,
+				(unsigned long long)n->conformal_last_runtime_ns);
+			diag_fprintf_double(out, 0, n->conformal_last_prediction_ns);
+			fputs(",\"last_score\":", out);
+			diag_fprintf_double(out, 6, n->conformal_last_score);
+			fprintf(out,
+				",\"last_budget_ns\":%llu,"
+				"\"last_invalidation_reason\":\"%s\"}}",
+				(unsigned long long)n->conformal_last_budget_ns,
+				rt_conformal_invalidation_reason_name(
+					(enum rt_conformal_invalidation_reason)
+					n->conformal_last_invalidation_reason));
 		}
 	}
 	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is

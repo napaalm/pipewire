@@ -546,6 +546,38 @@ struct rt_diag_param_node {
 	 * a soft-degraded demotion via the typed
 	 * RECONCILE_SOFT_REASON_PROCESS_BLOCKED_INSIDE_RT reason. */
 	uint64_t voluntary_ctxt_switches_in_process;
+
+	/*
+	 * Adaptive-conformal estimator diagnostics. The estimator's
+	 * state surfaces as the stable lowercase token in
+	 * rt_conformal_state_name(); samples_seen / samples_used /
+	 * the overrun counters / alpha_eff / mu_ns / scale_ns /
+	 * score_quantile mirror the per-instance state. Zero values
+	 * are the expected steady-state when the conformal estimator
+	 * has not yet been instantiated for this follower (e.g. a
+	 * driver node that does not run process()).
+	 */
+	uint8_t  conformal_state; /* enum rt_conformal_state */
+	uint64_t conformal_samples_seen;
+	uint64_t conformal_samples_used;
+	uint64_t conformal_overruns_seen;
+	uint64_t conformal_recent_overruns;
+	uint64_t conformal_max_overrun_burst;
+	uint64_t conformal_current_overrun_burst;
+	double   conformal_alpha_target;
+	double   conformal_alpha_eff;
+	uint32_t conformal_window;
+	double   conformal_ewma_location_ns;
+	double   conformal_ewma_scale_ns;
+	double   conformal_score_quantile;
+	uint64_t conformal_guard_ns;
+	double   conformal_guard_percent;
+	uint64_t conformal_runtime_floor_ns;
+	uint64_t conformal_last_runtime_ns;
+	double   conformal_last_prediction_ns;
+	double   conformal_last_score;
+	uint64_t conformal_last_budget_ns;
+	uint8_t  conformal_last_invalidation_reason;
 };
 
 struct rt_diag_params_snapshot {

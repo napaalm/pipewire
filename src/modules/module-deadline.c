@@ -3044,6 +3044,60 @@ static int populate_params_snapshot(struct impl *impl,
 				drv->reconcile, n_iter->info.id);
 		pn.voluntary_ctxt_switches_in_process =
 			(mn != NULL) ? mn->voluntary_ctxt_switches_in_process : 0;
+
+		/*
+		 * Adaptive-conformal diagnostics. Pull the state every
+		 * snapshot pass so the JSON reader sees the current
+		 * EWMA pair, the current alpha_eff, and the overrun
+		 * counters that the estimator updated since the last
+		 * snapshot. When the conformal estimator has not yet
+		 * been instantiated for this follower (e.g. a driver
+		 * sentinel) the fields stay at zero -- the JSON token
+		 * still reports "insufficient_data" so a parser sees a
+		 * stable shape regardless.
+		 */
+		if (mn != NULL && mn->conformal != NULL) {
+			rt_conformal_t *c = mn->conformal;
+			pn.conformal_state = (uint8_t)rt_conformal_state(c);
+			pn.conformal_samples_seen =
+				rt_conformal_samples_seen(c);
+			pn.conformal_samples_used =
+				rt_conformal_samples_used(c);
+			pn.conformal_overruns_seen =
+				rt_conformal_overruns_seen(c);
+			pn.conformal_recent_overruns =
+				rt_conformal_recent_overruns(c);
+			pn.conformal_max_overrun_burst =
+				rt_conformal_max_overrun_burst(c);
+			pn.conformal_current_overrun_burst =
+				rt_conformal_current_overrun_burst(c);
+			pn.conformal_alpha_target =
+				impl->conformal_cfg.alpha_target;
+			pn.conformal_alpha_eff = rt_conformal_alpha_eff(c);
+			pn.conformal_window = impl->conformal_cfg.window;
+			pn.conformal_ewma_location_ns =
+				rt_conformal_mu_ns(c);
+			pn.conformal_ewma_scale_ns =
+				rt_conformal_scale_ns(c);
+			pn.conformal_score_quantile =
+				rt_conformal_score_quantile(c);
+			pn.conformal_guard_ns =
+				rt_conformal_guard_ns_effective(c);
+			pn.conformal_guard_percent =
+				impl->conformal_cfg.guard_percent;
+			pn.conformal_runtime_floor_ns =
+				impl->conformal_cfg.runtime_floor_ns;
+			pn.conformal_last_runtime_ns =
+				rt_conformal_last_runtime_ns(c);
+			pn.conformal_last_prediction_ns =
+				rt_conformal_last_prediction_ns(c);
+			pn.conformal_last_score = rt_conformal_last_score(c);
+			pn.conformal_last_budget_ns =
+				rt_conformal_last_budget_ns(c);
+			pn.conformal_last_invalidation_reason = (uint8_t)
+				rt_conformal_last_invalidation_reason(c);
+		}
+
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
 			return r;
