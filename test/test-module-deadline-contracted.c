@@ -833,6 +833,112 @@ PWTEST(contracted_bridge_missing_node_preserves_fields)
 	return PWTEST_PASS;
 }
 
+PWTEST(contracted_edge_meta_attach_records_originals)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *a = contracted_dag_add_node(cg);
+	contracted_node_t *b = contracted_dag_add_node(cg);
+	contracted_edge_t *e;
+
+	pwtest_int_eq(contracted_dag_add_edge(cg, a, b), 0);
+	e = contracted_dag_find_edge(cg, a, b);
+	pwtest_ptr_notnull(e);
+	pwtest_int_eq((int)e->n_originals, 0);
+	pwtest_int_eq((int)e->flags_union, 0);
+
+	pwtest_int_eq(contracted_edge_add_meta(e, 11, 3, 4,
+			CONTRACTED_EDGE_ASYNC), 0);
+	pwtest_int_eq(contracted_edge_add_meta(e, 12, 5, 6,
+			CONTRACTED_EDGE_FEEDBACK), 0);
+	pwtest_int_eq((int)e->n_originals, 2);
+	pwtest_int_eq((int)e->flags_union,
+			CONTRACTED_EDGE_ASYNC | CONTRACTED_EDGE_FEEDBACK);
+
+	struct contracted_edge_meta *em;
+	uint32_t seen_ids = 0;
+	spa_list_for_each(em, &e->originals, link) {
+		seen_ids |= 1u << em->edge_id;
+	}
+	pwtest_int_eq((int)seen_ids, (int)((1u << 11) | (1u << 12)));
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_edge_meta_builder_preserves_per_original)
+{
+	/* Two original edges A -> B with distinct edge ids, ports, and
+	 * flags. After contraction they collapse to one contracted edge
+	 * (dedup) but the meta list still carries both originals so the
+	 * diagnostic dumps can list them. */
+	const struct contracted_member_input members[] = {
+		{ .id = 1, .tid = 100, .wcet_ns = 50 },
+		{ .id = 2, .tid = 200, .wcet_ns = 50 },
+	};
+	const uint32_t group_id[] = { 0, 0 };
+	const struct contracted_edge_input edges[] = {
+		{ .src_id = 1, .dst_id = 2, .edge_id = 7,
+			.src_port = 1, .dst_port = 2,
+			.flags = CONTRACTED_EDGE_ASYNC },
+		{ .src_id = 1, .dst_id = 2, .edge_id = 8,
+			.src_port = 3, .dst_port = 4, .flags = 0 },
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(1000, 1000, members, group_id, 2,
+			edges, 2, &cg), 0);
+	pwtest_int_eq((int)cg->n_edges, 1);
+
+	contracted_edge_t *e;
+	uint32_t n_seen_edges = 0;
+	spa_list_for_each(e, &cg->edges, link) {
+		pwtest_int_eq((int)e->n_originals, 2);
+		pwtest_int_eq((int)e->flags_union, CONTRACTED_EDGE_ASYNC);
+		n_seen_edges++;
+	}
+	pwtest_int_eq((int)n_seen_edges, 1);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_edge_meta_builder_skips_zero_input)
+{
+	/* When all meta fields are zero, the builder treats the edge as
+	 * "no diagnostics requested" and does NOT attach an empty meta
+	 * entry. This keeps the existing builder callers (tests, the
+	 * older reconcile path) free of accidental empty meta entries. */
+	const struct contracted_member_input members[] = {
+		{ .id = 1, .tid = 100, .wcet_ns = 50 },
+		{ .id = 2, .tid = 200, .wcet_ns = 50 },
+	};
+	const uint32_t group_id[] = { 0, 0 };
+	const struct contracted_edge_input edges[] = {
+		{ .src_id = 1, .dst_id = 2 }, /* all meta fields zero */
+	};
+	contracted_dag_t *cg = NULL;
+
+	pwtest_int_eq(contracted_dag_build(1000, 1000, members, group_id, 2,
+			edges, 1, &cg), 0);
+	pwtest_int_eq((int)cg->n_edges, 1);
+
+	contracted_edge_t *e;
+	spa_list_for_each(e, &cg->edges, link) {
+		pwtest_int_eq((int)e->n_originals, 0);
+		pwtest_int_eq((int)e->flags_union, 0);
+	}
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_edge_add_meta_null_safe)
+{
+	pwtest_int_eq(contracted_edge_add_meta(NULL, 1, 2, 3, 4), -EINVAL);
+	pwtest_ptr_null(contracted_dag_find_edge(NULL, NULL, NULL));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -865,6 +971,10 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_bridge_round_trip, PWTEST_NOARG);
 	pwtest_add(contracted_bridge_null_safe, PWTEST_NOARG);
 	pwtest_add(contracted_bridge_missing_node_preserves_fields, PWTEST_NOARG);
+	pwtest_add(contracted_edge_meta_attach_records_originals, PWTEST_NOARG);
+	pwtest_add(contracted_edge_meta_builder_preserves_per_original, PWTEST_NOARG);
+	pwtest_add(contracted_edge_meta_builder_skips_zero_input, PWTEST_NOARG);
+	pwtest_add(contracted_edge_add_meta_null_safe, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

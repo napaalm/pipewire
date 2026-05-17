@@ -140,6 +140,48 @@ struct contracted_node {
 	bool externally_atomic;
 };
 
+/*
+ * Per-original-edge metadata retained on a contracted edge.
+ *
+ * Edge contraction collapses every original edge with the same
+ * (src_macro, dst_macro) pair into one contracted edge for analysis
+ * (one edge in the deadline-splitter / placer input). The original
+ * edges, however, may carry diagnostic context that the runtime
+ * needs at fault-injection or trace time: which scheduling-DAG edge
+ * the kernel signal traversed, the source / destination port ids on
+ * the original nodes, and any classifier flags (async, feedback,
+ * exported) that distinguish a back-pressure edge from a normal
+ * data edge.
+ *
+ * The list of original edges that collapsed onto a contracted edge
+ * is preserved here so the diagnostic dumps can surface "contracted
+ * edge AB -> C carries N original edges, listed below" without
+ * pretending the dedup never happened. The runtime analysis layer
+ * does not consume this list; it exists for logging and tests.
+ */
+struct contracted_edge_meta {
+	struct spa_list link;       /* link in contracted_edge::originals */
+	uint32_t        edge_id;    /* opaque id assigned by caller; 0 if unknown */
+	uint32_t        src_port;   /* originating port id; 0 if not modelled */
+	uint32_t        dst_port;   /* terminating port id; 0 if not modelled */
+	uint32_t        flags;      /* bitmask of contracted_edge_flag */
+};
+
+/*
+ * Classification flags carried per original edge. Mirror the
+ * scheduling-DAG edge classifier the diag layer already uses
+ * (rt_diag_sched_excluded_reason) so the logging vocabulary stays
+ * consistent. Only the kinds a contracted edge may legitimately
+ * collapse from are enumerated here; edges classified as
+ * cross-driver or unsupported are rejected upstream by the fusion
+ * validator and never reach this layer.
+ */
+enum contracted_edge_flag {
+	CONTRACTED_EDGE_ASYNC    = 1u << 0,
+	CONTRACTED_EDGE_FEEDBACK = 1u << 1,
+	CONTRACTED_EDGE_EXPORTED = 1u << 2,
+};
+
 /* Directed edge in the contracted DAG. */
 struct contracted_edge {
 	struct spa_list link;       /* link in contracted_dag::edges */
@@ -147,6 +189,20 @@ struct contracted_edge {
 	contracted_node_t *dst;
 	struct spa_list src_link;   /* link in src->succs */
 	struct spa_list dst_link;   /* link in dst->preds */
+
+	/* List of contracted_edge_meta describing every original edge
+	 * that collapsed onto this contracted edge. The first call to
+	 * contracted_dag_add_edge for a given (src, dst) pair appends
+	 * no meta (callers may attach explicitly via
+	 * contracted_edge_add_meta or pass meta through the builder);
+	 * subsequent duplicate calls fold their meta entries in.
+	 *
+	 * The list aggregates a logical-OR of all per-original flags
+	 * into `flags_union` so a single is-this-edge-async check
+	 * does not have to walk the list. */
+	struct spa_list originals;
+	uint32_t        n_originals;
+	uint32_t        flags_union;
 };
 
 /* The contracted DAG container. */
@@ -185,8 +241,32 @@ int contracted_node_add_member(contracted_node_t *cn, uint32_t id,
 /* Add a directed edge between two contracted nodes. Duplicate
  * (src, dst) pairs are deduplicated: subsequent adds with the same
  * endpoints are no-ops. Returns 0 on success, -ENOMEM on
- * allocation failure, -EINVAL on a self-loop (src == dst). */
+ * allocation failure, -EINVAL on a self-loop (src == dst).
+ *
+ * No per-original metadata is attached by this entry point; callers
+ * that need to preserve the original-edge identity for diagnostics
+ * should call contracted_edge_add_meta() on the resulting edge or
+ * pass meta through contracted_dag_build(). */
 int contracted_dag_add_edge(contracted_dag_t *cg,
+		contracted_node_t *src, contracted_node_t *dst);
+
+/*
+ * Attach one piece of original-edge metadata to a contracted edge.
+ * Returns 0 on success, -EINVAL on NULL ce, -ENOMEM on allocation
+ * failure. flags is OR'd into ce->flags_union; the meta entry is
+ * appended to ce->originals and ce->n_originals is bumped. The
+ * meta becomes owned by the contracted_edge and is freed by
+ * contracted_dag_destroy.
+ */
+int contracted_edge_add_meta(contracted_edge_t *ce,
+		uint32_t edge_id, uint32_t src_port, uint32_t dst_port,
+		uint32_t flags);
+
+/*
+ * Convenience: look up an existing contracted edge between two
+ * macro-nodes. Returns NULL if no edge exists. O(out-degree of src).
+ */
+contracted_edge_t *contracted_dag_find_edge(contracted_dag_t *cg,
 		contracted_node_t *src, contracted_node_t *dst);
 
 /* Returns true if any directed cycle exists. The analysis layer
@@ -245,6 +325,14 @@ struct contracted_member_input {
 struct contracted_edge_input {
 	uint32_t src_id;
 	uint32_t dst_id;
+	/* Optional diagnostic metadata preserved across contraction.
+	 * Zero-initialised fields are treated as "not specified" by the
+	 * meta layer (edge_id 0 means unknown caller id; ports 0 mean
+	 * unmodelled; flags 0 means a plain in-period edge). */
+	uint32_t edge_id;
+	uint32_t src_port;
+	uint32_t dst_port;
+	uint32_t flags;        /* bitmask of contracted_edge_flag */
 };
 
 int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,

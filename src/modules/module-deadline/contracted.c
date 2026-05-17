@@ -36,6 +36,7 @@ void contracted_dag_destroy(contracted_dag_t *cg)
 	contracted_node_t *cn, *tmp_n;
 	contracted_edge_t *ce, *tmp_e;
 	struct contracted_member *m, *tmp_m;
+	struct contracted_edge_meta *em, *tmp_em;
 
 	if (cg == NULL)
 		return;
@@ -48,6 +49,10 @@ void contracted_dag_destroy(contracted_dag_t *cg)
 		 * themselves are freed next. */
 		spa_list_remove(&ce->src_link);
 		spa_list_remove(&ce->dst_link);
+		spa_list_for_each_safe(em, tmp_em, &ce->originals, link) {
+			spa_list_remove(&em->link);
+			free(em);
+		}
 		free(ce);
 	}
 	spa_list_for_each_safe(cn, tmp_n, &cg->nodes, link) {
@@ -152,11 +157,47 @@ int contracted_dag_add_edge(contracted_dag_t *cg,
 		return -ENOMEM;
 	ce->src = src;
 	ce->dst = dst;
+	spa_list_init(&ce->originals);
 	spa_list_append(&cg->edges, &ce->link);
 	spa_list_append(&src->succs, &ce->src_link);
 	spa_list_append(&dst->preds, &ce->dst_link);
 	cg->n_edges++;
 	return 0;
+}
+
+int contracted_edge_add_meta(contracted_edge_t *ce,
+		uint32_t edge_id, uint32_t src_port, uint32_t dst_port,
+		uint32_t flags)
+{
+	struct contracted_edge_meta *em;
+
+	if (ce == NULL)
+		return -EINVAL;
+	em = calloc(1, sizeof(*em));
+	if (em == NULL)
+		return -ENOMEM;
+	em->edge_id = edge_id;
+	em->src_port = src_port;
+	em->dst_port = dst_port;
+	em->flags = flags;
+	spa_list_append(&ce->originals, &em->link);
+	ce->n_originals++;
+	ce->flags_union |= flags;
+	return 0;
+}
+
+contracted_edge_t *contracted_dag_find_edge(contracted_dag_t *cg,
+		contracted_node_t *src, contracted_node_t *dst)
+{
+	contracted_edge_t *ce;
+
+	if (cg == NULL || src == NULL || dst == NULL)
+		return NULL;
+	spa_list_for_each(ce, &src->succs, src_link) {
+		if (ce->dst == dst)
+			return ce;
+	}
+	return NULL;
 }
 
 /* DFS-based cycle detector. Two colour bits per node, recorded in
@@ -313,10 +354,14 @@ int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
 
 	/* Edge contraction. Each original edge becomes either an
 	 * internal-and-dropped edge or a contracted edge between two
-	 * distinct macro-nodes; add_edge dedupes parallel copies. */
+	 * distinct macro-nodes; add_edge dedupes parallel copies. Per-
+	 * original metadata is preserved on the contracted edge so the
+	 * diagnostic dumps can list every collapsed original. */
 	for (i = 0; i < n_edges; i++) {
 		uint32_t s_idx, d_idx;
 		contracted_node_t *src, *dst;
+		contracted_edge_t *ce;
+		bool has_meta;
 		if ((r = find_member_idx(members, n_members,
 				edges[i].src_id, &s_idx)) < 0)
 			goto fail;
@@ -328,6 +373,22 @@ int contracted_dag_build(uint64_t period_ns, uint64_t deadline_ns,
 		if (src == dst)
 			continue;
 		if ((r = contracted_dag_add_edge(cg, src, dst)) < 0)
+			goto fail;
+		has_meta = edges[i].edge_id != 0 || edges[i].src_port != 0
+				|| edges[i].dst_port != 0 || edges[i].flags != 0;
+		if (!has_meta)
+			continue;
+		ce = contracted_dag_find_edge(cg, src, dst);
+		if (ce == NULL) {
+			/* contracted_dag_add_edge just succeeded so this
+			 * cannot happen, but the defensive guard makes the
+			 * error path explicit. */
+			r = -ENOTRECOVERABLE;
+			goto fail;
+		}
+		if ((r = contracted_edge_add_meta(ce, edges[i].edge_id,
+				edges[i].src_port, edges[i].dst_port,
+				edges[i].flags)) < 0)
 			goto fail;
 	}
 
