@@ -34,6 +34,7 @@ struct cb_ctx {
 		pid_t    tid;
 		uint64_t runtime;
 		uint64_t deadline;
+		uint64_t cumulative_deadline;
 		uint64_t period;
 		uint32_t cpu;
 		uint32_t fusion_leader;
@@ -48,11 +49,11 @@ static void cb_record(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 	struct cb_ctx *c = data;
 	uint32_t slot = c->calls % (uint32_t)SPA_N_ELEMENTS(c->last);
 
-	(void)cumulative_deadline;
 	c->last[slot].id = id;
 	c->last[slot].tid = tid;
 	c->last[slot].runtime = runtime;
 	c->last[slot].deadline = local_deadline;
+	c->last[slot].cumulative_deadline = cumulative_deadline;
 	c->last[slot].period = period;
 	c->last[slot].cpu = cpu;
 	c->last[slot].fusion_leader = fusion_group_leader_id;
@@ -1619,6 +1620,125 @@ PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
 	return PWTEST_PASS;
 }
 
+/* Hard-mode cumulative deadlines are monotonic along every
+ * contracted edge: for every input edge u -> v, the cumulative
+ * deadline stamped on u must be <= the cumulative deadline
+ * stamped on v. This is the path-sum invariant the deadline
+ * splitter promises and the analysis layer's
+ * dag_compute_local_deadlines validates internally; pinning it
+ * at the reconcile_apply boundary catches a future regression
+ * where the splitter publishes a value that violates the
+ * promise before reaching apply_sched_groups.
+ *
+ * Drives 100 random chain / fork / join / diamond topologies
+ * through reconcile_apply, collects the (id, cumulative) pairs
+ * via cb_record, and checks every input edge. Trial set is
+ * LCG-deterministic (seed 0xA7F2D914). */
+PWTEST(reconcile_property_cumulative_monotonic_along_edges)
+{
+	uint32_t seed = 0xA7F2D914u;
+	uint32_t shape, trial;
+	uint32_t total_violations = 0;
+	const uint32_t trials_per_shape = 25;
+	const uint32_t n_shapes = 4;
+
+	for (shape = 0; shape < n_shapes; shape++) {
+	for (trial = 0; trial < trials_per_shape; trial++) {
+		reconcile_state_t *s = make_state_persistent(0.01);
+		struct cb_ctx cb = { 0 };
+		reconcile_topo_t rt;
+		reconcile_follower_t fol[4];
+		reconcile_edge_t edges[5];
+		uint32_t n_followers = 0, n_edges = 0, i, j, k;
+		uint64_t period;
+		struct reconcile_feasibility feas;
+
+		pwtest_ptr_notnull(s);
+		seed = seed * 1103515245u + 12345u;
+		period = 200000u + (uint64_t)(seed % 1800000u);
+
+		switch (shape) {
+		case 0: /* chain */
+			n_followers = 3;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 11, .dst = 12 };
+			n_edges = 2;
+			break;
+		case 1: /* fork */
+			n_followers = 3;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			n_edges = 2;
+			break;
+		case 2: /* join */
+			n_followers = 3;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			edges[1] = (reconcile_edge_t){ .src = 11, .dst = 12 };
+			n_edges = 2;
+			break;
+		case 3: /* diamond */
+			n_followers = 4;
+			edges[0] = (reconcile_edge_t){ .src = 10, .dst = 11 };
+			edges[1] = (reconcile_edge_t){ .src = 10, .dst = 12 };
+			edges[2] = (reconcile_edge_t){ .src = 11, .dst = 13 };
+			edges[3] = (reconcile_edge_t){ .src = 12, .dst = 13 };
+			n_edges = 4;
+			break;
+		}
+
+		for (i = 0; i < n_followers; i++) {
+			seed = seed * 1103515245u + 12345u;
+			fol[i].id  = 10 + i;
+			fol[i].tid = 100 + i;
+			fol[i].wcet = 1000u + (seed %
+				(uint32_t)(period / (n_followers * 6 + 1)));
+		}
+
+		rt.followers = fol;
+		rt.n_followers = n_followers;
+		rt.edges = edges;
+		rt.n_edges = n_edges;
+		rt.period = period;
+		rt.generation = (uint64_t)trial + 1 +
+			(uint64_t)shape * 1000;
+
+		pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+
+		reconcile_state_feasibility(s, &feas);
+		if (feas.mode != RECONCILE_MODE_HARD) {
+			reconcile_fini(s);
+			continue;
+		}
+
+		/* For each input edge, find both endpoints in the
+		 * captured callback table and assert cumulative(u)
+		 * <= cumulative(v). */
+		for (k = 0; k < n_edges; k++) {
+			uint64_t cu = 0, cv = 0;
+			bool got_u = false, got_v = false;
+			for (i = 0; i < cb.calls; i++) {
+				if (cb.last[i].id == edges[k].src) {
+					cu = cb.last[i].cumulative_deadline;
+					got_u = true;
+				}
+				if (cb.last[i].id == edges[k].dst) {
+					cv = cb.last[i].cumulative_deadline;
+					got_v = true;
+				}
+			}
+			if (got_u && got_v && cu > cv)
+				total_violations++;
+		}
+		j = 0; (void)j;
+
+		reconcile_fini(s);
+	}
+	}
+
+	pwtest_int_eq((int)total_violations, 0);
+	return PWTEST_PASS;
+}
+
 /* Soft-mode redistribution is deterministic on a fixed input:
  * the same infeasible topology applied twice (across two
  * independent reconcile_state_t instances) must produce
@@ -1862,6 +1982,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 			PWTEST_NOARG);
 	pwtest_add(reconcile_small_graph_oracle_soundness, PWTEST_NOARG);
 	pwtest_add(reconcile_soft_redistribution_is_deterministic,
+			PWTEST_NOARG);
+	pwtest_add(reconcile_property_cumulative_monotonic_along_edges,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
