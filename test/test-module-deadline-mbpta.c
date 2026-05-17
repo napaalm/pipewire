@@ -565,6 +565,54 @@ PWTEST(mbpta_gumbel_source_recovers_parameters_within_tolerance)
 	return PWTEST_PASS;
 }
 
+PWTEST(mbpta_pwcet_exceeds_observed_max_at_low_eps)
+{
+	/* Operational sanity check from Cucu-Grosjean 2012: when the
+	 * fit converges and the configured eps_node is small (1e-9),
+	 * the extrapolated tail must lie above the largest sample
+	 * actually observed in the window. A failing assertion would
+	 * indicate either the Gumbel inverse-CDF arithmetic is
+	 * truncating the tail or the published pwcet is using the
+	 * empirical max instead of the extrapolated value. */
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e;
+	uint64_t rng = 0xCAFEBABEFACEFEEDULL;
+	uint32_t i;
+	const double mu_true = 100000.0;
+	const double sigma_true = 5000.0;
+	uint64_t observed_max = 0;
+
+	c.sample_window = 2048;
+	c.warmup_discard = 32;
+	c.block_size = 16;
+	c.min_blocks = 32;
+	c.n_delta = 64;
+	c.n_conv = 2;
+	c.eps_node = 1.0e-9;
+	c.alpha_et = 0.0;
+	c.gumbel_r2_threshold = 0.5;
+	e = mbpta_create(&c);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 6 * c.sample_window; i++) {
+		uint64_t x = mbpta_test_gumbel_sample(&rng, mu_true,
+				sigma_true);
+		if (x > observed_max) observed_max = x;
+		mbpta_add_sample(e, x);
+	}
+
+	if (mbpta_state(e) == MBPTA_PWCET_VALID) {
+		uint64_t pwcet = mbpta_pwcet_ns(e);
+		/* At eps_node = 1e-9 the tail should clear the
+		 * observed max by a comfortable margin; assert the
+		 * weaker property that it at least exceeds it. */
+		pwtest_bool_true(pwcet > observed_max);
+	}
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 PWTEST(mbpta_et_pvalue_defaults_to_one)
 {
 	/* Before the first re-evaluation round the ET test has no
@@ -637,6 +685,8 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_runs_pvalue_low_under_clustered_transitions,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_gumbel_source_recovers_parameters_within_tolerance,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_pwcet_exceeds_observed_max_at_low_eps,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_defaults_to_one, PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_rejects_heavy_tailed_input,

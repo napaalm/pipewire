@@ -1579,6 +1579,64 @@ PWTEST(reconcile_invalid_params_demotes_to_soft_degraded)
 	return PWTEST_PASS;
 }
 
+/* Soft-mode redistribution is deterministic on a fixed input:
+ * the same infeasible topology applied twice (across two
+ * independent reconcile_state_t instances) must produce
+ * identical sched_cb tuples. The DAG analysis is closed-form
+ * arithmetic, the worst-fit placer's tie-breaking is by id, and
+ * the soft-degraded path has no PRNG; a non-deterministic
+ * outcome would indicate uninitialised memory or an iteration-
+ * order dependency that future code changes must not introduce. */
+PWTEST(reconcile_soft_redistribution_is_deterministic)
+{
+	reconcile_follower_t fol[] = {
+		{ 10, 100, 80000 },
+		{ 11, 101, 80000 },
+		{ 12, 102, 80000 },
+	};
+	reconcile_edge_t edges[] = { { 10, 11 }, { 11, 12 } };
+	reconcile_topo_t rt = {
+		.followers = fol, .n_followers = 3,
+		.edges = edges, .n_edges = 2,
+		.period = 100000, .generation = 1,
+	};
+	struct cb_ctx cb1 = { 0 }, cb2 = { 0 };
+	reconcile_state_t *s1 = reconcile_init(1, 1.0, NULL, 0.01, true);
+	reconcile_state_t *s2 = reconcile_init(1, 1.0, NULL, 0.01, true);
+	struct reconcile_feasibility f1 = { 0 }, f2 = { 0 };
+	uint32_t i;
+
+	pwtest_ptr_notnull(s1);
+	pwtest_ptr_notnull(s2);
+
+	(void)reconcile_apply(s1, &rt, cb_record, &cb1);
+	(void)reconcile_apply(s2, &rt, cb_record, &cb2);
+
+	reconcile_state_feasibility(s1, &f1);
+	reconcile_state_feasibility(s2, &f2);
+	pwtest_int_eq(f1.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_int_eq(f2.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_str_eq(f1.reason, f2.reason);
+
+	pwtest_int_eq((int)cb1.calls, (int)cb2.calls);
+	for (i = 0; i < cb1.calls; i++) {
+		pwtest_int_eq((int)cb1.last[i].id, (int)cb2.last[i].id);
+		pwtest_int_eq((int)cb1.last[i].tid, (int)cb2.last[i].tid);
+		pwtest_int_eq((int)cb1.last[i].runtime,
+				(int)cb2.last[i].runtime);
+		pwtest_int_eq((int)cb1.last[i].deadline,
+				(int)cb2.last[i].deadline);
+		pwtest_int_eq((int)cb1.last[i].period,
+				(int)cb2.last[i].period);
+		pwtest_int_eq((int)cb1.last[i].cpu,
+				(int)cb2.last[i].cpu);
+	}
+
+	reconcile_fini(s1);
+	reconcile_fini(s2);
+	return PWTEST_PASS;
+}
+
 /* Small-graph oracle: for graphs small enough that an exhaustive
  * enumeration of CPU placements is tractable, verify the
  * soundness property that the production reconcile path -- which
@@ -1763,6 +1821,8 @@ PWTEST_SUITE(module_deadline_reconcile)
 	pwtest_add(reconcile_property_random_shapes_satisfy_kernel_contract,
 			PWTEST_NOARG);
 	pwtest_add(reconcile_small_graph_oracle_soundness, PWTEST_NOARG);
+	pwtest_add(reconcile_soft_redistribution_is_deterministic,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
