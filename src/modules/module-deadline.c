@@ -795,6 +795,7 @@ struct impl {
 static void hist_dump(const char *who, struct node *drv);
 static void node_unregister(struct impl *impl, struct node *n);
 static struct node *find_node_by_id(struct impl *impl, uint32_t id);
+static struct node *find_node_any_by_id(struct impl *impl, uint32_t id);
 
 static void module_destroy(void *data)
 {
@@ -827,6 +828,35 @@ static void module_destroy(void *data)
 		pw_thread_loop_destroy(impl->worker_tloop);
 		impl->worker_tloop = NULL;
 		impl->worker_loop = NULL;
+	}
+
+	/* Drain the main-loop invoke queue before freeing per-node state.
+	 *
+	 * The worker may have queued one or more snapshot_topology_main
+	 * invokes via pw_loop_invoke(block=false) between its last
+	 * recalc and the pw_thread_loop_stop call above. The invokes
+	 * are sitting on the main loop's event queue; they capture the
+	 * struct node * by value (snapshot_arg.drv) and dereference it
+	 * when they fire (drv->node, drv->topo, ...). If we free the
+	 * struct node here and the queued invokes fire later (in the
+	 * next main-loop iteration, after module_destroy returns), the
+	 * stale pointer turns into a use-after-free and the daemon
+	 * SEGVs in snapshot_topology_main at line 2937
+	 * (dnode->target_rate.denom) -- the bug observed during shutdown
+	 * of the live-verification and mbpta-calibration runs.
+	 *
+	 * pw_loop_invoke called from the main loop's own thread (which
+	 * module_destroy always is) calls flush_all_queues() inline
+	 * before running the supplied function, processing every
+	 * already-queued invoke first. A no-op invoke with block=true
+	 * is therefore a synchronous barrier: when it returns, no
+	 * snapshot_topology_main invoke is pending and freeing the
+	 * struct node entries is safe.
+	 *
+	 * The worker is already stopped, so no new invokes can land
+	 * between this barrier and the freeing loop below. */
+	if (impl->main_loop != NULL) {
+		pw_loop_invoke(impl->main_loop, NULL, 0, NULL, 0, true, NULL);
 	}
 
 	/* Dump per-driver timing histograms for the live A/B test, then
@@ -1441,6 +1471,30 @@ static struct node *find_node_by_id(struct impl *impl, uint32_t id)
 		return NULL;
 	n = impl->nodes_by_id[pos];
 	if (n->node_id != id || n->is_driver)
+		return NULL;
+	return n;
+}
+
+/*
+ * Driver-aware lookup: same index walk as find_node_by_id but
+ * accepts both follower and driver entries. Used by code paths
+ * that may hold a driver id (snapshot_topology_main captures the
+ * driver's id by value at queue time; the post-drain lookup needs
+ * to resolve it whether or not it is a driver). Returns NULL on a
+ * missing id or empty index.
+ */
+static struct node *find_node_any_by_id(struct impl *impl, uint32_t id)
+{
+	uint32_t pos;
+	struct node *n;
+
+	if (impl == NULL || impl->nodes_by_id_count == 0)
+		return NULL;
+	pos = nodes_by_id_bsearch(impl, id);
+	if (pos >= impl->nodes_by_id_count)
+		return NULL;
+	n = impl->nodes_by_id[pos];
+	if (n->node_id != id)
 		return NULL;
 	return n;
 }
@@ -2916,8 +2970,34 @@ cleanup:
 /* Main-loop context: walk the driver's follower list and the
  * follower ports/links to capture a self-contained topology snapshot
  * that the worker can consume without further main-loop access. */
+/*
+ * Snapshot invokes are queued asynchronously from the worker via
+ * pw_loop_invoke(block=false). The data block is captured by value
+ * and dereferenced when the main loop drains its queue, which can
+ * be after the targeted driver has been torn down --
+ * context_driver_removed() may have freed the struct node, or the
+ * PipeWire core may have destroyed the underlying pw_impl_node as
+ * part of the daemon shutdown sequence before module_destroy gets
+ * a chance to run.
+ *
+ * Capturing the struct node pointer directly turns the second case
+ * into a use-after-free (SIGSEGV in snapshot_topology_main at the
+ * first dnode->... access). To stay safe across the entire
+ * tear-down window, capture (impl, driver_id) instead and look up
+ * the live struct node from impl->node_list on every invocation.
+ *
+ * `impl` itself is kept alive across all pending invokes by the
+ * synchronous drain barrier at the start of module_destroy
+ * (pw_loop_invoke from the main-loop thread calls flush_all_queues
+ * inline before running the supplied function, so issuing a no-op
+ * synchronous invoke drains every previously-queued snapshot
+ * invoke before impl is freed). The lookup pattern below covers
+ * the same race for context_driver_removed() (driver tear-down
+ * happens before module_destroy in the normal shutdown sequence).
+ */
 struct snapshot_arg {
-	struct node *drv;
+	struct impl *impl;
+	uint32_t     driver_id;
 };
 
 static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
@@ -2926,9 +3006,15 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 				   void *user_data SPA_UNUSED)
 {
 	const struct snapshot_arg *a = data;
-	struct node *drv = a->drv;
-	struct pw_impl_node *dnode = drv->node;
-	struct topo_snap *t = &drv->topo;
+	struct node *drv;
+	struct pw_impl_node *dnode;
+	struct topo_snap *t;
+
+	drv = find_node_any_by_id(a->impl, a->driver_id);
+	if (drv == NULL || drv->node == NULL)
+		return 0;  /* driver gone since the invoke was queued */
+	dnode = drv->node;
+	t = &drv->topo;
 
 	t->ok = false;
 	t->n_nodes = 0;
@@ -3202,7 +3288,10 @@ static void worker_recalc_one(struct impl *impl, struct node *drv)
 	 * one is still pending. The main-loop callback clears the flag
 	 * after writing. */
 	if (SPA_ATOMIC_CAS(drv->topo.pending, 0, 1)) {
-		struct snapshot_arg a = { .drv = drv };
+		struct snapshot_arg a = {
+			.impl = impl,
+			.driver_id = drv->node_id,
+		};
 		pw_loop_invoke(impl->main_loop, snapshot_topology_main, 0,
 			       &a, sizeof(a), false, NULL);
 	}
@@ -3366,7 +3455,10 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 	 * negotiated), in which case snapshot_topology_main sets
 	 * topo.ok=false and the worker will retry next wake. */
 	if (!impl->sync_mode && impl->main_loop != NULL) {
-		struct snapshot_arg a = { .drv = n };
+		struct snapshot_arg a = {
+			.impl = impl,
+			.driver_id = n->node_id,
+		};
 		SPA_ATOMIC_STORE(n->topo.pending, 1);
 		snapshot_topology_main(NULL, false, 0, &a, sizeof(a), NULL);
 	}
