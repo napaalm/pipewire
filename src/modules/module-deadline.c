@@ -2541,6 +2541,8 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_runs_pvalue = mbpta_runs_pvalue(mn->mbpta);
 			pn.mbpta_et_pvalue = mbpta_et_pvalue(mn->mbpta);
 			pn.mbpta_gev_shape_k = mbpta_gev_shape_k(mn->mbpta);
+			pn.mbpta_gumbel_r2 = mbpta_gumbel_r2(mn->mbpta);
+			pn.mbpta_gumbel_rse = mbpta_gumbel_rse(mn->mbpta);
 			pn.mbpta_crps = mbpta_crps(mn->mbpta);
 			pn.mbpta_convergence_streak =
 				mbpta_convergence_streak(mn->mbpta);

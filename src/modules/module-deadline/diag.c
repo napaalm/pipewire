@@ -597,6 +597,10 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 		diag_fprintf_double(out, 6, n->mbpta_et_pvalue);
 		fputs(" mbpta_k=", out);
 		diag_fprintf_double(out, 6, n->mbpta_gev_shape_k);
+		fputs(" mbpta_r2=", out);
+		diag_fprintf_double(out, 6, n->mbpta_gumbel_r2);
+		fputs(" mbpta_rse=", out);
+		diag_fprintf_double(out, 6, n->mbpta_gumbel_rse);
 		fputs(" mbpta_crps=", out);
 		diag_fprintf_double(out, 6, n->mbpta_crps);
 		fprintf(out,
@@ -876,6 +880,10 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			diag_fprintf_double(out, 6, n->mbpta_et_pvalue);
 			fputs(",\"gev_shape_k\":", out);
 			diag_fprintf_double(out, 6, n->mbpta_gev_shape_k);
+			fputs(",\"gumbel_r2\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_gumbel_r2);
+			fputs(",\"gumbel_rse\":", out);
+			diag_fprintf_double(out, 6, n->mbpta_gumbel_rse);
 			fputs(",\"crps\":", out);
 			diag_fprintf_double(out, 6, n->mbpta_crps);
 			fprintf(out,

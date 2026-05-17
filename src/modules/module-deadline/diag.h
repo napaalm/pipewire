@@ -443,6 +443,13 @@ struct rt_diag_param_node {
 	 * falls below the configured alpha_et. */
 	double   mbpta_et_pvalue;
 	double   mbpta_gev_shape_k;
+	/* QQ-plot regression goodness-of-fit: coefficient of
+	 * determination R^2 and residual standard error
+	 * RSE = sqrt(SS_res / (n - 2)). R^2 close to 1 and small
+	 * RSE are evidence the block-maxima series is well-modelled
+	 * by a Gumbel. */
+	double   mbpta_gumbel_r2;
+	double   mbpta_gumbel_rse;
 	double   mbpta_crps;
 	double   mbpta_mu;
 	double   mbpta_sigma;

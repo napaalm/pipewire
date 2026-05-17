@@ -207,6 +207,16 @@ double mbpta_runs_pvalue(const mbpta_t *e);
  * alpha_et. */
 double mbpta_et_pvalue(const mbpta_t *e);
 double mbpta_gev_shape_k(const mbpta_t *e);
+/* Goodness-of-fit diagnostics for the QQ-plot regression:
+ * coefficient of determination R^2 and residual standard error
+ * RSE = sqrt(SS_res / (n - 2)). R^2 close to 1 and RSE small
+ * relative to the fitted scale are evidence the block-maxima
+ * series is well-modelled by a Gumbel. R^2 is the gating
+ * predicate today; RSE rides along as a diagnostic
+ * (Cucu-Grosjean 2012 §II-A names it). Both default to 0.0
+ * before the first fit. */
+double mbpta_gumbel_r2(const mbpta_t *e);
+double mbpta_gumbel_rse(const mbpta_t *e);
 double mbpta_crps(const mbpta_t *e);
 uint32_t mbpta_convergence_streak(const mbpta_t *e);
 uint32_t mbpta_iid_reject_streak(const mbpta_t *e);

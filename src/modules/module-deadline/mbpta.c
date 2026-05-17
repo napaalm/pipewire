@@ -101,6 +101,8 @@ struct mbpta {
 	/* Last Gumbel fit. */
 	double   mu;
 	double   sigma;
+	double   gumbel_r2;
+	double   gumbel_rse;
 	uint64_t pwcet_ns_cached;
 
 	/* Previous block-maxima 1-CDF for CRPS. The series is
@@ -193,6 +195,8 @@ void mbpta_invalidate_with_reason(mbpta_t *e,
 	e->iid_reject_streak = 0;
 	e->mu = 0.0;
 	e->sigma = 0.0;
+	e->gumbel_r2 = 0.0;
+	e->gumbel_rse = 0.0;
 	e->pwcet_ns_cached = 0;
 	free(e->prev_bm);
 	e->prev_bm = NULL;
@@ -430,7 +434,7 @@ static uint32_t build_block_maxima(const mbpta_t *e, double *out, uint32_t cap)
  * squares fit y = mu + sigma * q on (q_i, bm[i]) gives mu =
  * intercept, sigma = slope. */
 static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
-		double *out_sigma, double *out_r2)
+		double *out_sigma, double *out_r2, double *out_rse)
 {
 	double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
 	double sy_mean, ss_res = 0.0, ss_tot = 0.0;
@@ -439,6 +443,7 @@ static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
 	*out_mu = 0.0;
 	*out_sigma = 0.0;
 	*out_r2 = 0.0;
+	*out_rse = 0.0;
 	if (n < 2)
 		return;
 
@@ -457,10 +462,17 @@ static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
 	*out_sigma = ((double)n * sxy - sx * sy) / denom;
 	*out_mu = (sy - *out_sigma * sx) / (double)n;
 
-	/* Coefficient of determination R^2 = 1 - SS_res / SS_tot.
-	 * Gumbel data fits a straight line on the QQ plot; a low
-	 * R^2 is evidence the distribution is not Gumbel and the
-	 * caller routes to NON_GUMBEL. */
+	/* Coefficient of determination R^2 = 1 - SS_res / SS_tot;
+	 * residual standard error RSE = sqrt(SS_res / (n - 2)).
+	 * Gumbel data fits a straight line on the QQ plot; low R^2
+	 * (or large RSE relative to the fitted scale) is evidence
+	 * the distribution is not Gumbel. R^2 is the gating
+	 * predicate today; RSE rides along as a diagnostic so an
+	 * operator can see *how far* the regression is from a clean
+	 * straight line rather than just whether it passed a
+	 * threshold (Cucu-Grosjean 2012 §II-A explicitly names the
+	 * residual standard error as the diagnostic the QQ-plot
+	 * pipeline emits alongside the slope estimate). */
 	sy_mean = sy / (double)n;
 	for (i = 0; i < n; i++) {
 		double p = (double)(i + 1) / (double)(n + 1);
@@ -472,6 +484,8 @@ static void gumbel_fit(double *bm, uint32_t n, double *out_mu,
 		ss_tot += tot * tot;
 	}
 	*out_r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
+	if (n > 2)
+		*out_rse = sqrt(ss_res / (double)(n - 2));
 }
 
 /* Exponential-tail (ET) test on the block-maxima series.
@@ -638,8 +652,10 @@ static void mbpta_step(mbpta_t *e)
 		return;
 	}
 
-	double r2 = 0.0;
-	gumbel_fit(bm, n_blocks, &mu, &sigma, &r2);
+	double r2 = 0.0, rse = 0.0;
+	gumbel_fit(bm, n_blocks, &mu, &sigma, &r2, &rse);
+	e->gumbel_r2 = r2;
+	e->gumbel_rse = rse;
 	if (sigma <= 0.0)
 		gumbel_ok = false;
 	if (r2 < e->cfg.gumbel_r2_threshold)
@@ -742,6 +758,8 @@ double mbpta_runs_z(const mbpta_t *e)    { return e ? e->runs_z : 0.0; }
 double mbpta_runs_pvalue(const mbpta_t *e) { return e ? e->runs_pvalue : 1.0; }
 double mbpta_et_pvalue(const mbpta_t *e) { return e ? e->et_pvalue : 1.0; }
 double mbpta_gev_shape_k(const mbpta_t *e) { return e ? e->gev_shape_k : 0.0; }
+double mbpta_gumbel_r2(const mbpta_t *e)  { return e ? e->gumbel_r2 : 0.0; }
+double mbpta_gumbel_rse(const mbpta_t *e) { return e ? e->gumbel_rse : 0.0; }
 double mbpta_crps(const mbpta_t *e)      { return e ? e->crps : 0.0; }
 uint32_t mbpta_convergence_streak(const mbpta_t *e)
 {
