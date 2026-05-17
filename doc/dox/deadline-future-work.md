@@ -89,8 +89,7 @@ macro-node deadline cannot pin the intermediate-output
 milestone. A future milestone-aware dispatcher would assign per-
 segment internal deadlines and dispatch members via
 earliest-internal-deadline-first within the group, accepting
-the groups today's policy turns away. The plan's `Phase 4`
-discussion sketches the contract; the dispatcher rework is
+the groups today's policy turns away. The dispatcher rework is
 substantial and unlikely to land before the simpler externally-
 atomic policy has been exercised on real workloads.
 

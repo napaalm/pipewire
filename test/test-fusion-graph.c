@@ -382,20 +382,20 @@ PWTEST(fg_dynamic_y_flips_fuse_to_linear_to_fuse)
 	struct pw_fusion_graph_decision out[4];
 	struct pw_fusion_graph *g;
 
-	/* Phase 1: cheap -> FUSE. */
+	/* Step 1: cheap -> FUSE. */
 	g = make_y_shape(1000, 1000, 1000, 1000, 100);
 	pw_fusion_graph_evaluate(g, &p, out);
 	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_FUSE);
 	pw_fusion_graph_free(g);
 
-	/* Phase 2: one heavy arm -> still FUSE (single heavy node sits
+	/* Step 2: one heavy arm -> still FUSE (single heavy node sits
 	 * on the critical path either way; sum stays under budget). */
 	g = make_y_shape(1000, 1000, 50000, 1000, 100);
 	pw_fusion_graph_evaluate(g, &p, out);
 	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_FUSE);
 	pw_fusion_graph_free(g);
 
-	/* Phase 3: BOTH arms heavy -> LINEAR_ONLY (sum doubles, cp
+	/* Step 3: BOTH arms heavy -> LINEAR_ONLY (sum doubles, cp
 	 * barely moves, fusion would double the critical path). */
 	g = make_y_shape(1000, 50000, 50000, 1000, 100);
 	pw_fusion_graph_evaluate(g, &p, out);
@@ -403,7 +403,7 @@ PWTEST(fg_dynamic_y_flips_fuse_to_linear_to_fuse)
 			(int)PW_FUSION_DECISION_LINEAR_ONLY);
 	pw_fusion_graph_free(g);
 
-	/* Phase 4: back to baseline -> FUSE again. */
+	/* Step 4: back to baseline -> FUSE again. */
 	g = make_y_shape(1000, 1000, 1000, 1000, 100);
 	pw_fusion_graph_evaluate(g, &p, out);
 	pwtest_int_eq((int)out[0].decision, (int)PW_FUSION_DECISION_FUSE);

@@ -265,14 +265,14 @@ void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
  * LINEAR_ONLY (chain fallback for single-input / single-output
  * pipelines per Gerasoulis & Yang 1993), and SPLIT (no fusion).
  *
- * For Phase 0 observability, the dump groups followers by the
- * applied decision and records each group's component leader, the
- * applied verdict, the rejection reason for non-FUSE verdicts (today
- * the only reason is "below_threshold" -- the Sarkar inequality did
- * not hold for the component; Phase 3's soundness validator will
- * extend this enum with structural rejection reasons such as
- * non_convex, internal_milestone, blocking_risk, ...), and the list
- * of member node ids in the group.
+ * The dump groups followers by the applied decision and records
+ * each group's component leader, the applied verdict, the
+ * rejection reason for non-FUSE verdicts (today the only reason
+ * is "below_threshold" -- the Sarkar inequality did not hold for
+ * the component; the soundness validator below extends this enum
+ * with structural rejection reasons such as non_convex,
+ * internal_milestone, blocking_risk, ...), and the list of member
+ * node ids in the group.
  */
 enum rt_diag_fusion_verdict {
 	RT_DIAG_FUSION_FUSE        = 0,
@@ -343,11 +343,12 @@ void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s
  *
  * One entry per schedulable follower carrying the kernel-facing
  * SCHED_DEADLINE tuple (runtime, deadline, period, cpu) plus a
- * "cumulative" deadline kept distinct in the API even though, at
- * Phase 0, it equals the local deadline. Phase 1's deadline-semantics
- * refactor populates the two fields independently, at which point
- * the JSON snapshot already carries the distinction without a schema
- * change.
+ * "cumulative" deadline kept distinct in the API. The two
+ * fields are populated independently by the deadline-semantics
+ * refactor that splits cumulative graph milestones from the
+ * local kernel-relative deadlines passed to sched_setattr; the
+ * JSON snapshot already carries the distinction without a
+ * schema change.
  *
  * The `applied` field reflects whether sched_setattr has issued at
  * least once for the follower; an entry with applied=false means the
@@ -547,8 +548,8 @@ void rt_diag_peer_dispatch_render_text(const struct rt_diag_peer_dispatch *s,
  * (mode, feasibility) in one stable structure. The mode and
  * feasibility strings are caller-provided so the rendered text does
  * not pretend to a hard/soft classification that the implementation
- * cannot yet justify; at Phase 0 the caller passes mode="prototype"
- * and feasibility_method="none".
+ * cannot yet justify; when the caller has no admission verdict in
+ * hand it passes mode="prototype" and feasibility_method="none".
  *
  * Any sub-snapshot pointer may be NULL; the corresponding section is
  * still emitted as an empty object so the JSON schema is stable

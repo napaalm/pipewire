@@ -822,7 +822,7 @@ PWTEST(fusion_decide_dynamic_low_to_high_to_low)
 	window_init(&w_b, bb, 64);
 	window_init(&w_t, bt, 64);
 
-	/* Phase 1: cheap (1000 ns per node). FUSE. */
+	/* Step 1: cheap (1000 ns per node). FUSE. */
 	for (i = 0; i < 100; i++) {
 		pw_fusion_window_update(&w_s, 1000);
 		pw_fusion_window_update(&w_a, 1000);
@@ -836,7 +836,7 @@ PWTEST(fusion_decide_dynamic_low_to_high_to_low)
 	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
 			(int)PW_FUSION_DECISION_FUSE);
 
-	/* Phase 2: arm B turns expensive (a convolution reverb is
+	/* Step 2: arm B turns expensive (a convolution reverb is
 	 * plugged in). Sum balloons; cp also grows but less, because
 	 * cp passes through the heavier of {A, B} only.
 	 *     sum_wcet (asymptote) ~ 1000 + 1000 + 50000 + 1000 = 53000
@@ -857,7 +857,7 @@ PWTEST(fusion_decide_dynamic_low_to_high_to_low)
 	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
 			(int)PW_FUSION_DECISION_FUSE);
 
-	/* Phase 3: arm A ALSO turns expensive (a second reverb on
+	/* Step 3: arm A ALSO turns expensive (a second reverb on
 	 * the parallel branch). Now both middles are heavy:
 	 *     sum_wcet (asymptote) ~ 1000 + 50000 + 50000 + 1000 = 102000
 	 *     cp_wcet  (asymptote) ~ 1000 + 50000 + 1000         = 52000
@@ -872,7 +872,7 @@ PWTEST(fusion_decide_dynamic_low_to_high_to_low)
 	pwtest_int_eq((int)pw_fusion_decide(&c, &p),
 			(int)PW_FUSION_DECISION_LINEAR_ONLY);
 
-	/* Phase 4: the reverbs are removed; runtimes drop back to
+	/* Step 4: the reverbs are removed; runtimes drop back to
 	 * baseline. The sliding mean converges fully within N
 	 * cycles. */
 	for (i = 0; i < 200; i++) {

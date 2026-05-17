@@ -1452,12 +1452,12 @@ PWTEST(reconcile_property_random_chains_satisfy_kernel_contract)
 }
 
 /* Property-based test extended to the fork, join, and diamond
- * graph families (Phase 11.2 plan instructions). For each family
- * we generate 60 random instances and assert the hard-mode
- * kernel contract `0 < runtime <= local_deadline <= period`. The
- * underlying mechanism is identical to the chain property test;
- * only the edge layout changes between families. WCETs stay
- * bounded so the workload always lands in HARD. */
+ * graph families. For each family we generate 60 random
+ * instances and assert the hard-mode kernel contract
+ * `0 < runtime <= local_deadline <= period`. The underlying
+ * mechanism is identical to the chain property test; only the
+ * edge layout changes between families. WCETs stay bounded so
+ * the workload always lands in HARD. */
 PWTEST(reconcile_property_random_shapes_satisfy_kernel_contract)
 {
 	uint32_t seed = 0xB5C9E227u;

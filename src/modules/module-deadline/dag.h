@@ -353,8 +353,8 @@ bool dag_dbf_feasible(const dag_t *g,
  * The function does not touch g->dirty: it is callable as a
  * post-contraction step from the analysis layer once
  * cumulative_deadline has been assigned. dag_recalculate runs it
- * automatically as the closing step of the splitter pass; external
- * callers (Phase 2's contracted DAG) invoke it directly.
+ * automatically as the closing step of the splitter pass; the
+ * contracted-DAG callers invoke it directly.
  */
 bool dag_compute_local_deadlines(dag_t *g);
 

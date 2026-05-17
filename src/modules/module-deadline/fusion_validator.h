@@ -113,22 +113,20 @@ struct fusion_candidate_member {
  * predicate's reason and returns false. n_members == 0 trivially
  * accepts.
  *
- * Phase 0 of the predicate set (this commit) covers
- * CROSS_DRIVER / MAIN_LOOP / EXPORTED / REMOTE_TID_UNKNOWN; the
- * structural predicates (WOULD_SELF_SUSPEND, NON_CONVEX,
- * INTERNAL_MILESTONE, BLOCKING_RISK) land in their own commits.
- * Until those land, the validator only filters at the analyzability
- * level; structurally unsound but analyzable candidates still pass
- * and the downstream contracted-DAG dispatcher's cycle-detection
- * fallback catches the worst cases.
+ * The analyzability predicates (CROSS_DRIVER / MAIN_LOOP /
+ * EXPORTED / REMOTE_TID_UNKNOWN) plus the structural ones
+ * (WOULD_SELF_SUSPEND, NON_CONVEX, INTERNAL_MILESTONE,
+ * BLOCKING_RISK) are all live; together they enforce the
+ * fusion-soundness predicate stack the contracted-DAG
+ * dispatcher then trusts.
  */
 bool fusion_validator_accept(const struct fusion_candidate_member *members,
 		uint32_t n_members,
 		enum fusion_reject_reason *out_reason);
 
 /*
- * Strict predecessor closure -- the Phase 3.2 fallback for the
- * release-barrier predicate.
+ * Strict predecessor closure -- the conservative structural
+ * fallback for the runtime release-barrier predicate.
  *
  * A fused group F must not begin executing one internal member
  * and then block waiting for another internal member's external

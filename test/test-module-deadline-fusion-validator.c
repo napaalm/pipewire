@@ -171,7 +171,7 @@ PWTEST(fusion_validator_reason_name_stability)
 	return PWTEST_PASS;
 }
 
-/* --- predecessor closure predicate (Phase 3.2 fallback) --- */
+/* --- predecessor closure predicate (release-barrier fallback) --- */
 
 PWTEST(fusion_pred_closure_empty_group_accepts)
 {
@@ -296,7 +296,7 @@ PWTEST(fusion_pred_closure_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
-/* --- precedence convexity predicate (Phase 3.3) --- */
+/* --- precedence convexity predicate --- */
 
 PWTEST(fusion_convex_singleton_accepts)
 {
@@ -410,7 +410,7 @@ PWTEST(fusion_convex_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
-/* --- externally atomic predicate (Phase 3.4) --- */
+/* --- externally atomic predicate --- */
 
 PWTEST(fusion_externally_atomic_singleton_accepts)
 {
@@ -513,7 +513,7 @@ PWTEST(fusion_externally_atomic_null_member_ids_rejects)
 	return PWTEST_PASS;
 }
 
-/* --- blocking-closure predicate (Phase 3.5) --- */
+/* --- blocking-closure predicate --- */
 
 PWTEST(fusion_blocking_empty_accepts)
 {
