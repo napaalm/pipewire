@@ -167,6 +167,71 @@ PWTEST(contracted_cycle_detected)
 /* Chain A -> B -> C with fusion {A, B} produces a 2-node
  * contracted DAG {AB, C} with one edge AB -> C and macro WCET
  * for AB equal to W_A + W_B (overhead left at 0). */
+/* Group {B, C} on graph A -> C, B -> C, A -> X: contracting
+ * preserves A as an external predecessor of the macro-node BC,
+ * and the contracted edge A -> BC carries the singleton-A
+ * dependency that the runtime needs to gate the macro's
+ * release on A completing. The check is that the contracted
+ * DAG records exactly the right external predecessors -- no
+ * silent dropping, no spurious extras. */
+PWTEST(contracted_builder_preserves_external_predecessors)
+{
+	struct contracted_member_input members[] = {
+		{ 1, 1001, 10 }, /* A */
+		{ 2, 1002, 20 }, /* B */
+		{ 3, 1003, 30 }, /* C */
+		{ 4, 1004, 40 }, /* X (external) */
+	};
+	/* {B, C} fused into group 9; A and X stay singletons. */
+	uint32_t groups[] = { 0, 9, 9, 0 };
+	struct contracted_edge_input edges[] = {
+		{ 1, 3 }, /* A -> C, becomes external pred of BC */
+		{ 2, 3 }, /* B -> C, internal (both in BC) */
+		{ 1, 4 }, /* A -> X, untouched (both singletons) */
+	};
+	contracted_dag_t *cg = NULL;
+	contracted_node_t *cn, *a = NULL, *bc = NULL, *x = NULL;
+	contracted_edge_t *ce;
+	uint32_t bc_preds = 0, a_succs = 0;
+
+	pwtest_int_eq(contracted_dag_build(100, 100,
+			members, groups, 4,
+			edges, 3, &cg), 0);
+	pwtest_ptr_notnull(cg);
+	/* Three contracted nodes: singleton A, macro BC, singleton X. */
+	pwtest_int_eq((int)cg->n_nodes, 3);
+	pwtest_bool_false(contracted_dag_has_cycle(cg));
+
+	spa_list_for_each(cn, &cg->nodes, link) {
+		if (cn->n_members == 2)
+			bc = cn;
+		else if (cn->wcet_ns == 10)
+			a = cn;
+		else if (cn->wcet_ns == 40)
+			x = cn;
+	}
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(bc);
+	pwtest_ptr_notnull(x);
+
+	/* BC has exactly one predecessor: A. */
+	spa_list_for_each(ce, &bc->preds, dst_link) {
+		pwtest_ptr_eq(ce->src, a);
+		bc_preds++;
+	}
+	pwtest_int_eq((int)bc_preds, 1);
+
+	/* A has two successors: BC and X. */
+	spa_list_for_each(ce, &a->succs, src_link) {
+		pwtest_bool_true(ce->dst == bc || ce->dst == x);
+		a_succs++;
+	}
+	pwtest_int_eq((int)a_succs, 2);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST(contracted_builder_chain_fuse_first_two)
 {
 	struct contracted_member_input members[] = {
@@ -544,6 +609,8 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_acyclic_chain_passes, PWTEST_NOARG);
 	pwtest_add(contracted_cycle_detected, PWTEST_NOARG);
 	pwtest_add(contracted_builder_chain_fuse_first_two, PWTEST_NOARG);
+	pwtest_add(contracted_builder_preserves_external_predecessors,
+			PWTEST_NOARG);
 	pwtest_add(contracted_builder_drops_internal_edges, PWTEST_NOARG);
 	pwtest_add(contracted_builder_deduplicates_parallel_external_edges, PWTEST_NOARG);
 	pwtest_add(contracted_builder_singletons_only, PWTEST_NOARG);
