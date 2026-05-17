@@ -240,6 +240,32 @@ int rt_diag_sched_snapshot_add_excluded(struct rt_diag_sched_snapshot *s,
 const char *rt_diag_sched_exclude_reason_name(enum rt_diag_sched_exclude_reason r);
 
 /*
+ * Pure classifier for one in-period edge. Returns the single
+ * exclusion reason that drove the edge out of the scheduling DAG
+ * (or RT_DIAG_SCHED_EXC_NONE when the edge belongs to the included
+ * set).
+ *
+ * The decision order matches the runtime path -- feedback edges
+ * dominate every other reason because they intentionally use
+ * previous-period data; async edges drop next because they break
+ * the in-period chain; exported edges drop because the daemon
+ * cannot place SCHED_DEADLINE on the remote thread; and finally
+ * any edge whose endpoint is missing or not part of the schedulable
+ * follower set is classified UNSUPPORTED. The decision is total:
+ * exactly one reason is returned per call.
+ *
+ * Pure data: no PipeWire runtime symbols; safe to call from unit
+ * tests with arbitrary flag combinations. The runtime callers in
+ * module-deadline.c project the live pw_impl_link / pw_impl_node
+ * flags into these booleans.
+ */
+enum rt_diag_sched_exclude_reason rt_diag_sched_classify_edge(
+		bool feedback,
+		bool src_async, bool dst_async,
+		bool src_exported, bool dst_exported,
+		bool src_in_set, bool dst_in_set);
+
+/*
  * Render to `out` as a stable text block:
  *
  *   deadline-diag-sched: driver=<id> generation=<g> period_ns=<p> deadline_ns=<d>

@@ -2058,17 +2058,19 @@ static enum rt_diag_sched_exclude_reason sched_dag_edge_reason(
 		struct pw_impl_link *l, struct pw_impl_node *src,
 		struct pw_impl_node *dst)
 {
-	if (l->feedback)
-		return RT_DIAG_SCHED_EXC_FEEDBACK;
-	if ((src != NULL && src->async) || (dst != NULL && dst->async))
-		return RT_DIAG_SCHED_EXC_ASYNC;
-	if ((src != NULL && src->exported) || (dst != NULL && dst->exported))
-		return RT_DIAG_SCHED_EXC_EXPORTED;
-	if (src == NULL || dst == NULL ||
-	    !sched_dag_follower_in_set(src) ||
-	    !sched_dag_follower_in_set(dst))
-		return RT_DIAG_SCHED_EXC_UNSUPPORTED;
-	return RT_DIAG_SCHED_EXC_NONE;
+	/* Endpoint-missing degenerates to UNSUPPORTED before we touch
+	 * the per-endpoint flags: a NULL endpoint has neither async nor
+	 * exported booleans to query. The pure classifier below has no
+	 * way to express "missing endpoint" other than via the in-set
+	 * booleans, so handle it explicitly here. */
+	return rt_diag_sched_classify_edge(
+			l->feedback,
+			src != NULL && src->async,
+			dst != NULL && dst->async,
+			src != NULL && src->exported,
+			dst != NULL && dst->exported,
+			src != NULL && sched_dag_follower_in_set(src),
+			dst != NULL && sched_dag_follower_in_set(dst));
 }
 
 /* Build a scheduling-DAG diagnostic snapshot and emit it via

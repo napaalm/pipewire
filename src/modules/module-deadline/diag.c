@@ -332,6 +332,23 @@ const char *rt_diag_sched_exclude_reason_name(enum rt_diag_sched_exclude_reason 
 	return "unknown";
 }
 
+enum rt_diag_sched_exclude_reason rt_diag_sched_classify_edge(
+		bool feedback,
+		bool src_async, bool dst_async,
+		bool src_exported, bool dst_exported,
+		bool src_in_set, bool dst_in_set)
+{
+	if (feedback)
+		return RT_DIAG_SCHED_EXC_FEEDBACK;
+	if (src_async || dst_async)
+		return RT_DIAG_SCHED_EXC_ASYNC;
+	if (src_exported || dst_exported)
+		return RT_DIAG_SCHED_EXC_EXPORTED;
+	if (!src_in_set || !dst_in_set)
+		return RT_DIAG_SCHED_EXC_UNSUPPORTED;
+	return RT_DIAG_SCHED_EXC_NONE;
+}
+
 void rt_diag_sched_snapshot_render_text(const struct rt_diag_sched_snapshot *s,
 					FILE *out)
 {

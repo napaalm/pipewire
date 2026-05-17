@@ -276,6 +276,75 @@ PWTEST(diag_sched_reason_names_stable)
 	return PWTEST_PASS;
 }
 
+/*
+ * Pure classifier exercises the same decision the runtime path
+ * uses; tests pin the policy for every reason without dragging in
+ * pw_impl_link / pw_impl_node. The runtime call site in
+ * module-deadline.c projects the live flags through this helper, so
+ * a regression in the predicate is caught here regardless of where
+ * the production wiring evolves.
+ */
+PWTEST(sched_dag_excludes_async_edges)
+{
+	/* src async drops -- the edge intentionally uses previous-period
+	 * data, so it is not in the in-period DAG. */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, true, false,
+			false, false, true, true),
+			RT_DIAG_SCHED_EXC_ASYNC);
+	/* dst async drops too, by symmetry. */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, true,
+			false, false, true, true),
+			RT_DIAG_SCHED_EXC_ASYNC);
+	/* Both endpoints async also drops as async (the predicate is
+	 * total: exactly one reason returned). */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, true, true,
+			false, false, true, true),
+			RT_DIAG_SCHED_EXC_ASYNC);
+	/* Default in-period edge is included. */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, false,
+			false, false, true, true),
+			RT_DIAG_SCHED_EXC_NONE);
+	return PWTEST_PASS;
+}
+
+PWTEST(sched_dag_excludes_feedback_edges)
+{
+	/* Feedback dominates every other classifier reason: even an
+	 * edge whose endpoints would otherwise drop for async/exported/
+	 * unsupported is reported as feedback if its link carries the
+	 * feedback flag. The reason: the DAG must remain acyclic, and
+	 * back-edges intentionally use previous-period data. */
+	pwtest_int_eq(rt_diag_sched_classify_edge(true, false, false,
+			false, false, true, true),
+			RT_DIAG_SCHED_EXC_FEEDBACK);
+	pwtest_int_eq(rt_diag_sched_classify_edge(true, true, true,
+			true, true, false, false),
+			RT_DIAG_SCHED_EXC_FEEDBACK);
+	return PWTEST_PASS;
+}
+
+PWTEST(sched_dag_classify_exported_and_unsupported)
+{
+	/* Exported drops with reason=exported, but only when neither
+	 * async nor feedback claims the edge first (predicate is
+	 * ordered). */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, false,
+			true, false, true, true),
+			RT_DIAG_SCHED_EXC_EXPORTED);
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, false,
+			false, true, true, true),
+			RT_DIAG_SCHED_EXC_EXPORTED);
+	/* Endpoint missing from the schedulable follower set drops
+	 * with reason=unsupported. */
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, false,
+			false, false, false, true),
+			RT_DIAG_SCHED_EXC_UNSUPPORTED);
+	pwtest_int_eq(rt_diag_sched_classify_edge(false, false, false,
+			false, false, true, false),
+			RT_DIAG_SCHED_EXC_UNSUPPORTED);
+	return PWTEST_PASS;
+}
+
 PWTEST(diag_sched_render_text_golden)
 {
 	struct rt_diag_sched_snapshot s;
@@ -847,6 +916,9 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_sched_null_safe, PWTEST_NOARG);
 	pwtest_add(diag_sched_excluded_rejects_none, PWTEST_NOARG);
 	pwtest_add(diag_sched_reason_names_stable, PWTEST_NOARG);
+	pwtest_add(sched_dag_excludes_async_edges, PWTEST_NOARG);
+	pwtest_add(sched_dag_excludes_feedback_edges, PWTEST_NOARG);
+	pwtest_add(sched_dag_classify_exported_and_unsupported, PWTEST_NOARG);
 	pwtest_add(diag_sched_render_text_golden, PWTEST_NOARG);
 	pwtest_add(diag_fusion_null_safe, PWTEST_NOARG);
 	pwtest_add(diag_fusion_begin_group_validates_pair, PWTEST_NOARG);
