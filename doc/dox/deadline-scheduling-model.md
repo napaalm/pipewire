@@ -103,35 +103,58 @@ Kernel-API contract:
 ## Runtime budget kind
 
 The `runtime_budget_ns` shipped to `sched_setattr` comes from one
-of four sources, identified per-node in the JSON snapshot under
+of three sources, identified per-node in the JSON snapshot under
 `budget_kind`:
 
-  * **`pwcet`** -- the MBPTA estimator has reached `PWCET_VALID`
-    and the operator has opted in via
-    `deadline.mbpta.accept_probabilistic_hard = true`. The
-    runtime is `pWCET(eps_node) = mu - sigma * ln(-ln(1 - eps_node))`
-    at the configured per-node exceedance target
-    (Cucu-Grosjean 2012 §III-D).
-  * **`empirical_quantile`** -- the t-digest sketch's
-    configured quantile (default p95). This is **soft
-    telemetry**, not a worst-case execution time: it cannot be
-    used to claim hard real-time guarantees and the budget
-    label is named accordingly so no public field, log line,
-    or JSON value ever advertises a p95 quantile as WCET.
-  * **`bootstrap_fallback`** -- a conservative default applied
-    while a freshly-created node has not yet accumulated enough
-    samples for either MBPTA or the sketch to produce a value.
-  * **`deterministic_wcet`** -- a configured static WCET, for
-    operator-known plugins.
+  * **`manual_override`** -- a per-node operator override
+    (reserved for a future per-node property). Always wins
+    when set.
+  * **`deterministic_wcet`** -- a configured static worst-case
+    execution time (reserved for a future plugin attribute).
+    Hard-realtime provenance: a deterministic bound is the only
+    kind that admits a hard claim.
+  * **`adaptive_conformal`** -- the adaptive-conformal
+    estimator's online one-sided upper-runtime budget
+    calibrated to a target overrun frequency via conformal
+    prediction (Romano, Patterson & Candes, NeurIPS 2019)
+    with an EWMA location/scale base predictor and an
+    adaptive `alpha_eff` update under distribution shift
+    (Gibbs & Candes, NeurIPS 2021). **The published value is
+    a soft / weakly-hard bound (Bernat, Burns & Llamosi,
+    IEEE TC 50(4), 2001), not a deterministic WCET.** Strict
+    hard-realtime operation requires `manual_override` or
+    `deterministic_wcet`. The conformal estimator owns its
+    own bootstrap-with-immediate-start path: a freshly-created
+    follower receives a configured bootstrap budget under the
+    same kind, and the operator can read `samples_used = 0`
+    in the per-node `conformal` sub-object to identify the
+    bootstrap state.
+
+The estimator's full state surfaces in the per-node JSON
+snapshot under `parameters.nodes[i].conformal`: `state`
+(`insufficient_data`, `bootstrap`, `valid`, `shift`,
+`disabled`), `alpha_target`, `alpha_eff`, `window`,
+`ewma_location_ns`, `ewma_scale_ns`, `score_quantile`,
+`overruns_seen`, `recent_overruns`, `current_overrun_burst`,
+`max_overrun_burst`, `last_runtime_ns`, `last_prediction_ns`,
+`last_score`, `last_budget_ns`, `last_invalidation_reason`,
+plus the configured guard and runtime floor for reference.
+
+The graph-level `budget_clipped` flag on each follower and the
+`risk_objective_value` aggregate report the soft-mode risk-aware
+deadline redistribution outcome (see
+[deadline-future-work](deadline-future-work.md) for the
+non-shipped extensions: weighted alpha allocation,
+solver-based redistribution).
 
 ## Hard mode
 
 The published schedule is in **hard mode** when *all* of:
 
-  * the per-node runtime budget is a deterministic WCET or an
-    MBPTA pWCET (the only two kinds that admit a hard claim --
-    an empirical quantile is by definition a probabilistic
-    soft-telemetry value, not a worst-case bound);
+  * the per-node runtime budget is `deterministic_wcet` or
+    `manual_override` (the two kinds that admit a hard claim --
+    the adaptive-conformal estimate is by definition a soft /
+    weakly-hard bound, not a worst-case bound);
   * every member of every fused group is non-blocking inside
     its `process()` call (the fusion validator's blocking-
     closure predicate rejects groups whose members fail this);
@@ -163,20 +186,38 @@ transition; per-cycle re-emission is suppressed by the
 hysteresis counter (`feas.consecutive_hard_passes`, default
 threshold 3).
 
-The redistribution is deliberately minimal in the current
-implementation: tuples that would violate
-`runtime <= deadline <= period` are capped at 95 % of the
-local deadline so the kernel admission test accepts them. The
-follower then runs under a CBS budget below its measured demand
-and may be throttled (the "throttling risk is expected"
-operator-visible behaviour); the `kernel_rejected_or_invalid_params`
-reason on the published feasibility report is the cause-of-
-transition signal.
+The redistribution runs a deterministic single-pass critical-path
+heuristic (`dag_soft_redistribute_deadlines` in
+`src/modules/module-deadline/dag.c`): cumulative deadlines are
+reassigned proportional to the in-path WCET along the global
+longest path so the available end-to-end budget is shared
+according to each follower's contribution to the critical path
+(Sarkar 1989 §5.3 critical-path scheduling, adapted to the soft
+case where total path work may exceed the end-to-end deadline).
+Followers whose own WCET exceeds the redistributed local
+deadline are flagged `budget_clipped` in the JSON snapshot; the
+graph-level `risk_objective_value` aggregates the clipped
+overflow as a unitless fraction of the end-to-end deadline.
+Tuples that would violate `runtime <= deadline <= period` after
+the redistribution are then capped per-CPU by the existing
+density-scaling safety net so the kernel admission test still
+accepts them.
 
 Mode classification is read by an operator via the snapshot's
 top-level `mode` field; the underlying transition mechanism is
 `reconcile_state_force_soft` in
 `src/modules/module-deadline/reconcile.c`.
+
+## Claims and limitations
+
+The adaptive-conformal estimator publishes an online upper
+runtime budget calibrated to a target overrun frequency for
+stable mode keys and adapted under distribution shift. It is
+intended for soft / weakly-hard real-time operation with
+SCHED_DEADLINE reservations. It is not a deterministic WCET
+proof. Strict hard-real-time guarantees require manual / static
+/ hybrid WCETs and admission control that rejects unschedulable
+graph changes.
 
 ## References
 

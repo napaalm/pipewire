@@ -125,10 +125,79 @@
  *                       overrun surfaces immediately as a deadline
  *                       miss instead of being absorbed by reclaimed
  *                       bandwidth from idle peers. Used by the
- *                       saturation live test to verify the WCET
- *                       sketch has not under-bounded the worst
+ *                       saturation live test to verify the runtime
+ *                       budget has not under-bounded the worst
  *                       case; not recommended for production audio
  *                       graphs.
+ * - `deadline.budget.source`:
+ *                       Which budget source the runtime-selection
+ *                       predicate considers. Accepted values:
+ *                       `manual`, `deterministic`,
+ *                       `adaptive_conformal` (default automatic),
+ *                       `bootstrap`. The hierarchy is
+ *                       manual -> deterministic -> adaptive_conformal
+ *                       -> peak-hold-bootstrap; restricting via this
+ *                       knob skips kinds above the chosen layer.
+ *                       Strict hard-realtime operation requires
+ *                       `manual` or `deterministic` (a configured
+ *                       static bound); `adaptive_conformal` is a
+ *                       soft / weakly-hard estimate, not a
+ *                       deterministic WCET (Bernat, Burns & Llamosi
+ *                       2001).
+ * - `deadline.conformal.alpha_graph` / `alpha_min` / `alpha_max`:
+ *                       Target graph-level overrun frequency and
+ *                       the clamps the adaptive alpha update
+ *                       respects (Gibbs & Candes 2021). Defaults
+ *                       1e-3 / 1e-5 / 5e-2.
+ * - `deadline.conformal.eta`:
+ *                       Step size of the adaptive alpha update
+ *                       per observed activation. Default 5e-3.
+ * - `deadline.conformal.window`:
+ *                       Score-ring size (number of normalised
+ *                       nonconformity scores retained per
+ *                       follower). Must be in [2, 4096]. Default
+ *                       1024.
+ * - `deadline.conformal.recalc_period`:
+ *                       Number of observations between rolling
+ *                       quantile recomputes. Default 1
+ *                       (recompute every sample).
+ * - `deadline.conformal.ewma_location_lambda` /
+ *   `deadline.conformal.ewma_scale_lambda`:
+ *                       EWMA gains for the location and
+ *                       absolute-deviation scale predictors.
+ *                       Default 0.05 / 0.05.
+ * - `deadline.conformal.guard_ns` / `guard_percent`:
+ *                       Additive and multiplicative guards
+ *                       applied to the raw prediction before
+ *                       clamping. Default 1500 ns / 5 %.
+ * - `deadline.conformal.sigma_floor_ns`:
+ *                       Lower bound on the EWMA scale used in
+ *                       score normalisation; prevents division by
+ *                       near-zero scale on stable inputs.
+ *                       Default 1 ns.
+ * - `deadline.conformal.runtime_floor_ns`:
+ *                       Lower clamp on the emitted budget.
+ *                       Default 1000 ns.
+ * - `deadline.conformal.bootstrap_min_samples`:
+ *                       Number of observations required before the
+ *                       estimator transitions BOOTSTRAP -> VALID.
+ *                       Default 64.
+ * - `deadline.conformal.bootstrap_runtime_ns`:
+ *                       Bootstrap floor published while the state
+ *                       machine is in BOOTSTRAP. Default 0 (use
+ *                       runtime_floor_ns).
+ * - `deadline.conformal.compatible_history`:
+ *                       Whether the BOOTSTRAP path may reuse a
+ *                       compatible-history budget when a previously
+ *                       observed mode-key fingerprint recurs.
+ *                       Default true.
+ * - `deadline.conformal.trace_export` /
+ *   `deadline.conformal.trace_path`:
+ *                       When both set, the worker appends one
+ *                       JSON line per sample to the configured
+ *                       path. Input to the offline calibration
+ *                       tool `live-test/conformal_calibrate.py`.
+ *                       Default off.
  * - `recalc.sync`:      If true (default false), run the parameter
  *                       recalculation synchronously on the driver's RT
  *                       data-loop thread, as the module did before the

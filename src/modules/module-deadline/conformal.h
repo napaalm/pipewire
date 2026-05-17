@@ -15,6 +15,14 @@
  * already normalised to a reference CPU upstream) and publishes a
  * one-sided runtime bound calibrated to a target overrun frequency.
  *
+ * IMPORTANT: the estimator publishes an online upper runtime budget
+ * calibrated to a target overrun frequency for stable mode keys and
+ * adapted under distribution shift. It is intended for soft /
+ * weakly-hard real-time operation with SCHED_DEADLINE reservations.
+ * It is NOT a deterministic WCET proof. Strict hard-real-time
+ * guarantees require manual / static / hybrid WCETs and admission
+ * control that rejects unschedulable graph changes.
+ *
  * Mathematical references:
  *
  *   - Romano, Patterson & Candes, "Conformalized Quantile Regression",
