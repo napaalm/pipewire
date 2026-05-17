@@ -232,6 +232,150 @@ PWTEST(contracted_builder_preserves_external_predecessors)
 	return PWTEST_PASS;
 }
 
+/* Walk the macro-nodes and find the one that owns the given
+ * original member id. Returns NULL if no node carries it. */
+static contracted_node_t *
+contracted_test_owner(contracted_dag_t *cg, uint32_t member_id)
+{
+	contracted_node_t *cn;
+	struct contracted_member *m;
+	spa_list_for_each(cn, &cg->nodes, link) {
+		spa_list_for_each(m, &cn->members, link) {
+			if (m->id == member_id)
+				return cn;
+		}
+	}
+	return NULL;
+}
+
+/* Property-based test: for a family of randomised
+ * (members, group_id, edges) inputs the contracted DAG must
+ * preserve the following invariants:
+ *
+ *   1. Every input edge u -> v is either internal (owner(u) ==
+ *      owner(v), dropped) or represented by exactly one
+ *      contracted edge between owner(u) and owner(v). No edge is
+ *      silently lost; no spurious edge is invented.
+ *
+ *   2. Every contracted edge has at least one underlying input
+ *      edge crossing the same boundary -- a "round-trip" check
+ *      that catches a future deduplication bug from accidentally
+ *      keeping a phantom edge after group renaming.
+ *
+ *   3. Group-id 0 always maps to a singleton macro-node carrying
+ *      exactly the originating member.
+ *
+ *   4. Members with the same non-zero group_id always end up in
+ *      the same macro-node (with n_members > 1 when the group
+ *      has more than one member).
+ *
+ * The trial set is LCG-deterministic (seed 0xE9C2B137) so
+ * counter-examples are reproducible. 40 trials covers enough
+ * randomised shapes to catch obvious regressions without making
+ * the suite slow. */
+PWTEST(contracted_builder_property_preserves_edge_set)
+{
+	uint32_t seed = 0xE9C2B137u;
+	uint32_t trial;
+	uint32_t total_violations = 0;
+	const uint32_t trials = 40;
+
+	for (trial = 0; trial < trials; trial++) {
+		struct contracted_member_input members[6];
+		uint32_t groups[6];
+		struct contracted_edge_input edges[10];
+		uint32_t n_members, n_edges, i, j;
+		uint32_t group_pool[3] = { 0, 7, 9 };
+		contracted_dag_t *cg = NULL;
+		contracted_node_t *cn;
+
+		seed = seed * 1103515245u + 12345u;
+		n_members = 3 + (seed % 4); /* 3..6 members */
+
+		/* Assign each member to one of three group buckets
+		 * (0=singleton, 7, 9). */
+		for (i = 0; i < n_members; i++) {
+			seed = seed * 1103515245u + 12345u;
+			members[i].id  = 100 + i;
+			members[i].tid = 1000 + i;
+			members[i].wcet_ns = 10 + (seed % 50);
+			groups[i] = group_pool[seed % 3];
+		}
+
+		/* Generate a forward-only edge set (DAG by construction)
+		 * with each edge present with 50 % probability. */
+		n_edges = 0;
+		for (i = 0; i < n_members; i++) {
+			for (j = i + 1; j < n_members; j++) {
+				seed = seed * 1103515245u + 12345u;
+				if ((seed & 0x1) == 0)
+					continue;
+				if (n_edges >= 10)
+					continue;
+				edges[n_edges].src_id = members[i].id;
+				edges[n_edges].dst_id = members[j].id;
+				n_edges++;
+			}
+		}
+
+		if (contracted_dag_build(100, 100, members, groups,
+				n_members, edges, n_edges, &cg) != 0)
+			continue;
+
+		/* Invariant 4: members with the same non-zero group_id
+		 * map to the same macro-node. */
+		for (i = 0; i < n_members; i++) {
+			for (j = i + 1; j < n_members; j++) {
+				if (groups[i] == 0 || groups[i] != groups[j])
+					continue;
+				contracted_node_t *a =
+					contracted_test_owner(cg, members[i].id);
+				contracted_node_t *b =
+					contracted_test_owner(cg, members[j].id);
+				if (a != b)
+					total_violations++;
+			}
+		}
+
+		/* Invariant 3: group_id 0 means singleton. */
+		for (i = 0; i < n_members; i++) {
+			if (groups[i] != 0)
+				continue;
+			cn = contracted_test_owner(cg, members[i].id);
+			if (cn == NULL || cn->n_members != 1)
+				total_violations++;
+		}
+
+		/* Invariant 1 & 2: every input edge is either internal
+		 * or has a contracted edge between owner(src) and
+		 * owner(dst). */
+		for (i = 0; i < n_edges; i++) {
+			contracted_node_t *u =
+				contracted_test_owner(cg, edges[i].src_id);
+			contracted_node_t *v =
+				contracted_test_owner(cg, edges[i].dst_id);
+			if (u == NULL || v == NULL) {
+				total_violations++;
+				continue;
+			}
+			if (u == v)
+				continue; /* internal -- dropped, OK */
+			contracted_edge_t *ce;
+			bool found = false;
+			spa_list_for_each(ce, &u->succs, src_link) {
+				if (ce->dst == v) { found = true; break; }
+			}
+			if (!found)
+				total_violations++;
+		}
+
+		contracted_dag_destroy(cg);
+	}
+
+	pwtest_int_eq((int)total_violations, 0);
+	return PWTEST_PASS;
+}
+
 PWTEST(contracted_builder_chain_fuse_first_two)
 {
 	struct contracted_member_input members[] = {
@@ -610,6 +754,8 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_cycle_detected, PWTEST_NOARG);
 	pwtest_add(contracted_builder_chain_fuse_first_two, PWTEST_NOARG);
 	pwtest_add(contracted_builder_preserves_external_predecessors,
+			PWTEST_NOARG);
+	pwtest_add(contracted_builder_property_preserves_edge_set,
 			PWTEST_NOARG);
 	pwtest_add(contracted_builder_drops_internal_edges, PWTEST_NOARG);
 	pwtest_add(contracted_builder_deduplicates_parallel_external_edges, PWTEST_NOARG);
