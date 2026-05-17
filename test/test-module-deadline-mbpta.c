@@ -544,6 +544,23 @@ PWTEST(mbpta_gumbel_source_recovers_parameters_within_tolerance)
 	if (sigma_err < 0) sigma_err = -sigma_err;
 	pwtest_bool_true(sigma_err < 0.20);
 
+	/* When the fit reaches PWCET_VALID the published pWCET must
+	 * match the closed-form Gumbel inverse CDF
+	 *     pWCET = mu - sigma * ln(-ln(1 - eps_node))
+	 * at the configured eps_node. The integer cast in the
+	 * estimator's cache truncates by < 1 ns, well below the
+	 * tolerance the sigma recovery already accepts. */
+	if (mbpta_state(e) == MBPTA_PWCET_VALID) {
+		double mu_hat = mbpta_mu(e);
+		double sigma_hat = mbpta_sigma(e);
+		double expected = mu_hat - sigma_hat *
+			log(-log(1.0 - c.eps_node));
+		uint64_t actual = mbpta_pwcet_ns(e);
+		double diff = (double)actual - expected;
+		if (diff < 0) diff = -diff;
+		pwtest_bool_true(diff < 2.0);
+	}
+
 	mbpta_destroy(e);
 	return PWTEST_PASS;
 }
