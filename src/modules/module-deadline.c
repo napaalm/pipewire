@@ -1130,36 +1130,55 @@ static int read_voluntary_ctxt_switches(pid_t tid, uint64_t *out)
  * far below the cycle rate so the open-per-recalc cost is amortised.
  * The check runs off the RT path.
  */
+/*
+ * Iterate the worker-owned topology snapshot (drv->topo.nodes[]) --
+ * the same view worker_apply_dag uses to build the reconcile_topo_t.
+ * The snapshot is rebuilt on the main loop in snapshot_topology_main
+ * and consumed lock-free by the worker after spa_loop_invoke
+ * completes; iterating dnode->follower_list directly from worker
+ * context would race with main-loop topology mutations and is what
+ * an earlier draft of this function did (the resulting SIGSEGV was
+ * observed at daemon shutdown when the follower list was being torn
+ * down concurrently).
+ *
+ * The tolerance over expected voluntary yields is generous: in
+ * production a filter-chain follower can legitimately yield a
+ * handful of times per second beyond the one-per-deadline-wait
+ * baseline (lazy-init epoll path, occasional reservation handshake,
+ * the first cycles after a topology flip). Reporting on a single
+ * extra yield generates noise; require excess > a margin that is
+ * proportional to the number of cycles in the interval before
+ * demoting to soft-degraded.
+ */
 static void sample_voluntary_ctxt_switches_main(struct impl *impl,
 		struct node *drv)
 {
-	struct pw_impl_node *dnode;
-	struct pw_impl_node *n_iter;
+	struct topo_snap *t;
 	struct timespec ts;
 	uint64_t now_ns;
+	uint32_t i;
 
-	if (impl == NULL || drv == NULL || drv->node == NULL ||
-	    drv->reconcile == NULL)
+	if (impl == NULL || drv == NULL || drv->reconcile == NULL)
+		return;
+	t = &drv->topo;
+	if (!t->ok || t->n_nodes == 0)
 		return;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
 		return;
 	now_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 
-	dnode = drv->node;
-	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
+	for (i = 0; i < t->n_nodes; i++) {
+		pid_t tid = t->nodes[i].tid;
+		uint32_t id = t->nodes[i].id;
 		struct node *mn;
-		pid_t tid;
 		uint64_t cur, delta, expected, excess, interval_ns, period_ns;
+		uint64_t margin;
 
-		if (n_iter == dnode)
-			continue;
-		tid = pw_properties_get_int32(n_iter->properties,
-				PW_KEY_NODE_LOOP_TID, -1);
 		if (tid <= 0)
 			continue;
 		if (read_voluntary_ctxt_switches(tid, &cur) < 0)
 			continue;
-		mn = find_node_by_id(impl, n_iter->info.id);
+		mn = find_node_by_id(impl, id);
 		if (mn == NULL)
 			continue;
 		if (!mn->voluntary_ctxt_switches_seen) {
@@ -1176,16 +1195,21 @@ static void sample_voluntary_ctxt_switches_main(struct impl *impl,
 		if (period_ns == 0)
 			period_ns = mn->period;
 		if (period_ns == 0) {
-			/* Without a period we cannot estimate the legitimate
-			 * yield count; record raw delta as observational. */
 			expected = 0;
+			margin = 64;  /* arbitrary noise floor */
 		} else {
-			/* One voluntary yield per activation on
-			 * SCHED_DEADLINE (the deadline wait), plus a small
-			 * tolerance for scheduler bookkeeping. */
-			expected = interval_ns / period_ns + 2;
+			uint64_t cycles = interval_ns / period_ns + 1;
+			/* One yield per activation (the deadline wait) plus
+			 * a generous margin: a 10% slack on top of the cycle
+			 * count, with a floor of 16 yields so very short
+			 * intervals do not produce a 0-margin window that
+			 * fires on every scheduler hiccup. */
+			expected = cycles;
+			margin = cycles / 10;
+			if (margin < 16)
+				margin = 16;
 		}
-		excess = delta > expected ? delta - expected : 0;
+		excess = delta > expected + margin ? delta - expected - margin : 0;
 		mn->voluntary_ctxt_switches_in_process = excess;
 		mn->voluntary_ctxt_switches_last_sample = cur;
 		mn->voluntary_ctxt_switches_last_sample_time_ns = now_ns;
