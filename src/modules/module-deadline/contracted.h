@@ -147,6 +147,36 @@ struct contracted_node {
 	uint64_t macro_completion_ns;
 	uint64_t macro_completion_count;
 
+	/*
+	 * Release-barrier state for the macro-node's per-cycle
+	 * activation. required_external_inputs is the constant set at
+	 * topology snapshot time: the count of distinct contracted-node
+	 * predecessors that must complete the current period before the
+	 * fused thread may begin its job. pending_external_inputs is the
+	 * per-cycle decrementing counter the runtime drives:
+	 *
+	 *   armed at cycle start  -> pending = required
+	 *   external pred completes -> pending--
+	 *   pending == 0           -> wake fused thread
+	 *
+	 * For a singleton macro-node required equals the count of
+	 * scheduling-DAG predecessors. For a fused group it is the size
+	 * of external_pred(F) computed on the contracted DAG. A
+	 * required of 0 (graph source) means the group wakes with the
+	 * driver activation; no external waits required.
+	 *
+	 * Today's apply path uses the conservative strict-predecessor-
+	 * closure validator to refuse groups that would self-suspend, so
+	 * the per-cycle barrier is a no-op in production (every accepted
+	 * group has required == size-of-external-pred and the existing
+	 * activation already gates on those). The fields are populated
+	 * and exercised in the unit tests so the runtime hook can wire
+	 * them into impl-node's group-wake path without changing the
+	 * data contract.
+	 */
+	uint32_t required_external_inputs;
+	uint32_t pending_external_inputs;
+
 	/* Structural flags. is_fusion_group is true iff n_members > 1
 	 * (a singleton macro-node mirrors an un-fused original node).
 	 * externally_atomic is the validator's verdict on whether
@@ -436,6 +466,37 @@ int contracted_node_observe_macro_runtime(contracted_node_t *cn,
  */
 int contracted_node_observe_macro_completion(contracted_node_t *cn,
 		uint64_t timestamp_ns);
+
+/*
+ * Release-barrier helpers.
+ *
+ * contracted_node_set_required_external_inputs assigns the
+ * constant required count from the contracted-DAG predecessor list
+ * (callers typically compute it as spa_list_count(&cn->preds) at
+ * topology-snapshot time). The pending counter is reset to the
+ * same value so the next cycle starts armed.
+ *
+ * contracted_node_arm_cycle resets pending to required at the
+ * start of a new cycle.
+ *
+ * contracted_node_pred_completed decrements pending by one and
+ * returns true iff pending has reached zero (i.e. the fused thread
+ * is ready to be woken). Calling past zero is clamped at zero;
+ * cn->pending_external_inputs may not become negative.
+ *
+ * contracted_node_ready_to_wake is the predicate variant: returns
+ * true iff pending == 0 without mutating state. Useful in the
+ * conservative strict-predecessor-closure path where the predicate
+ * is read but the decrement is driven by a separate dependency
+ * tracker.
+ *
+ * All four are NULL-safe (-EINVAL or false on NULL cn).
+ */
+int  contracted_node_set_required_external_inputs(contracted_node_t *cn,
+		uint32_t required);
+int  contracted_node_arm_cycle(contracted_node_t *cn);
+bool contracted_node_pred_completed(contracted_node_t *cn);
+bool contracted_node_ready_to_wake(const contracted_node_t *cn);
 
 /*
  * Bridge between the contracted DAG and the existing scheduling-DAG

@@ -167,6 +167,40 @@ int contracted_node_observe_macro_completion(contracted_node_t *cn,
 	return 0;
 }
 
+int contracted_node_set_required_external_inputs(contracted_node_t *cn,
+		uint32_t required)
+{
+	if (cn == NULL)
+		return -EINVAL;
+	cn->required_external_inputs = required;
+	cn->pending_external_inputs = required;
+	return 0;
+}
+
+int contracted_node_arm_cycle(contracted_node_t *cn)
+{
+	if (cn == NULL)
+		return -EINVAL;
+	cn->pending_external_inputs = cn->required_external_inputs;
+	return 0;
+}
+
+bool contracted_node_pred_completed(contracted_node_t *cn)
+{
+	if (cn == NULL)
+		return false;
+	if (cn->pending_external_inputs > 0)
+		cn->pending_external_inputs--;
+	return cn->pending_external_inputs == 0;
+}
+
+bool contracted_node_ready_to_wake(const contracted_node_t *cn)
+{
+	if (cn == NULL)
+		return false;
+	return cn->pending_external_inputs == 0;
+}
+
 int contracted_dag_add_edge(contracted_dag_t *cg,
 		contracted_node_t *src, contracted_node_t *dst)
 {

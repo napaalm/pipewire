@@ -994,6 +994,71 @@ PWTEST(contracted_observe_macro_runtime_null_and_zero)
 	return PWTEST_PASS;
 }
 
+PWTEST(contracted_release_barrier_counter_arms_decrements_wakes)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 0), 0);
+	pwtest_int_eq((int)n->required_external_inputs, 0);
+	pwtest_int_eq((int)n->pending_external_inputs, 0);
+	pwtest_bool_true(contracted_node_ready_to_wake(n));
+
+	/* Macro-node has 3 external predecessors: arming sets the
+	 * pending counter equal to required. */
+	pwtest_int_eq(contracted_node_set_required_external_inputs(n, 3), 0);
+	pwtest_int_eq((int)n->required_external_inputs, 3);
+	pwtest_int_eq((int)n->pending_external_inputs, 3);
+	pwtest_bool_false(contracted_node_ready_to_wake(n));
+
+	/* Predecessor completions decrement; wake on the third. */
+	pwtest_bool_false(contracted_node_pred_completed(n));
+	pwtest_int_eq((int)n->pending_external_inputs, 2);
+	pwtest_bool_false(contracted_node_pred_completed(n));
+	pwtest_int_eq((int)n->pending_external_inputs, 1);
+	pwtest_bool_true(contracted_node_pred_completed(n));
+	pwtest_int_eq((int)n->pending_external_inputs, 0);
+	pwtest_bool_true(contracted_node_ready_to_wake(n));
+
+	/* Past zero is clamped (defensive against spurious completion
+	 * events). */
+	pwtest_bool_true(contracted_node_pred_completed(n));
+	pwtest_int_eq((int)n->pending_external_inputs, 0);
+
+	/* Arm a fresh cycle resets pending to required. */
+	pwtest_int_eq(contracted_node_arm_cycle(n), 0);
+	pwtest_int_eq((int)n->pending_external_inputs, 3);
+	pwtest_bool_false(contracted_node_ready_to_wake(n));
+
+	/* NULL-safety. */
+	pwtest_int_eq(contracted_node_set_required_external_inputs(NULL, 1),
+			-EINVAL);
+	pwtest_int_eq(contracted_node_arm_cycle(NULL), -EINVAL);
+	pwtest_bool_false(contracted_node_pred_completed(NULL));
+	pwtest_bool_false(contracted_node_ready_to_wake(NULL));
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_release_barrier_source_wakes_immediately)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 0), 0);
+
+	/* A graph source has zero external predecessors -- it wakes
+	 * with the driver activation. The barrier is a no-op. */
+	pwtest_int_eq(contracted_node_set_required_external_inputs(n, 0), 0);
+	pwtest_bool_true(contracted_node_ready_to_wake(n));
+
+	pwtest_int_eq(contracted_node_arm_cycle(n), 0);
+	pwtest_bool_true(contracted_node_ready_to_wake(n));
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST(contracted_observe_macro_completion_records_one_edge_per_cycle)
 {
 	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
@@ -1066,6 +1131,10 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_observe_macro_runtime_non_zero_residual, PWTEST_NOARG);
 	pwtest_add(contracted_observe_macro_runtime_null_and_zero, PWTEST_NOARG);
 	pwtest_add(contracted_observe_macro_completion_records_one_edge_per_cycle,
+			PWTEST_NOARG);
+	pwtest_add(contracted_release_barrier_counter_arms_decrements_wakes,
+			PWTEST_NOARG);
+	pwtest_add(contracted_release_barrier_source_wakes_immediately,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
