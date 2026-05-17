@@ -74,6 +74,9 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	cfg->risk_allocation       = RT_CONF_RISK_ALLOC_UNIFORM;
 	cfg->max_update_cost_ns    = 5000;
 	cfg->trace_export          = false;
+	cfg->burst_threshold       = 0;       /* extension off by default */
+	cfg->burst_penalty         = 1.0;
+	cfg->shift_burst_threshold = 8;
 }
 
 int rt_conformal_config_validate(const struct rt_conformal_config *cfg)
@@ -109,6 +112,8 @@ int rt_conformal_config_validate(const struct rt_conformal_config *cfg)
 	    !isfinite(cfg->ewma_location_lambda) ||
 	    !isfinite(cfg->ewma_scale_lambda) ||
 	    !isfinite(cfg->guard_percent))
+		return -EINVAL;
+	if (!(cfg->burst_penalty >= 1.0 && cfg->burst_penalty <= 1e6))
 		return -EINVAL;
 	return 0;
 }
@@ -342,16 +347,21 @@ void rt_conformal_invalidate(rt_conformal_t *e,
 
 /*
  * Internal: classify the state after an observation has updated the
- * counters. The state machine for Phase B is:
+ * counters. The state machine:
  *
+ *   DISABLED is sticky -- only rt_conformal_enable can clear it.
  *   samples_used == 0                                -> INSUFFICIENT_DATA
  *   samples_used < bootstrap_min_samples / 2         -> BOOTSTRAP
  *   ring_count   < bootstrap_min_samples / 2         -> BOOTSTRAP
+ *   current_overrun_burst >= shift_burst_threshold   -> SHIFT
  *   otherwise                                        -> VALID
  *
- * The SHIFT classification depends on the adaptive overrun-burst
- * threshold, which lands together with the alpha update in Phase C;
- * the SHIFT branch is unreachable in Phase B by construction.
+ * The SHIFT classification is a diagnostic surface: the alpha_eff
+ * update continues progressing while in SHIFT (it does not freeze).
+ * An operator can use the state as a signal to investigate
+ * sustained overruns; the typed reason vocabulary lets a future
+ * commit cross-reference SHIFT with the worker's
+ * "report-blocking-observation" path.
  */
 static void recompute_state(rt_conformal_t *e)
 {
@@ -370,6 +380,11 @@ static void recompute_state(rt_conformal_t *e)
 		e->state = RT_CONF_BOOTSTRAP;
 		return;
 	}
+	if (e->cfg.shift_burst_threshold > 0 &&
+	    e->current_overrun_burst >= e->cfg.shift_burst_threshold) {
+		e->state = RT_CONF_SHIFT;
+		return;
+	}
 	e->state = RT_CONF_VALID;
 }
 
@@ -386,6 +401,8 @@ bool rt_conformal_observe(rt_conformal_t *e, uint64_t runtime_ns)
 		return false;
 	e->samples_seen++;
 	if (runtime_ns == 0)
+		return false;
+	if (e->state == RT_CONF_DISABLED)
 		return false;
 
 	/*
@@ -454,15 +471,53 @@ bool rt_conformal_observe(rt_conformal_t *e, uint64_t runtime_ns)
 		budget_for_this = clamp_u64(b, e->cfg.runtime_floor_ns, 0);
 	}
 
-	/* Overrun on the budget that was active for activation t. */
-	if (runtime_ns > budget_for_this && budget_for_this > 0) {
-		e->overruns_seen++;
-		e->recent_overruns++;
-		e->current_overrun_burst++;
-		if (e->current_overrun_burst > e->max_overrun_burst)
-			e->max_overrun_burst = e->current_overrun_burst;
-	} else {
-		e->current_overrun_burst = 0;
+	/* Overrun on the budget that was active for activation t.
+	 * overrun_t in {0, 1} drives the adaptive alpha update below. */
+	{
+		bool overrun = runtime_ns > budget_for_this && budget_for_this > 0;
+		double overrun_t = overrun ? 1.0 : 0.0;
+		double step;
+		double new_alpha;
+
+		if (overrun) {
+			e->overruns_seen++;
+			e->recent_overruns++;
+			e->current_overrun_burst++;
+			if (e->current_overrun_burst > e->max_overrun_burst)
+				e->max_overrun_burst = e->current_overrun_burst;
+		} else {
+			e->current_overrun_burst = 0;
+		}
+
+		/*
+		 * Adaptive conformal inference update under distribution
+		 * shift (Gibbs & Candes 2021):
+		 *
+		 *   alpha_eff_{t+1} = alpha_eff_t
+		 *                    + eta * (alpha_target - overrun_t)
+		 *                    clamped to [alpha_min, alpha_max]
+		 *
+		 * Interpretation: a sample that exceeded budget_t pushes
+		 * alpha_eff downward (tighter next quantile, more
+		 * conservative); a non-overrun pushes it upward slowly.
+		 *
+		 * Optional burst-penalty extension: when the current
+		 * consecutive-overrun streak reaches the configured
+		 * threshold, the negative update is multiplied by
+		 * burst_penalty so the next quantile tightens faster.
+		 */
+		step = e->cfg.eta * (e->cfg.alpha_target - overrun_t);
+		if (overrun && e->cfg.burst_threshold > 0 &&
+		    e->current_overrun_burst >= e->cfg.burst_threshold &&
+		    e->cfg.burst_penalty > 1.0) {
+			step *= e->cfg.burst_penalty;
+		}
+		new_alpha = e->alpha_eff + step;
+		if (new_alpha < e->cfg.alpha_min)
+			new_alpha = e->cfg.alpha_min;
+		if (new_alpha > e->cfg.alpha_max)
+			new_alpha = e->cfg.alpha_max;
+		e->alpha_eff = new_alpha;
 	}
 
 	/* Insert (score, runtime) into the ring, then update the
@@ -635,4 +690,32 @@ rt_conformal_last_invalidation_reason(const rt_conformal_t *e)
 size_t rt_conformal_state_data_size(void)
 {
 	return sizeof(struct rt_conformal);
+}
+
+double rt_conformal_burst_penalty(const rt_conformal_t *e)
+{
+	return e ? e->cfg.burst_penalty : 1.0;
+}
+
+uint32_t rt_conformal_burst_threshold(const rt_conformal_t *e)
+{
+	return e ? e->cfg.burst_threshold : 0;
+}
+
+void rt_conformal_disable(rt_conformal_t *e)
+{
+	if (e == NULL)
+		return;
+	e->state = RT_CONF_DISABLED;
+}
+
+void rt_conformal_enable(rt_conformal_t *e)
+{
+	if (e == NULL)
+		return;
+	if (e->state == RT_CONF_DISABLED) {
+		e->state = e->samples_used > 0
+			? RT_CONF_BOOTSTRAP : RT_CONF_INSUFFICIENT_DATA;
+		recompute_state(e);
+	}
 }

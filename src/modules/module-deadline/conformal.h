@@ -172,6 +172,27 @@ struct rt_conformal_config {
 	enum rt_conformal_risk_allocation risk_allocation;
 	uint64_t max_update_cost_ns;
 	bool     trace_export;
+
+	/*
+	 * Optional burst-penalty extension. burst_threshold is the
+	 * consecutive-overrun count above which the alpha_eff
+	 * negative update is multiplied by burst_penalty. Defaults
+	 * keep the extension off (burst_penalty = 1.0); calibration
+	 * may enable it.
+	 */
+	uint32_t burst_threshold;
+	double   burst_penalty;
+
+	/*
+	 * SHIFT-state detector. When the most recent consecutive
+	 * overrun burst reaches shift_burst_threshold the estimator
+	 * transitions from VALID to SHIFT and the typed
+	 * invalidation reason RT_CONF_INVALIDATED_PLUGIN_MODE may
+	 * be stamped by the caller. The SHIFT branch is informational
+	 * for diagnostics; the alpha update still progresses (the
+	 * threshold is a hint, not a kill).
+	 */
+	uint32_t shift_burst_threshold;
 };
 
 /*
@@ -282,6 +303,26 @@ uint64_t rt_conformal_recent_overruns(const rt_conformal_t *e);
 uint64_t rt_conformal_max_overrun_burst(const rt_conformal_t *e);
 uint64_t rt_conformal_current_overrun_burst(const rt_conformal_t *e);
 double   rt_conformal_alpha_eff(const rt_conformal_t *e);
+
+/*
+ * Optional burst-penalty extension: when the current consecutive
+ * overrun burst reaches the configured threshold, the alpha_eff
+ * update is multiplied by burst_penalty so it tightens faster
+ * (Gibbs & Candes 2021 §4 motivates the asymmetric response). The
+ * extension is OFF by default (burst_penalty = 1.0); a calibration
+ * pass enables it only if it improves weakly-hard metrics.
+ */
+double   rt_conformal_burst_penalty(const rt_conformal_t *e);
+uint32_t rt_conformal_burst_threshold(const rt_conformal_t *e);
+
+/*
+ * Force the estimator into RT_CONF_DISABLED. Subsequent calls to
+ * rt_conformal_observe accept samples but do not contribute to the
+ * EWMA / ring; rt_conformal_budget returns 0 to signal "no
+ * conformal opinion". An operator opt-out hook.
+ */
+void rt_conformal_disable(rt_conformal_t *e);
+void rt_conformal_enable(rt_conformal_t *e);
 double   rt_conformal_mu_ns(const rt_conformal_t *e);
 double   rt_conformal_scale_ns(const rt_conformal_t *e);
 double   rt_conformal_last_prediction_ns(const rt_conformal_t *e);

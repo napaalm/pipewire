@@ -704,6 +704,299 @@ PWTEST(conformal_state_transitions_bootstrap_to_valid)
 	return PWTEST_PASS;
 }
 
+/* ---------------------------------------------------------------- */
+/* Section H: adaptive alpha update and drift detection.             */
+/* ---------------------------------------------------------------- */
+
+PWTEST(conformal_alpha_eff_decreases_on_overrun)
+{
+	/* A single overrun pushes alpha_eff down (more conservative
+	 * next quantile) by eta * (alpha_target - 1.0). The test uses
+	 * a small eta so the new value lands strictly below the
+	 * starting alpha_eff without saturating against alpha_min on
+	 * the first step. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	double a0, a1;
+
+	cfg.eta = 0.001; /* one overrun moves alpha by ~0.001 */
+	cfg.alpha_target = 0.01;
+	cfg.alpha_min = 1e-6;
+	cfg.alpha_max = 0.5;
+	cfg.bootstrap_runtime_ns = 5000;
+	cfg.runtime_floor_ns = 5000;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	a0 = rt_conformal_alpha_eff(e);
+	rt_conformal_observe(e, 5000000); /* huge: overruns bootstrap */
+	a1 = rt_conformal_alpha_eff(e);
+
+	pwtest_bool_true(a1 < a0);
+	pwtest_bool_true(a1 >= cfg.alpha_min);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_alpha_eff_increases_on_non_overrun)
+{
+	/* A non-overruning sample nudges alpha_eff upward by
+	 * eta * alpha_target (a slow positive drift). Starting from
+	 * alpha_target the value must end strictly above. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint32_t i;
+	double a;
+
+	cfg.eta = 0.1;
+	cfg.alpha_target = 0.01;
+	cfg.alpha_min = 1e-6;
+	cfg.alpha_max = 0.5;
+	cfg.bootstrap_runtime_ns = 200000; /* very loose, no overruns */
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 100; i++)
+		rt_conformal_observe(e, 40000); /* below 200k bootstrap */
+
+	a = rt_conformal_alpha_eff(e);
+	pwtest_bool_true(a > cfg.alpha_target);
+	pwtest_bool_true(a <= cfg.alpha_max);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_alpha_eff_clamps_to_min)
+{
+	/* Repeated overruns must not push alpha_eff below alpha_min. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint32_t i;
+
+	cfg.eta = 0.5; /* aggressive */
+	cfg.alpha_target = 0.01;
+	cfg.alpha_min = 0.001;
+	cfg.alpha_max = 0.5;
+	cfg.bootstrap_runtime_ns = 100; /* easy to overrun */
+	cfg.runtime_floor_ns = 100;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 1000; i++)
+		rt_conformal_observe(e, 10000000); /* always overrun */
+
+	pwtest_bool_true(rt_conformal_alpha_eff(e) >= cfg.alpha_min);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_alpha_eff_clamps_to_max)
+{
+	/* Repeated non-overruns must not push alpha_eff above
+	 * alpha_max. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint32_t i;
+
+	cfg.eta = 0.5;
+	cfg.alpha_target = 0.01;
+	cfg.alpha_min = 1e-6;
+	cfg.alpha_max = 0.05;
+	cfg.bootstrap_runtime_ns = 200000;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 5000; i++)
+		rt_conformal_observe(e, 40000);
+
+	pwtest_bool_true(rt_conformal_alpha_eff(e) <= cfg.alpha_max);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_max_overrun_burst_tracks_streak)
+{
+	/* A geometrically-growing sample stream coupled with an
+	 * artificially-large sigma_floor pegs the score-ring
+	 * contribution near zero (s = delta / (scale + huge) ~ 0),
+	 * which leaves the reconstructed budget at
+	 * mu_pred * (1 + guard_percent) + guard_ns. mu trails the
+	 * fast-growing stream, so every step overruns. The test pins
+	 * three properties: (i) the streak counter monotonically
+	 * advances under sustained overruns, (ii) max_overrun_burst
+	 * stays at the running max, (iii) a small sample (which
+	 * cannot overrun the inflated budget) resets the current
+	 * streak but does not lower max. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint32_t i;
+	uint64_t sample;
+	uint64_t streak_after_5;
+
+	cfg.sigma_floor_ns = (uint64_t)1e15; /* peg score at ~0 */
+	cfg.bootstrap_runtime_ns = 5000;
+	cfg.runtime_floor_ns = 5000;
+	cfg.ewma_location_lambda = 0.05;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	sample = 100000;
+	for (i = 0; i < 5; i++) {
+		rt_conformal_observe(e, sample);
+		sample = (uint64_t)((double)sample * 1.5);
+	}
+	streak_after_5 = rt_conformal_current_overrun_burst(e);
+	pwtest_bool_true(streak_after_5 >= 4);
+	pwtest_bool_true(rt_conformal_max_overrun_burst(e) >= streak_after_5);
+
+	/* A small sample below the inflated budget resets current
+	 * but max sticks. */
+	rt_conformal_observe(e, 5000);
+	pwtest_int_eq((int)rt_conformal_current_overrun_burst(e), 0);
+	pwtest_bool_true(rt_conformal_max_overrun_burst(e) >= streak_after_5);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_state_shifts_on_sustained_burst)
+{
+	/* When the consecutive-overrun streak reaches the configured
+	 * SHIFT threshold the state transitions to RT_CONF_SHIFT. The
+	 * test uses the same large-sigma_floor trick as the burst
+	 * counter test to keep the quantile contribution near zero so
+	 * the streak actually develops; then it confirms the state
+	 * classifier surfaces SHIFT. The alpha update is still
+	 * progressing in parallel -- the SHIFT state is informational,
+	 * not a kill. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint32_t i;
+	uint64_t sample;
+
+	cfg.sigma_floor_ns = (uint64_t)1e15;
+	cfg.shift_burst_threshold = 3;
+	cfg.bootstrap_runtime_ns = 5000;
+	cfg.runtime_floor_ns = 5000;
+	cfg.bootstrap_min_samples = 2;
+	cfg.ewma_location_lambda = 0.05;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < 50; i++)
+		rt_conformal_observe(e, 6000);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_VALID);
+
+	sample = 100000;
+	for (i = 0; i < 5; i++) {
+		rt_conformal_observe(e, sample);
+		sample = (uint64_t)((double)sample * 1.5);
+	}
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_SHIFT);
+
+	/* Once the streak is broken the state returns to VALID. */
+	rt_conformal_observe(e, 5000);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_VALID);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_disable_freezes_observation)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e = rt_conformal_create(&cfg);
+	uint64_t mu_before;
+	pwtest_ptr_notnull(e);
+
+	rt_conformal_observe(e, 50000);
+	rt_conformal_observe(e, 50000);
+	mu_before = (uint64_t)rt_conformal_mu_ns(e);
+
+	rt_conformal_disable(e);
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_DISABLED);
+
+	pwtest_bool_false(rt_conformal_observe(e, 200000));
+	/* mu must not move while disabled. */
+	pwtest_bool_true((uint64_t)rt_conformal_mu_ns(e) == mu_before);
+	pwtest_bool_true(rt_conformal_budget(e, 0) == 0);
+
+	rt_conformal_enable(e);
+	pwtest_bool_true(rt_conformal_state(e) != RT_CONF_DISABLED);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_burst_penalty_amplifies_negative_step)
+{
+	/* With burst_threshold = 3, burst_penalty = 10 and a stream
+	 * that produces a sustained overrun streak (the
+	 * large-sigma_floor trick), the alpha_eff step at and beyond
+	 * the threshold is much larger than the step before it. The
+	 * test inspects the diff before vs after the threshold trip
+	 * and asserts the post-threshold step is significantly larger.
+	 *
+	 * Because the alpha update is gated by alpha_min, choose the
+	 * floor low enough that the pre-threshold steps do not
+	 * saturate. */
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	double a0, a1, a2, a3, a4;
+	double pre_step;
+	double post_step;
+	uint64_t sample;
+
+	cfg.sigma_floor_ns = (uint64_t)1e15;
+	cfg.eta = 0.0001;
+	cfg.alpha_target = 0.4;
+	cfg.alpha_min = 1e-6;
+	cfg.alpha_max = 0.5;
+	cfg.bootstrap_runtime_ns = 5000;
+	cfg.runtime_floor_ns = 5000;
+	cfg.burst_threshold = 3;
+	cfg.burst_penalty = 100.0;
+	cfg.ewma_location_lambda = 0.05;
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	a0 = rt_conformal_alpha_eff(e);
+	sample = 100000;
+	rt_conformal_observe(e, sample); sample = (uint64_t)(sample * 1.5);
+	a1 = rt_conformal_alpha_eff(e);
+	rt_conformal_observe(e, sample); sample = (uint64_t)(sample * 1.5);
+	a2 = rt_conformal_alpha_eff(e);
+	rt_conformal_observe(e, sample); sample = (uint64_t)(sample * 1.5);
+	a3 = rt_conformal_alpha_eff(e); /* third overrun -> threshold met */
+	rt_conformal_observe(e, sample);
+	a4 = rt_conformal_alpha_eff(e); /* fourth overrun -> penalty applies */
+
+	pre_step  = a1 - a2; /* before threshold */
+	post_step = a3 - a4; /* threshold met -> amplified step */
+	(void)a0;
+	pwtest_bool_true(post_step > pre_step * 5.0);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_burst_penalty_validator_rejects_below_one)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.burst_penalty = 0.5;
+	pwtest_int_eq(rt_conformal_config_validate(&cfg), -EINVAL);
+	cfg.burst_penalty = -1.0;
+	pwtest_int_eq(rt_conformal_config_validate(&cfg), -EINVAL);
+	cfg.burst_penalty = 1.0;
+	pwtest_int_eq(rt_conformal_config_validate(&cfg), 0);
+	return PWTEST_PASS;
+}
+
 PWTEST(conformal_compatible_history_field_round_trips)
 {
 	/* compatible_history is a parsed boolean; defaults to true.
@@ -761,6 +1054,21 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_state_transitions_bootstrap_to_valid,
 			PWTEST_NOARG);
 	pwtest_add(conformal_compatible_history_field_round_trips,
+			PWTEST_NOARG);
+
+	pwtest_add(conformal_alpha_eff_decreases_on_overrun, PWTEST_NOARG);
+	pwtest_add(conformal_alpha_eff_increases_on_non_overrun,
+			PWTEST_NOARG);
+	pwtest_add(conformal_alpha_eff_clamps_to_min, PWTEST_NOARG);
+	pwtest_add(conformal_alpha_eff_clamps_to_max, PWTEST_NOARG);
+	pwtest_add(conformal_max_overrun_burst_tracks_streak,
+			PWTEST_NOARG);
+	pwtest_add(conformal_state_shifts_on_sustained_burst,
+			PWTEST_NOARG);
+	pwtest_add(conformal_disable_freezes_observation, PWTEST_NOARG);
+	pwtest_add(conformal_burst_penalty_amplifies_negative_step,
+			PWTEST_NOARG);
+	pwtest_add(conformal_burst_penalty_validator_rejects_below_one,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;
