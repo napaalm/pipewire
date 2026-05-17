@@ -150,7 +150,16 @@ void     mbpta_destroy(mbpta_t *e);
 /* Reasons the estimator key fingerprint can change. Surfaced
  * via mbpta_last_invalidation_reason for operator diagnostics --
  * a follower whose estimator keeps rebuilding gives the
- * operator a clear cause to investigate. */
+ * operator a clear cause to investigate.
+ *
+ * The PLUGIN_MODE reason covers any change to the plugin's
+ * internal configuration that materially changes the distribution
+ * of per-cycle execution times: a convolver impulse-response
+ * swap, a filter-chain bypass toggle, a synth polyphony cap, a
+ * resampler-quality switch. The runtime layer that detects such a
+ * change calls mbpta_invalidate_with_reason(e, ..._PLUGIN_MODE) so
+ * the next fit window starts after the old behaviour stops
+ * contributing samples. */
 enum mbpta_invalidation_reason {
 	MBPTA_INVALIDATED_NONE              = 0,
 	MBPTA_INVALIDATED_PERIOD            = 1,
@@ -158,6 +167,7 @@ enum mbpta_invalidation_reason {
 	MBPTA_INVALIDATED_TOPOLOGY_GENERATION = 3,
 	MBPTA_INVALIDATED_CPU_CLASS         = 4,
 	MBPTA_INVALIDATED_OPERATOR_REQUEST  = 5,
+	MBPTA_INVALIDATED_PLUGIN_MODE       = 6,
 };
 
 const char *mbpta_invalidation_reason_name(enum mbpta_invalidation_reason r);

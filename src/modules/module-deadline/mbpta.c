@@ -66,6 +66,7 @@ const char *mbpta_invalidation_reason_name(enum mbpta_invalidation_reason r)
 	case MBPTA_INVALIDATED_TOPOLOGY_GENERATION: return "topology_generation";
 	case MBPTA_INVALIDATED_CPU_CLASS:           return "cpu_class";
 	case MBPTA_INVALIDATED_OPERATOR_REQUEST:    return "operator_request";
+	case MBPTA_INVALIDATED_PLUGIN_MODE:         return "plugin_mode";
 	}
 	return "unknown";
 }

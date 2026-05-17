@@ -255,6 +255,38 @@ PWTEST(mbpta_invalidate_fusion_group_resets_and_tags_reason)
 	return PWTEST_PASS;
 }
 
+/* A plugin's internal mode/parameter change (convolver IR swap,
+ * filter-chain bypass toggle, synth polyphony cap, resampler
+ * quality switch) materially changes the per-cycle execution-time
+ * distribution. The runtime calls mbpta_invalidate_with_reason
+ * with the PLUGIN_MODE reason so the snapshot reports why the
+ * estimator started rebuilding instead of showing an unexplained
+ * INSUFFICIENT_DATA blip. This test pins the contract for that
+ * reason in isolation. */
+PWTEST(mbpta_invalidate_plugin_mode_resets_and_tags_reason)
+{
+	struct mbpta_config c = cfg_default();
+	mbpta_t *e = mbpta_create(&c);
+	uint32_t i;
+
+	pwtest_ptr_notnull(e);
+	for (i = 0; i < 2 * c.sample_window; i++)
+		mbpta_add_sample(e, 100 + (i % 31) * 3);
+	pwtest_bool_true(mbpta_sample_count(e) > 0);
+
+	mbpta_invalidate_with_reason(e, MBPTA_INVALIDATED_PLUGIN_MODE);
+	pwtest_int_eq((int)mbpta_sample_count(e), 0);
+	pwtest_int_eq(mbpta_state(e), MBPTA_INSUFFICIENT_DATA);
+	pwtest_int_eq(mbpta_last_invalidation_reason(e),
+			MBPTA_INVALIDATED_PLUGIN_MODE);
+	pwtest_str_eq(mbpta_invalidation_reason_name(
+				mbpta_last_invalidation_reason(e)),
+			"plugin_mode");
+
+	mbpta_destroy(e);
+	return PWTEST_PASS;
+}
+
 /* Drive an estimator to PWCET_VALID, then continuously feed
  * non-stationary data: after n_iid_reject consecutive evaluation
  * rounds with KS rejection the state moves to DRIFT (not back to
@@ -747,6 +779,8 @@ PWTEST_SUITE(module_deadline_mbpta)
 	pwtest_add(mbpta_distribution_shift_lands_iid_pending, PWTEST_NOARG);
 	pwtest_add(mbpta_invalidate_resets_state, PWTEST_NOARG);
 	pwtest_add(mbpta_invalidate_fusion_group_resets_and_tags_reason,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_invalidate_plugin_mode_resets_and_tags_reason,
 			PWTEST_NOARG);
 	pwtest_add(mbpta_drift_after_sustained_iid_rejection, PWTEST_NOARG);
 	pwtest_add(mbpta_non_gumbel_distribution_rejects_fit, PWTEST_NOARG);
