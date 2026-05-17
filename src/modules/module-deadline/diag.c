@@ -808,6 +808,7 @@ const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k)
 	case RT_DIAG_BUDGET_EMPIRICAL_QUANTILE: return "empirical_quantile";
 	case RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK: return "bootstrap_fallback";
 	case RT_DIAG_BUDGET_MANUAL_OVERRIDE:    return "manual_override";
+	case RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL: return "adaptive_conformal";
 	}
 	return "unknown";
 }

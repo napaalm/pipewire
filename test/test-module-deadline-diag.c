@@ -940,6 +940,8 @@ PWTEST(diag_budget_kind_names_stable)
 		      "bootstrap_fallback");
 	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_MANUAL_OVERRIDE),
 		      "manual_override");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL),
+		      "adaptive_conformal");
 	pwtest_str_eq(rt_diag_budget_kind_name((enum rt_diag_budget_kind)999),
 		      "unknown");
 	return PWTEST_PASS;

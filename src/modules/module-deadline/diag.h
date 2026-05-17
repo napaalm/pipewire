@@ -409,6 +409,16 @@ enum rt_diag_budget_kind {
 	RT_DIAG_BUDGET_EMPIRICAL_QUANTILE = 2,
 	RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK = 3,
 	RT_DIAG_BUDGET_MANUAL_OVERRIDE    = 4,
+	/*
+	 * Adaptive online upper-runtime budget calibrated to a target
+	 * overrun frequency via one-sided conformal prediction with an
+	 * EWMA location/scale base predictor (Romano, Patterson &
+	 * Candes 2019; Gibbs & Candes 2021). The published value is a
+	 * soft / weakly-hard bound (Bernat, Burns & Llamosi 2001), not
+	 * a deterministic WCET: strict hard-realtime operation still
+	 * requires manual / static / hybrid WCETs.
+	 */
+	RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL = 5,
 };
 
 const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k);
