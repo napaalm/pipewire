@@ -95,6 +95,7 @@ pipewire_module_combine_stream = shared_library('pipewire-module-combine-stream'
 
 pipewire_module_deadline = shared_library('pipewire-module-deadline',
   [ 'module-deadline.c',
+    'module-deadline/conformal.c',
     'module-deadline/contracted.c',
     'module-deadline/cpu_topology.c',
     'module-deadline/dag.c',

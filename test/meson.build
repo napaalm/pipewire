@@ -144,6 +144,15 @@ test('test-module-deadline-mbpta',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-conformal',
+    executable('test-module-deadline-conformal',
+               'test-module-deadline-conformal.c',
+               '../src/modules/module-deadline/conformal.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep, mathlib ],
+               link_with: pwtest_lib)
+)
+
 test('test-cpu-topology',
     executable('test-cpu-topology',
                'test-cpu-topology.c',
