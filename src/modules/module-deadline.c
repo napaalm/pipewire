@@ -3098,6 +3098,21 @@ static int populate_params_snapshot(struct impl *impl,
 				rt_conformal_last_invalidation_reason(c);
 		}
 
+		/*
+		 * Soft-mode budget_clipped / risk_objective_value
+		 * surfacing. The flag lives on the dag_node after
+		 * dag_soft_redistribute_deadlines; queried by id via
+		 * the reconcile state so we do not need to thread the
+		 * pointer through the snapshot path. The graph-level
+		 * objective is mirrored on every follower for parser
+		 * convenience -- the same number on every node in a
+		 * given snapshot.
+		 */
+		pn.budget_clipped = reconcile_state_node_budget_clipped(
+				drv->reconcile, n_iter->info.id);
+		pn.risk_objective_value =
+			reconcile_state_risk_objective(drv->reconcile);
+
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
 			return r;

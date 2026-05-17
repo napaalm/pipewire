@@ -972,11 +972,16 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			diag_fprintf_double(out, 6, n->conformal_last_score);
 			fprintf(out,
 				",\"last_budget_ns\":%llu,"
-				"\"last_invalidation_reason\":\"%s\"}}",
+				"\"last_invalidation_reason\":\"%s\"},"
+				"\"budget_clipped\":%s,"
+				"\"risk_objective_value\":",
 				(unsigned long long)n->conformal_last_budget_ns,
 				rt_conformal_invalidation_reason_name(
 					(enum rt_conformal_invalidation_reason)
-					n->conformal_last_invalidation_reason));
+					n->conformal_last_invalidation_reason),
+				n->budget_clipped ? "true" : "false");
+			diag_fprintf_double(out, 6, n->risk_objective_value);
+			fputc('}', out);
 		}
 	}
 	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is

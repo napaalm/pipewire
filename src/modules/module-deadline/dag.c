@@ -60,6 +60,7 @@ static void dag_invalidate_schedule(dag_t *g)
 		n->local_deadline = 0;
 		n->remaining_deadline = 0;
 		n->cpu = DAG_CPU_INVALID;
+		n->budget_clipped = false;
 	}
 }
 
@@ -459,6 +460,7 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->local_deadline = 0;
 	n->cpu = DAG_CPU_INVALID;
 	n->deadline_assigned = false;
+	n->budget_clipped = false;
 	spa_list_init(&n->outgoing);
 	spa_list_init(&n->incoming);
 	spa_list_append(&g->nodes, &n->link);
@@ -2629,6 +2631,341 @@ bool dag_compute_local_deadlines(dag_t *g)
 		}
 	}
 	return true;
+}
+
+/*
+ * Soft-mode deadline redistribution. The algorithm is a single pass
+ * along the topological order: for every real node compute the
+ * "cumulative WCET along the heaviest in-path" and the
+ * "cumulative WCET along the heaviest out-path", combine them into
+ * the longest path that traverses the node, and assign a cumulative
+ * deadline proportional to the in-path fraction of that path.
+ *
+ * The scratch arrays are sized at indexed_count so the pass is
+ * O(n + e) with no allocation after dag_recalculate has built the
+ * indexed-nodes cache. The function returns false on missing inputs
+ * or kernel-invalid output; the caller falls back to the existing
+ * apply-time clamp in that case.
+ */
+/*
+ * Internal topological-sort helper used by the soft-mode
+ * redistribution. The hard-mode analysis cache (indexed_nodes) may
+ * have been dropped by dag_invalidate_analysis when the splitter
+ * rejected the workload, so this helper builds its own dense order
+ * by Kahn's algorithm. Returns the order and node count in *out_*;
+ * the caller frees the returned arrays. Returns 0 on success or a
+ * negative errno on failure.
+ */
+static int dag_soft_topo_order(dag_t *g, dag_node_t ***out_order,
+		uint32_t *out_count)
+{
+	dag_node_t **order = NULL;
+	uint32_t   *indegree = NULL;
+	uint32_t   *queue = NULL;
+	uint32_t    n = 0;
+	uint32_t    head = 0, tail = 0;
+	uint32_t    produced = 0;
+	dag_node_t *node;
+
+	spa_list_for_each(node, &g->nodes, link)
+		n++;
+	if (n == 0)
+		return -EINVAL;
+
+	order = calloc(n, sizeof(*order));
+	indegree = calloc(n, sizeof(*indegree));
+	queue = calloc(n, sizeof(*queue));
+	if (order == NULL || indegree == NULL || queue == NULL) {
+		free(order); free(indegree); free(queue);
+		return -ENOMEM;
+	}
+
+	/* Assign dense indices and tally in-degree. */
+	{
+		uint32_t i = 0;
+		spa_list_for_each(node, &g->nodes, link) {
+			node->index = i;
+			indegree[i] = 0;
+			i++;
+		}
+	}
+	{
+		uint32_t i = 0;
+		spa_list_for_each(node, &g->nodes, link) {
+			dag_edge_t *e;
+			uint32_t d = 0;
+			spa_list_for_each(e, &node->incoming, dst_link)
+				d++;
+			indegree[i] = d;
+			if (d == 0)
+				queue[tail++] = i;
+			order[i] = node;
+			i++;
+		}
+	}
+
+	while (head < tail) {
+		uint32_t idx = queue[head++];
+		dag_node_t *m = order[idx];
+		dag_edge_t *e;
+		produced++;
+		spa_list_for_each(e, &m->outgoing, src_link) {
+			uint32_t di = e->dst->index;
+			if (indegree[di] > 0 && --indegree[di] == 0)
+				queue[tail++] = di;
+		}
+	}
+
+	free(indegree);
+	free(queue);
+
+	if (produced != n) {
+		free(order);
+		return -EINVAL; /* cycle */
+	}
+
+	/* Re-order `order[]` so positions 0..n-1 follow the dequeue
+	 * sequence. The queue array was indexing-into-order; to expose
+	 * the topological order we walk dequeue order and emit nodes
+	 * accordingly. Simpler: redo with a second pass. */
+	{
+		dag_node_t **topo = calloc(n, sizeof(*topo));
+		uint32_t   *indeg2 = calloc(n, sizeof(*indeg2));
+		uint32_t   *q2 = calloc(n, sizeof(*q2));
+		uint32_t    h = 0, t = 0;
+		uint32_t    out = 0;
+		if (topo == NULL || indeg2 == NULL || q2 == NULL) {
+			free(topo); free(indeg2); free(q2); free(order);
+			return -ENOMEM;
+		}
+		for (uint32_t i = 0; i < n; i++) {
+			dag_edge_t *e;
+			uint32_t d = 0;
+			spa_list_for_each(e, &order[i]->incoming, dst_link)
+				d++;
+			indeg2[i] = d;
+			if (d == 0)
+				q2[t++] = i;
+		}
+		while (h < t) {
+			uint32_t idx = q2[h++];
+			dag_edge_t *e;
+			topo[out++] = order[idx];
+			spa_list_for_each(e, &order[idx]->outgoing, src_link) {
+				uint32_t di = e->dst->index;
+				if (indeg2[di] > 0 && --indeg2[di] == 0)
+					q2[t++] = di;
+			}
+		}
+		free(indeg2);
+		free(q2);
+		free(order);
+		order = topo;
+	}
+
+	/* Refresh the per-node `index` field so it matches the
+	 * topological order positions. dag_compute_local_deadlines
+	 * does not depend on index, so this only matters for callers
+	 * that inspect the field directly. */
+	for (uint32_t i = 0; i < n; i++)
+		order[i]->index = i;
+
+	*out_order = order;
+	*out_count = n;
+	return 0;
+}
+
+bool dag_soft_redistribute_deadlines(dag_t *g,
+		double *out_objective,
+		uint32_t *out_clipped_count)
+{
+	dag_node_t **order = NULL;
+	uint64_t *in_path = NULL;
+	uint64_t *out_path = NULL;
+	uint64_t global_longest = 0;
+	uint32_t clipped = 0;
+	uint32_t n = 0;
+	double objective = 0.0;
+	uint64_t end_to_end;
+	int rc;
+
+	if (out_objective != NULL)
+		*out_objective = 0.0;
+	if (out_clipped_count != NULL)
+		*out_clipped_count = 0;
+	if (g == NULL) {
+		errno = EINVAL;
+		return false;
+	}
+
+	end_to_end = g->deadline != 0 ? g->deadline : g->period;
+	if (end_to_end == 0) {
+		errno = EINVAL;
+		return false;
+	}
+
+	rc = dag_soft_topo_order(g, &order, &n);
+	if (rc < 0) {
+		errno = -rc;
+		return false;
+	}
+
+	in_path  = calloc(n, sizeof(*in_path));
+	out_path = calloc(n, sizeof(*out_path));
+	if (in_path == NULL || out_path == NULL) {
+		free(order); free(in_path); free(out_path);
+		errno = ENOMEM;
+		return false;
+	}
+
+	/* Forward pass: cum_wcet along the heaviest in-path. */
+	for (uint32_t i = 0; i < n; i++) {
+		dag_node_t *node = order[i];
+		uint64_t best_pred = 0;
+		dag_edge_t *e;
+
+		if (node->fictitious) {
+			in_path[i] = 0;
+			continue;
+		}
+		spa_list_for_each(e, &node->incoming, dst_link) {
+			if (e->src->fictitious)
+				continue;
+			if (in_path[e->src->index] > best_pred)
+				best_pred = in_path[e->src->index];
+		}
+		in_path[i] = best_pred + node->wcet;
+	}
+
+	/* Backward pass: rem_wcet along the heaviest out-path. */
+	for (uint32_t i = n; i > 0; i--) {
+		uint32_t idx = i - 1;
+		dag_node_t *node = order[idx];
+		uint64_t best_succ = 0;
+		dag_edge_t *e;
+
+		if (node->fictitious) {
+			out_path[idx] = 0;
+			continue;
+		}
+		spa_list_for_each(e, &node->outgoing, src_link) {
+			if (e->dst->fictitious)
+				continue;
+			if (out_path[e->dst->index] > best_succ)
+				best_succ = out_path[e->dst->index];
+		}
+		out_path[idx] = best_succ + node->wcet;
+	}
+
+	/* Global longest path (through any node). */
+	for (uint32_t i = 0; i < n; i++) {
+		dag_node_t *node = order[i];
+		uint64_t l;
+		if (node->fictitious)
+			continue;
+		l = in_path[i] + out_path[i] - node->wcet;
+		if (l > global_longest)
+			global_longest = l;
+	}
+
+	if (global_longest == 0) {
+		free(order); free(in_path); free(out_path);
+		errno = EINVAL;
+		return false;
+	}
+
+	/* Proportional cumulative deadline assignment. */
+	for (uint32_t i = 0; i < n; i++) {
+		dag_node_t *node = order[i];
+		double frac;
+		uint64_t cum;
+
+		if (node->fictitious) {
+			node->cumulative_deadline = 0;
+			continue;
+		}
+		frac = (double)in_path[i] / (double)global_longest;
+		if (frac <= 0.0)
+			frac = 0.0;
+		if (frac > 1.0)
+			frac = 1.0;
+		cum = (uint64_t)((double)end_to_end * frac);
+		if (cum == 0)
+			cum = 1; /* keep strictly positive */
+		node->cumulative_deadline = cum;
+		node->deadline_assigned = true;
+	}
+
+	/* Refresh local_deadline directly: dag_compute_local_deadlines
+	 * walks g->indexed_nodes, which may not be built when the soft
+	 * heuristic runs after dag_recalculate has failed. Compute the
+	 * local deadline in place using the topological order we just
+	 * built. */
+	for (uint32_t i = 0; i < n; i++) {
+		dag_node_t *node = order[i];
+		uint64_t max_pred = 0;
+		dag_edge_t *e;
+		bool has_real_pred = false;
+
+		if (node->fictitious) {
+			node->local_deadline = 0;
+			continue;
+		}
+		spa_list_for_each(e, &node->incoming, dst_link) {
+			if (e->src->fictitious)
+				continue;
+			has_real_pred = true;
+			if (e->src->cumulative_deadline > max_pred)
+				max_pred = e->src->cumulative_deadline;
+		}
+		if (!has_real_pred) {
+			node->local_deadline = node->cumulative_deadline;
+		} else if (node->cumulative_deadline > max_pred) {
+			node->local_deadline = node->cumulative_deadline - max_pred;
+		} else {
+			node->local_deadline = 1; /* monotonicity violation:
+			                            fall back to a token
+			                            value; the apply path
+			                            will catch the clip. */
+		}
+		if (node->local_deadline > g->period)
+			node->local_deadline = g->period;
+	}
+
+	/* Mark clipped nodes and accumulate the risk-objective. */
+	for (uint32_t i = 0; i < n; i++) {
+		dag_node_t *node = order[i];
+		if (node->fictitious)
+			continue;
+		if (node->wcet > node->local_deadline) {
+			node->budget_clipped = true;
+			clipped++;
+			objective += (double)(node->wcet - node->local_deadline) /
+					(double)end_to_end;
+		} else {
+			node->budget_clipped = false;
+		}
+	}
+
+	free(order);
+	free(in_path);
+	free(out_path);
+
+	if (out_clipped_count != NULL)
+		*out_clipped_count = clipped;
+	if (out_objective != NULL)
+		*out_objective = objective;
+
+	return true;
+}
+
+bool dag_node_budget_clipped(const dag_t *g, uint32_t id)
+{
+	dag_node_t *n;
+	if (g == NULL)
+		return false;
+	n = dag_find_node((dag_t *)g, id);
+	return n != NULL && n->budget_clipped;
 }
 
 int dag_recalculate(dag_t *g)

@@ -3330,6 +3330,138 @@ PWTEST(unrelated_collapse_no_groups_matches_baseline)
 	return PWTEST_PASS;
 }
 
+PWTEST(soft_redistribute_chain_proportional)
+{
+	/* A chain A(100) -> B(200) -> C(300) with a 1000ns end-to-end
+	 * deadline gets cumulative deadlines proportional to the
+	 * cumulative WCET: A=100/600, B=300/600, C=600/600 of D.
+	 * Sum equals 1000ns. */
+	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
+	double obj = -1.0;
+	uint32_t clipped = 99;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 200, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
+	pwtest_int_eq((int)clipped, 0);
+	pwtest_bool_true(obj == 0.0);
+
+	{
+		dag_node_t *a = dag_find_node(g, 1);
+		dag_node_t *b = dag_find_node(g, 2);
+		dag_node_t *c = dag_find_node(g, 3);
+		pwtest_ptr_notnull(a);
+		pwtest_ptr_notnull(b);
+		pwtest_ptr_notnull(c);
+		/* A's cumulative ~= 100/600 * 1000 = 166ns. */
+		pwtest_bool_true(a->cumulative_deadline >= 150);
+		pwtest_bool_true(a->cumulative_deadline <= 200);
+		/* B's cumulative ~= 300/600 * 1000 = 500ns. */
+		pwtest_bool_true(b->cumulative_deadline >= 450);
+		pwtest_bool_true(b->cumulative_deadline <= 550);
+		/* C's cumulative = D = 1000. */
+		pwtest_int_eq((int)c->cumulative_deadline, 1000);
+		/* Local deadlines must satisfy wcet <= local <= period. */
+		pwtest_bool_true(a->wcet <= a->local_deadline);
+		pwtest_bool_true(b->wcet <= b->local_deadline);
+		pwtest_bool_true(c->wcet <= c->local_deadline);
+		pwtest_bool_false(dag_node_budget_clipped(g, 1));
+		pwtest_bool_false(dag_node_budget_clipped(g, 2));
+		pwtest_bool_false(dag_node_budget_clipped(g, 3));
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_overload_clips_nodes)
+{
+	/* A chain A(800) -> B(500) -> C(300) with end-to-end 1000ns
+	 * cannot fit: path sum 1600 > 1000. The hard-mode splitter
+	 * (dag_recalculate) refuses the workload; the soft-mode
+	 * heuristic runs directly on the DAG and produces a clipped
+	 * proportional assignment. A's wcet (800) > local (500) means
+	 * the budget got clipped against the redistributed deadline;
+	 * the objective records the overflow as a unitless fraction
+	 * of the end-to-end deadline. */
+	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
+	double obj = -1.0;
+	uint32_t clipped = 0;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 800, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 500, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	/* dag_recalculate is expected to refuse this workload; the
+	 * soft heuristic must work on the un-analysed DAG. */
+	(void)dag_recalculate(g);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
+	pwtest_bool_true(clipped >= 1);
+	pwtest_bool_true(obj > 0.0);
+	pwtest_bool_true(dag_node_budget_clipped(g, 1));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_diamond_keeps_monotonicity)
+{
+	/* A diamond A -> B -> D, A -> C -> D with A=B=C=D=100 (so
+	 * path sum 300, longest 300). The redistribution must keep
+	 * cumulative_deadline monotonic along every edge. */
+	dag_t *g = dag_create(1200, 1200, 1.0, 4, NULL);
+	double obj = -1.0;
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
+	pwtest_int_eq(dag_add_node(g, 2, 100, 1002, false), 0);
+	pwtest_int_eq(dag_add_node(g, 3, 100, 1003, false), 0);
+	pwtest_int_eq(dag_add_node(g, 4, 100, 1004, false), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, NULL));
+
+	{
+		dag_node_t *a = dag_find_node(g, 1);
+		dag_node_t *b = dag_find_node(g, 2);
+		dag_node_t *c = dag_find_node(g, 3);
+		dag_node_t *d = dag_find_node(g, 4);
+		pwtest_ptr_notnull(a);
+		pwtest_ptr_notnull(b);
+		pwtest_ptr_notnull(c);
+		pwtest_ptr_notnull(d);
+		pwtest_bool_true(a->cumulative_deadline <= b->cumulative_deadline);
+		pwtest_bool_true(a->cumulative_deadline <= c->cumulative_deadline);
+		pwtest_bool_true(b->cumulative_deadline <= d->cumulative_deadline);
+		pwtest_bool_true(c->cumulative_deadline <= d->cumulative_deadline);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(soft_redistribute_rejects_invalid_inputs)
+{
+	double obj;
+	uint32_t clipped;
+	pwtest_bool_false(dag_soft_redistribute_deadlines(NULL, &obj, &clipped));
+	pwtest_bool_false(dag_node_budget_clipped(NULL, 0));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(explicit_deadline_fields_populated_after_recalc, PWTEST_NOARG);
@@ -3435,6 +3567,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(unrelated_collapse_group_relation_via_non_rep_member, PWTEST_NOARG);
 	pwtest_add(unrelated_collapse_mixed_grouped_and_ungrouped, PWTEST_NOARG);
 	pwtest_add(unrelated_collapse_no_groups_matches_baseline, PWTEST_NOARG);
+
+	pwtest_add(soft_redistribute_chain_proportional, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_overload_clips_nodes, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_diamond_keeps_monotonicity, PWTEST_NOARG);
+	pwtest_add(soft_redistribute_rejects_invalid_inputs, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

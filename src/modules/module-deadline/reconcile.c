@@ -53,6 +53,23 @@ struct reconcile_state {
 	 * the semantics of mode / consecutive_hard_passes and the
 	 * hysteresis contract. */
 	struct reconcile_feasibility feas;
+
+	/*
+	 * Soft-mode redistribution surfacing. Refreshed on every
+	 * reconcile_dispatch_contracted call:
+	 *   * `last_risk_objective` is the aggregate clipped-runtime
+	 *     fraction returned by dag_soft_redistribute_deadlines on
+	 *     the macro DAG; zero in HARD mode.
+	 *   * `clipped_followers` is a sorted ascending array of the
+	 *     follower IDs whose macro-node was budget-clipped after
+	 *     the redistribution. Lookups go through
+	 *     reconcile_state_node_budget_clipped (bsearch). Empty
+	 *     between passes; reallocated geometrically.
+	 */
+	double    last_risk_objective;
+	uint32_t *clipped_followers;
+	uint32_t  n_clipped_followers;
+	uint32_t  cap_clipped_followers;
 };
 
 #define RECONCILE_FAILURE_BACKOFF 16u
@@ -102,6 +119,71 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 bool reconcile_state_has_persistent_dag(const reconcile_state_t *state)
 {
 	return state != NULL && state->persistent && state->dag != NULL;
+}
+
+bool reconcile_state_node_budget_clipped(
+		const reconcile_state_t *state, uint32_t follower_id)
+{
+	uint32_t lo, hi;
+	if (state == NULL || state->clipped_followers == NULL)
+		return false;
+	lo = 0;
+	hi = state->n_clipped_followers;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		uint32_t v = state->clipped_followers[mid];
+		if (v < follower_id)
+			lo = mid + 1;
+		else if (v > follower_id)
+			hi = mid;
+		else
+			return true;
+	}
+	return false;
+}
+
+double reconcile_state_risk_objective(const reconcile_state_t *state)
+{
+	return state ? state->last_risk_objective : 0.0;
+}
+
+static void clipped_followers_reset(reconcile_state_t *state)
+{
+	if (state == NULL)
+		return;
+	state->n_clipped_followers = 0;
+}
+
+static int clipped_followers_add_sorted(reconcile_state_t *state,
+		uint32_t id)
+{
+	uint32_t lo = 0, hi = state->n_clipped_followers;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (state->clipped_followers[mid] < id)
+			lo = mid + 1;
+		else if (state->clipped_followers[mid] > id)
+			hi = mid;
+		else
+			return 0; /* already present */
+	}
+	if (state->n_clipped_followers == state->cap_clipped_followers) {
+		uint32_t new_cap = state->cap_clipped_followers > 0
+			? state->cap_clipped_followers * 2u : 8u;
+		uint32_t *new_buf = realloc(state->clipped_followers,
+				(size_t)new_cap * sizeof(*new_buf));
+		if (new_buf == NULL)
+			return -ENOMEM;
+		state->clipped_followers = new_buf;
+		state->cap_clipped_followers = new_cap;
+	}
+	memmove(&state->clipped_followers[lo + 1],
+			&state->clipped_followers[lo],
+			(size_t)(state->n_clipped_followers - lo) *
+				sizeof(*state->clipped_followers));
+	state->clipped_followers[lo] = id;
+	state->n_clipped_followers++;
+	return 0;
 }
 
 uint32_t reconcile_state_node_required_external_inputs(
@@ -185,6 +267,7 @@ void reconcile_fini(reconcile_state_t *state)
 		return;
 	reconcile_drop(state);
 	free(state->relative_capacity);
+	free(state->clipped_followers);
 	free(state);
 }
 
@@ -852,6 +935,60 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		}
 
 		state->feas = f;
+	}
+
+	/*
+	 * Risk-aware deadline redistribution. In SOFT_DEGRADED mode
+	 * rewrite the macro-node cumulative and local deadlines so a
+	 * proportional share of the end-to-end budget is granted to
+	 * every node along its critical path -- a Sarkar 1989-style
+	 * critical-path split adapted to the soft case where the
+	 * total path work may exceed the end-to-end deadline. Nodes
+	 * whose wcet still exceeds their redistributed local deadline
+	 * after the rewrite are marked budget_clipped so the
+	 * follower-level diagnostic surfaces the bottleneck.
+	 *
+	 * The function returns false if the macro-DAG has degenerate
+	 * topology (no real nodes or a zero longest path); the per-CPU
+	 * scaling pass below stays as the always-on safety net.
+	 */
+	clipped_followers_reset(state);
+	state->last_risk_objective = 0.0;
+	if (state->feas.mode == RECONCILE_MODE_SOFT_DEGRADED) {
+		double obj = 0.0;
+		uint32_t clipped = 0;
+		if (dag_soft_redistribute_deadlines(macro_dag, &obj,
+					&clipped)) {
+			pw_log_debug("reconcile: soft redistribution "
+					"objective=%.6f clipped_nodes=%u",
+					obj, clipped);
+			/* Push the rewritten deadlines back into the
+			 * contracted_node side-table so the per-follower
+			 * emission below picks up the new values. */
+			contracted_dag_apply_dag_schedule(cg, macro_dag);
+			state->last_risk_objective = obj;
+			if (clipped > 0) {
+				dag_node_t *macro_n;
+				spa_list_for_each(macro_n, &macro_dag->nodes, link) {
+					contracted_node_t *cn;
+					const struct contracted_member *m;
+					if (macro_n->fictitious)
+						continue;
+					if (!macro_n->budget_clipped)
+						continue;
+					cn = contracted_owner(cg, macro_n->id);
+					if (cn == NULL)
+						continue;
+					/* Every follower in this macro
+					 * shares the clipped flag. */
+					spa_list_for_each(m, &cn->members,
+							link) {
+						(void)clipped_followers_add_sorted(
+							state, m->id);
+					}
+				}
+			}
+		}
 	}
 
 	/* Per-CPU soft-redistribution scaling. In SOFT_DEGRADED mode

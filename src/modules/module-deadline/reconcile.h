@@ -161,6 +161,27 @@ uint32_t reconcile_state_node_required_external_inputs(
 		const reconcile_state_t *state, uint32_t follower_id);
 
 /*
+ * Per-follower budget-clipped indicator. Returns true iff the
+ * soft-mode risk-aware redistribution had to cap the follower's
+ * wcet against its assigned local deadline. False on NULL state,
+ * unknown follower id, or before any soft pass has run. Surfaced
+ * via the JSON snapshot so an operator can identify the
+ * bottleneck on a soft-degraded graph.
+ */
+bool reconcile_state_node_budget_clipped(
+		const reconcile_state_t *state, uint32_t follower_id);
+
+/*
+ * Graph-level risk-objective aggregate from the last soft-mode
+ * redistribution. Returns 0.0 in hard mode and when the heuristic
+ * has not been run. A positive value indicates the heuristic
+ * clipped one or more nodes; the unit is "wcet overflow per
+ * end-to-end deadline" summed across clipped followers. Surfaced
+ * verbatim on every per-follower diagnostic.
+ */
+double reconcile_state_risk_objective(const reconcile_state_t *state);
+
+/*
  * Free everything reconcile_init allocated, plus any persistent
  * DAG state. Safe to call on a NULL pointer. Called by module-
  * deadline.c at driver_removed and module_destroy; no other

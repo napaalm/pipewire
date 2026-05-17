@@ -111,6 +111,18 @@ struct dag_node {
 	bitset_t *successors;
 
 	bool deadline_assigned;
+
+	/*
+	 * Set by dag_soft_redistribute_deadlines when the heuristic
+	 * had to cap the node's effective runtime against its assigned
+	 * local deadline because the path-level workload exceeded the
+	 * end-to-end budget. A clipped node is expected to xrun under
+	 * sustained load; the operator-facing JSON surface reports the
+	 * flag so a follower-level diagnostic identifies the bottleneck.
+	 * Cleared on every dag_invalidate_analysis pass (so a recalc
+	 * that finds the graph hard-feasible again returns false here).
+	 */
+	bool budget_clipped;
 };
 
 struct dag_edge {
@@ -357,6 +369,75 @@ bool dag_dbf_feasible(const dag_t *g,
  * contracted-DAG callers invoke it directly.
  */
 bool dag_compute_local_deadlines(dag_t *g);
+
+/*
+ * Soft-mode deadline redistribution heuristic.
+ *
+ * When the hard-mode assignment cannot satisfy the kernel SCHED_DEADLINE
+ * contract for every node (because the total work exceeds the
+ * end-to-end deadline or the per-CPU density does), the existing
+ * apply path clamps each follower's runtime to a fraction of its
+ * kernel deadline and proceeds in soft-degraded mode. That single
+ * clamp does not move slack around the graph: low-pressure nodes
+ * keep their generous deadlines, high-pressure nodes get crammed.
+ *
+ * This function redistributes slack across the contracted DAG in a
+ * deterministic single pass:
+ *
+ *   1. For every node compute the "pressure" ratio
+ *
+ *          p_v = wcet_v / cumulative_deadline_v
+ *
+ *      so a node well below its milestone has p < 1 and a node at
+ *      its limit has p ~ 1. Pressure above 1 indicates the
+ *      assignment was infeasible for that node already.
+ *
+ *   2. Walk the longest paths in topological order. On each path
+ *      compute the available end-to-end deadline (g->deadline,
+ *      capped at g->period) and the sum of wcets along the path.
+ *      If the path sum exceeds the deadline the assignment is
+ *      hopelessly infeasible -- mark every node on the path
+ *      `budget_clipped` and proceed (the caller will clamp the
+ *      kernel runtime down to the deadline; xruns are expected).
+ *
+ *   3. Otherwise redistribute the path deadline proportional to
+ *      wcet so each node receives a cumulative deadline that
+ *      equalises pressure along the path:
+ *
+ *          new_cumulative_v = (path_deadline) * (cum_wcet_v / path_wcet)
+ *
+ *      with cum_wcet_v = sum of wcet of predecessors-on-path plus
+ *      wcet_v. Monotonicity along every edge is preserved because
+ *      cum_wcet is non-decreasing along the path.
+ *
+ *   4. Run dag_compute_local_deadlines to refresh the kernel-side
+ *      local_deadline values.
+ *
+ * The `out_objective` argument receives an aggregate risk-objective
+ * value -- the sum of clamped runtimes divided by the path deadline,
+ * a unitless quantity an operator can log alongside the
+ * hard-guarantee-dropped warning -- when non-NULL. The
+ * `out_clipped_count` argument receives the number of nodes whose
+ * runtime was clipped against the path deadline.
+ *
+ * Returns true if the redistribution converged to a kernel-valid
+ * assignment (every node satisfies wcet <= local_deadline <= period
+ * after the rewrite) and false otherwise. On false return the caller
+ * keeps running in soft-degraded mode with the cap-against-deadline
+ * fallback the apply path already applies.
+ */
+bool dag_soft_redistribute_deadlines(dag_t *g,
+		double *out_objective,
+		uint32_t *out_clipped_count);
+
+/*
+ * Per-node "budget clipped" indicator after dag_soft_redistribute_deadlines.
+ * Returns true iff the heuristic had to cap node `id`'s wcet against
+ * its assigned local deadline because the assignment could not
+ * accommodate the full estimate. Returns false on unknown id, on
+ * NULL dag, or before any redistribution has run.
+ */
+bool dag_node_budget_clipped(const dag_t *g, uint32_t id);
 
 /* Return true if the DAG currently contains a cycle. Walks the
  * graph independently of the indexed-nodes cache so the caller may
