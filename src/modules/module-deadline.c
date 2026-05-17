@@ -514,6 +514,25 @@ struct node {
 	 * arrives (lazy init). */
 	mbpta_t  *mbpta;
 
+	/* Adaptive-conformal upper-runtime-budget estimator
+	 * (Romano, Patterson & Candes 2019; Gibbs & Candes 2021).
+	 * Runs alongside MBPTA and the t-digest on the same
+	 * reference-CPU-normalised sample stream; publishes a soft
+	 * / weakly-hard (Bernat, Burns & Llamosi 2001) one-sided
+	 * budget. The runtime selection predicate prefers this
+	 * estimator over MBPTA by default; MBPTA only drives the
+	 * kernel runtime when the operator opts in via
+	 * deadline.mbpta.accept_probabilistic_hard. NULL until the
+	 * first sample arrives (lazy init). */
+	rt_conformal_t *conformal;
+
+	/* Per-follower budget kind chosen by runtime_select_for_node
+	 * on the most recent sample. Surfaced in the JSON snapshot so
+	 * an operator can audit which source drove this cycle's
+	 * kernel runtime. */
+	enum rt_diag_budget_kind budget_kind;
+	uint64_t                 budget_sample_count;
+
 	/* Last-applied SCHED_DEADLINE tuple. Used by sched_cb to skip
 	 * a sched_setattr+sched_setaffinity pair when the four
 	 * components (runtime, deadline, period, cpu) all match the
@@ -903,6 +922,10 @@ static void module_destroy(void *data)
 			mbpta_destroy(n->mbpta);
 			n->mbpta = NULL;
 		}
+		if (n->conformal != NULL) {
+			rt_conformal_destroy(n->conformal);
+			n->conformal = NULL;
+		}
 		free(n->ring_slots);
 		free(n->topo.nodes);
 		free(n->topo.edges);
@@ -1118,10 +1141,13 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		 * (last_fusion_group_seen = false) records the leader
 		 * without invalidating; subsequent passes compare. */
 		if (mn->last_fusion_group_seen &&
-		    mn->last_fusion_group_leader != fusion_group_leader_id &&
-		    mn->mbpta != NULL) {
-			mbpta_invalidate_with_reason(mn->mbpta,
-					MBPTA_INVALIDATED_FUSION_GROUP);
+		    mn->last_fusion_group_leader != fusion_group_leader_id) {
+			if (mn->mbpta != NULL)
+				mbpta_invalidate_with_reason(mn->mbpta,
+						MBPTA_INVALIDATED_FUSION_GROUP);
+			if (mn->conformal != NULL)
+				rt_conformal_invalidate(mn->conformal,
+						RT_CONF_INVALIDATED_FUSION_GROUP);
 		}
 		mn->last_fusion_group_leader = fusion_group_leader_id;
 		mn->last_fusion_group_seen = true;
@@ -1736,6 +1762,166 @@ static inline double wcet_sample_to_reference(struct impl *impl,
 	return (double)runtime * rc;
 }
 
+/*
+ * Pure predicate that walks the runtime budget-source hierarchy and
+ * returns the kind that should drive the kernel runtime for this
+ * follower this cycle, along with the value (in reference-CPU ns)
+ * and the sample count that backs it. The hierarchy is fixed:
+ *
+ *   1. RT_DIAG_BUDGET_MANUAL_OVERRIDE -- per-node operator override
+ *      (no plumbing yet; reserved for a future per-node property).
+ *      Always wins when set.
+ *   2. RT_DIAG_BUDGET_DETERMINISTIC_WCET -- a hard static bound
+ *      supplied by the plugin (no plumbing yet; reserved for a
+ *      future plugin attribute). Used when the plugin exports it.
+ *   3. RT_DIAG_BUDGET_PWCET -- MBPTA tail extrapolation. Only
+ *      considered when the operator has explicitly opted in via
+ *      deadline.mbpta.accept_probabilistic_hard=true; the MBPTA
+ *      estimator must additionally be PWCET_VALID. By default
+ *      MBPTA is telemetry-only and this branch never fires.
+ *   4. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- adaptive-conformal
+ *      one-sided upper budget. Used when the conformal estimator
+ *      is in RT_CONF_VALID (or SHIFT, since SHIFT is still
+ *      publishable; the diagnostic surface flags the drift).
+ *   5. RT_DIAG_BUDGET_EMPIRICAL_QUANTILE -- t-digest sketch quantile
+ *      once sample count >= sketch_min_samples. Soft-real-time
+ *      estimate only (Dunning & Ertl 2019 does not produce a
+ *      worst-case bound).
+ *   6. RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK -- peak-hold of observed
+ *      samples while the higher-provenance sources are not yet
+ *      ready. Always defined.
+ *
+ * The operator can constrain the hierarchy via deadline.budget.source:
+ * BUDGET_SOURCE_BOOTSTRAP always returns peak-hold; the manual /
+ * deterministic / mbpta / empirical_quantile / adaptive_conformal
+ * values skip the kinds above the requested one. BUDGET_SOURCE_AUTO
+ * (the default) walks the full hierarchy. The MBPTA branch is
+ * additionally gated by the opt-in flag regardless of
+ * budget_source.
+ *
+ * Pure function: no PipeWire side effects, no global state mutation.
+ * sample_ref is the reference-CPU-normalised most-recent sample;
+ * peak_hold is the running maximum observed so far in the same
+ * normalisation. Both are uint64 ns. period_ns is forwarded so a
+ * future deterministic-bound source can refuse a budget > period.
+ */
+struct runtime_select_result {
+	enum rt_diag_budget_kind kind;
+	uint64_t                 value_ns;
+	uint64_t                 sample_count;
+};
+
+static struct runtime_select_result runtime_select_for_node(
+		const struct impl *impl,
+		struct node *n,
+		uint64_t sample_ref,
+		uint64_t peak_hold,
+		uint64_t period_ns SPA_UNUSED)
+{
+	struct runtime_select_result r = {
+		.kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK,
+		.value_ns = SPA_MAX(peak_hold, sample_ref),
+		.sample_count = 0,
+	};
+	enum rt_budget_source pref = impl->budget_source;
+
+	/*
+	 * Per-node manual override hook. No plugin property is wired
+	 * to it yet; once a per-node deadline.manual_override.runtime_ns
+	 * property exists this branch picks it up. Manual override
+	 * always wins.
+	 */
+	if (false /* placeholder until per-node property lands */) {
+		r.kind = RT_DIAG_BUDGET_MANUAL_OVERRIDE;
+		return r;
+	}
+	if (pref == BUDGET_SOURCE_MANUAL)
+		return r;
+
+	/*
+	 * Per-node deterministic WCET hook. No plugin attribute is
+	 * wired to it yet; reserved for a future PW_KEY_NODE_WCET_NS
+	 * or equivalent.
+	 */
+	if (false /* placeholder until plugin attribute lands */) {
+		r.kind = RT_DIAG_BUDGET_DETERMINISTIC_WCET;
+		return r;
+	}
+	if (pref == BUDGET_SOURCE_DETERMINISTIC)
+		return r;
+
+	/*
+	 * MBPTA pWCET. Only considered when the operator has opted in
+	 * AND the estimator is PWCET_VALID. The hierarchy step is
+	 * skipped when budget_source restricts further.
+	 */
+	if (n->mbpta != NULL && impl->mbpta_accept_probabilistic_hard &&
+	    mbpta_runtime_uses_pwcet(mbpta_state(n->mbpta), true) &&
+	    (pref == BUDGET_SOURCE_AUTO || pref == BUDGET_SOURCE_MBPTA)) {
+		uint64_t p = mbpta_pwcet_ns(n->mbpta);
+		r.kind = RT_DIAG_BUDGET_PWCET;
+		r.value_ns = SPA_MAX(p, sample_ref);
+		r.sample_count = mbpta_sample_count(n->mbpta);
+		return r;
+	}
+	if (pref == BUDGET_SOURCE_MBPTA) {
+		/* Operator requested MBPTA but its gate is not open. Fall
+		 * through to the next layer rather than returning a stale
+		 * value; the JSON diagnostic surfaces the actual kind so
+		 * the operator can see that the request was downgraded. */
+	}
+
+	/*
+	 * Adaptive-conformal upper budget. Used when the estimator
+	 * has cleared bootstrap (state == VALID, SHIFT). SHIFT is
+	 * still publishable: the value remains a valid one-sided
+	 * bound; the drift flag rides in the diagnostic surface.
+	 */
+	if (n->conformal != NULL &&
+	    (pref == BUDGET_SOURCE_AUTO ||
+	     pref == BUDGET_SOURCE_ADAPTIVE_CONFORMAL)) {
+		enum rt_conformal_state cs = rt_conformal_state(n->conformal);
+		if (cs == RT_CONF_VALID || cs == RT_CONF_SHIFT) {
+			uint64_t c = rt_conformal_budget(n->conformal, 0);
+			if (c > 0) {
+				r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
+				r.value_ns = SPA_MAX(c, sample_ref);
+				r.sample_count = rt_conformal_samples_used(n->conformal);
+				return r;
+			}
+		}
+	}
+	/* If the operator requested adaptive_conformal explicitly and
+	 * the estimator is not yet ready, the predicate falls through
+	 * to the lower layers rather than holding the budget back. */
+
+	/*
+	 * Empirical-quantile sketch (t-digest). Soft-real-time
+	 * provenance only; available once enough samples have been
+	 * digested.
+	 */
+	if (n->sketch_ready &&
+	    (pref == BUDGET_SOURCE_AUTO ||
+	     pref == BUDGET_SOURCE_EMPIRICAL_QUANTILE ||
+	     pref == BUDGET_SOURCE_ADAPTIVE_CONFORMAL ||
+	     pref == BUDGET_SOURCE_MBPTA)) {
+		uint32_t count = wcet_sketch_count(&n->sketch);
+		if (count >= impl->sketch_min_samples) {
+			double q = wcet_sketch_quantile(&n->sketch);
+			if (q > 0.0 && q < (double)UINT64_MAX) {
+				r.kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
+				r.value_ns = SPA_MAX((uint64_t)q, sample_ref);
+				r.sample_count = count;
+				return r;
+			}
+		}
+		r.sample_count = count;
+	}
+
+	/* Bootstrap fallback: keep peak-hold value (default of r). */
+	return r;
+}
+
 /* Apply one sample to a follower's estimator. Worker-thread or RT-
  * thread (in sync mode); never both for a given node. sample_cpu is
  * the placement CPU the follower ran on; cycles is the
@@ -1774,6 +1960,9 @@ static void apply_sample(struct impl *impl, struct node *n,
 		if (n->mbpta != NULL)
 			mbpta_invalidate_with_reason(n->mbpta,
 					MBPTA_INVALIDATED_PERIOD);
+		if (n->conformal != NULL)
+			rt_conformal_invalidate(n->conformal,
+					RT_CONF_INVALIDATED_PERIOD);
 		n->wcet = 0;
 	}
 
@@ -1804,6 +1993,18 @@ static void apply_sample(struct impl *impl, struct node *n,
 				n->node ? n->node->info.id : (uint32_t)-1);
 	}
 
+	/* Lazy-init the adaptive-conformal estimator with the module's
+	 * configured knobs. The estimator runs unconditionally so the
+	 * conformal-source path is available the moment its state
+	 * machine clears bootstrap; runtime_select_for_node gates
+	 * whether its output reaches the kernel runtime field. */
+	if (n->conformal == NULL) {
+		n->conformal = rt_conformal_create(&impl->conformal_cfg);
+		if (n->conformal == NULL)
+			pw_log_warn("node %d: conformal estimator init failed",
+				n->node ? n->node->info.id : (uint32_t)-1);
+	}
+
 	/* Prefer cycles when available: they are frequency-invariant
 	 * by construction and yield a precise reference-CPU WCET
 	 * without the assume-max inflation. */
@@ -1822,47 +2023,25 @@ static void apply_sample(struct impl *impl, struct node *n,
 	if (runtime > 0 && n->mbpta != NULL && sample_ref > 0.0)
 		(void)mbpta_add_sample(n->mbpta, (uint64_t)sample_ref);
 
-	/* Budget source selection, in declining order of provenance
-	 * strength (Cucu-Grosjean et al. 2012 §III):
-	 *
-	 *   1. MBPTA pWCET when the per-node estimator is
-	 *      PWCET_VALID and the operator has opted in via
-	 *      deadline.mbpta.accept_probabilistic_hard. This is
-	 *      the strongest claim the implementation produces --
-	 *      a tail-extrapolated bound at the configured
-	 *      exceedance probability eps_node.
-	 *   2. Sketch empirical quantile once the bootstrap-min
-	 *      gate has cleared. The result is a soft-real-time
-	 *      estimate only (Dunning & Ertl 2019 does not produce
-	 *      a worst-case bound).
-	 *   3. Peak-hold of the most recent sample when neither
-	 *      estimator is ready -- the bootstrap fallback.
-	 *
-	 * The peak-hold floor stays as a lower bound even when an
-	 * estimator is publishing, so a single spike that the
-	 * estimator has not yet incorporated still raises the
-	 * kernel runtime in the next cycle. */
-	if (n->mbpta != NULL &&
-	    mbpta_runtime_uses_pwcet(mbpta_state(n->mbpta),
-			    impl->mbpta_accept_probabilistic_hard)) {
-		uint64_t p = mbpta_pwcet_ns(n->mbpta);
-		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
-			(uint64_t)sample_ref : 0;
-		n->wcet = SPA_MAX(p, sample_ref_u64);
-	} else if (!n->sketch_ready ||
-	    wcet_sketch_count(&n->sketch) < impl->sketch_min_samples) {
-		/* Peak-hold fallback. n->wcet is stored in reference-CPU
-		 * units so it lines up with the sketch's eventual output;
-		 * sched_cb denormalises before sched_setattr. */
-		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
-			(uint64_t)sample_ref : 0;
-		n->wcet = SPA_MAX(n->wcet, sample_ref_u64);
-	} else {
-		double q = wcet_sketch_quantile(&n->sketch);
-		if (q > 0.0 && q < (double)UINT64_MAX)
-			n->wcet = (uint64_t)q;
-		else
-			n->wcet = SPA_MAX(n->wcet, runtime);
+	/* Feed the conformal estimator the same sample. The observation
+	 * flow obeys the prequential discipline internally (score
+	 * computed against pre-observation EWMA state). */
+	if (runtime > 0 && n->conformal != NULL && sample_ref > 0.0)
+		(void)rt_conformal_observe(n->conformal, (uint64_t)sample_ref);
+
+	/* Peak-hold floor: an outlier the estimators have not yet
+	 * incorporated still raises the budget for the next cycle.
+	 * Track the running max in n->wcet so the selection predicate
+	 * can fall back on it. */
+	{
+		uint64_t sample_ref_u64 = sample_ref > 0.0
+			? (uint64_t)sample_ref : 0;
+		uint64_t peak_hold = SPA_MAX(n->wcet, sample_ref_u64);
+		struct runtime_select_result sel = runtime_select_for_node(
+				impl, n, sample_ref_u64, peak_hold, period);
+		n->wcet = sel.value_ns;
+		n->budget_kind = sel.kind;
+		n->budget_sample_count = sel.sample_count;
 	}
 
 	n->period = period;
@@ -2836,17 +3015,16 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_pwcet_ns = 0;
 			pn.mbpta_block_count = 0;
 		}
-		if (mn != NULL && mn->mbpta != NULL &&
-		    mbpta_runtime_uses_pwcet(mbpta_state(mn->mbpta),
-				    impl->mbpta_accept_probabilistic_hard)) {
-			pn.budget_kind = RT_DIAG_BUDGET_PWCET;
-			pn.budget_sample_count = mbpta_sample_count(mn->mbpta);
-		} else if (mn != NULL && mn->sketch_ready) {
-			uint32_t count = wcet_sketch_count(&mn->sketch);
-			pn.budget_sample_count = count;
-			pn.budget_kind = count >= impl->sketch_min_samples
-				? RT_DIAG_BUDGET_EMPIRICAL_QUANTILE
-				: RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
+		/*
+		 * The budget-source predicate stamped the per-follower
+		 * fields when the last sample arrived; surface them
+		 * verbatim so the JSON snapshot reflects the kind that
+		 * actually drove the kernel runtime for the most recent
+		 * apply pass, not a re-derived classification.
+		 */
+		if (mn != NULL) {
+			pn.budget_kind = mn->budget_kind;
+			pn.budget_sample_count = mn->budget_sample_count;
 		} else {
 			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
 			pn.budget_sample_count = 0;
@@ -3248,10 +3426,13 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 			if (n == NULL)
 				continue;
 			if (n->last_topo_generation_seen &&
-			    n->last_topo_generation != this_gen &&
-			    n->mbpta != NULL) {
-				mbpta_invalidate_with_reason(n->mbpta,
-					MBPTA_INVALIDATED_TOPOLOGY_GENERATION);
+			    n->last_topo_generation != this_gen) {
+				if (n->mbpta != NULL)
+					mbpta_invalidate_with_reason(n->mbpta,
+						MBPTA_INVALIDATED_TOPOLOGY_GENERATION);
+				if (n->conformal != NULL)
+					rt_conformal_invalidate(n->conformal,
+						RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
 			}
 			n->last_topo_generation = this_gen;
 			n->last_topo_generation_seen = true;
