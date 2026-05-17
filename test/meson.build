@@ -120,6 +120,7 @@ test('test-module-deadline-contracted',
                'test-module-deadline-contracted.c',
                '../src/modules/module-deadline/contracted.c',
                '../src/modules/module-deadline/dag.c',
+               '../src/modules/module-deadline/fusion_validator.c',
                include_directories: pwtest_inc,
                dependencies: [ spa_dep, pipewire_dep, mathlib ],
                link_with: pwtest_lib)

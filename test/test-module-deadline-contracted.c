@@ -22,6 +22,7 @@
 
 #include "../src/modules/module-deadline/contracted.h"
 #include "../src/modules/module-deadline/dag.h"
+#include "../src/modules/module-deadline/fusion_validator.h"
 
 PWTEST(contracted_create_destroy_null_safe)
 {
@@ -369,6 +370,98 @@ PWTEST(contracted_builder_property_preserves_edge_set)
 				total_violations++;
 		}
 
+		contracted_dag_destroy(cg);
+	}
+
+	pwtest_int_eq((int)total_violations, 0);
+	return PWTEST_PASS;
+}
+
+/* Property test combining the convexity validator with the
+ * contracted DAG builder: if the precedence-convexity predicate
+ * accepts a candidate group then the resulting contracted DAG is
+ * acyclic. Sarkar 1989 §5.3 frames precedence-convexity exactly
+ * as the soundness requirement for macro-actor formation -- a
+ * non-convex group's macro-node ends up on a cycle through the
+ * outside-and-back-in path. Pinning the joint property catches a
+ * future bug in either the validator or the builder where one
+ * relaxes its definition out of sync with the other.
+ *
+ * 40 trials, LCG seed 0xF7A3B561, each trial picks a small
+ * member subset on a random forward-only DAG and feeds the same
+ * (members, edges) to both layers. */
+PWTEST(contracted_validator_convex_accept_implies_acyclic)
+{
+	uint32_t seed = 0xF7A3B561u;
+	uint32_t trial;
+	uint32_t total_violations = 0;
+	const uint32_t trials = 40;
+	const uint32_t n_total = 6;
+
+	for (trial = 0; trial < trials; trial++) {
+		struct contracted_member_input all_members[6];
+		uint32_t group_ids[6] = { 0 };
+		uint32_t member_ids[6];
+		uint32_t n_in_group = 0, i, j, n_edges = 0;
+		struct contracted_edge_input cedges[15];
+		struct fusion_edge_input fedges[15];
+
+		/* Build the universe: 6 nodes id 200..205. */
+		for (i = 0; i < n_total; i++) {
+			all_members[i].id  = 200 + i;
+			all_members[i].tid = 2000 + i;
+			all_members[i].wcet_ns = 10;
+		}
+
+		/* Random forward edge set. */
+		seed = seed * 1103515245u + 12345u;
+		for (i = 0; i < n_total; i++) {
+			for (j = i + 1; j < n_total; j++) {
+				seed = seed * 1103515245u + 12345u;
+				if ((seed & 0x3) == 0)
+					continue;
+				if (n_edges >= 15)
+					continue;
+				cedges[n_edges] = (struct contracted_edge_input){
+					.src_id = all_members[i].id,
+					.dst_id = all_members[j].id,
+				};
+				fedges[n_edges] = (struct fusion_edge_input){
+					.src_id = all_members[i].id,
+					.dst_id = all_members[j].id,
+				};
+				n_edges++;
+			}
+		}
+
+		/* Pick a random subset to be the candidate group. */
+		for (i = 0; i < n_total; i++) {
+			seed = seed * 1103515245u + 12345u;
+			if ((seed & 0x1) == 0)
+				continue;
+			member_ids[n_in_group] = all_members[i].id;
+			n_in_group++;
+			group_ids[i] = 42;
+		}
+
+		if (n_in_group < 2)
+			continue; /* trivial group */
+
+		enum fusion_reject_reason r = FUSION_REJ_NONE;
+		bool accept = fusion_validator_precedence_convex_accept(
+				member_ids, n_in_group,
+				fedges, n_edges, &r);
+		if (!accept)
+			continue; /* rejected, nothing to check */
+
+		/* Validator accepted: contracted DAG must be acyclic. */
+		contracted_dag_t *cg = NULL;
+		int rc = contracted_dag_build(100, 100, all_members,
+				group_ids, n_total, cedges, n_edges, &cg);
+		if (rc != 0)
+			continue;
+		if (contracted_dag_has_cycle(cg))
+			total_violations++;
 		contracted_dag_destroy(cg);
 	}
 
@@ -756,6 +849,8 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_builder_preserves_external_predecessors,
 			PWTEST_NOARG);
 	pwtest_add(contracted_builder_property_preserves_edge_set,
+			PWTEST_NOARG);
+	pwtest_add(contracted_validator_convex_accept_implies_acyclic,
 			PWTEST_NOARG);
 	pwtest_add(contracted_builder_drops_internal_edges, PWTEST_NOARG);
 	pwtest_add(contracted_builder_deduplicates_parallel_external_edges, PWTEST_NOARG);
