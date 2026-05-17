@@ -323,6 +323,78 @@ PWTEST(sched_dag_excludes_feedback_edges)
 	return PWTEST_PASS;
 }
 
+/* Property: across 4096 LCG-deterministic random flag combinations,
+ * the classifier is total (returns exactly one reason) and respects
+ * the documented precedence (feedback dominates async dominates
+ * exported dominates unsupported). The test simulates the same
+ * precedence inline so a future change to the classifier is caught
+ * here as well as at the per-case tests above. Mixes coverage of
+ * the "graphs with async and feedback edges" and "graphs with
+ * exported / remote / main-loop nodes" property families the
+ * project's scheduling-model reference enumerates. */
+PWTEST(sched_dag_classify_property_total_and_precedence)
+{
+	uint32_t seed = 0xC4F1A38Bu;
+	uint32_t trial;
+	const uint32_t trials = 4096;
+	uint32_t feedback_hits = 0, async_hits = 0;
+	uint32_t exported_hits = 0, unsupported_hits = 0, none_hits = 0;
+
+	for (trial = 0; trial < trials; trial++) {
+		bool feedback, src_async, dst_async;
+		bool src_exported, dst_exported;
+		bool src_in_set, dst_in_set;
+		enum rt_diag_sched_exclude_reason got;
+		enum rt_diag_sched_exclude_reason want;
+
+		seed = seed * 1103515245u + 12345u;
+		feedback     = (seed >> 1) & 1u;
+		src_async    = (seed >> 2) & 1u;
+		dst_async    = (seed >> 3) & 1u;
+		src_exported = (seed >> 4) & 1u;
+		dst_exported = (seed >> 5) & 1u;
+		src_in_set   = (seed >> 6) & 1u;
+		dst_in_set   = (seed >> 7) & 1u;
+
+		if (feedback)
+			want = RT_DIAG_SCHED_EXC_FEEDBACK;
+		else if (src_async || dst_async)
+			want = RT_DIAG_SCHED_EXC_ASYNC;
+		else if (src_exported || dst_exported)
+			want = RT_DIAG_SCHED_EXC_EXPORTED;
+		else if (!src_in_set || !dst_in_set)
+			want = RT_DIAG_SCHED_EXC_UNSUPPORTED;
+		else
+			want = RT_DIAG_SCHED_EXC_NONE;
+
+		got = rt_diag_sched_classify_edge(feedback,
+				src_async, dst_async,
+				src_exported, dst_exported,
+				src_in_set, dst_in_set);
+		pwtest_int_eq(got, want);
+
+		switch (want) {
+		case RT_DIAG_SCHED_EXC_NONE:        none_hits++; break;
+		case RT_DIAG_SCHED_EXC_FEEDBACK:    feedback_hits++; break;
+		case RT_DIAG_SCHED_EXC_ASYNC:       async_hits++; break;
+		case RT_DIAG_SCHED_EXC_EXPORTED:    exported_hits++; break;
+		case RT_DIAG_SCHED_EXC_UNSUPPORTED: unsupported_hits++; break;
+		default: break;
+		}
+	}
+
+	/* Sanity coverage -- every reason must fire at least 5 times
+	 * across 4096 trials or the LCG is biased. The NONE branch
+	 * requires all 7 booleans to take specific values (~1/128 of
+	 * trials), so its threshold is lower than the others. */
+	pwtest_bool_true(feedback_hits > 50);
+	pwtest_bool_true(async_hits > 50);
+	pwtest_bool_true(exported_hits > 50);
+	pwtest_bool_true(unsupported_hits > 50);
+	pwtest_bool_true(none_hits > 5);
+	return PWTEST_PASS;
+}
+
 PWTEST(sched_dag_classify_exported_and_unsupported)
 {
 	/* Exported drops with reason=exported, but only when neither
@@ -918,6 +990,7 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_sched_reason_names_stable, PWTEST_NOARG);
 	pwtest_add(sched_dag_excludes_async_edges, PWTEST_NOARG);
 	pwtest_add(sched_dag_excludes_feedback_edges, PWTEST_NOARG);
+	pwtest_add(sched_dag_classify_property_total_and_precedence, PWTEST_NOARG);
 	pwtest_add(sched_dag_classify_exported_and_unsupported, PWTEST_NOARG);
 	pwtest_add(diag_sched_render_text_golden, PWTEST_NOARG);
 	pwtest_add(diag_fusion_null_safe, PWTEST_NOARG);
