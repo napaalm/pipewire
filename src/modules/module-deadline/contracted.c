@@ -134,6 +134,29 @@ uint64_t contracted_node_effective_wcet(const contracted_node_t *cn)
 	return cn->wcet_ns + cn->overhead_ns;
 }
 
+int contracted_node_observe_macro_runtime(contracted_node_t *cn,
+		uint64_t observed_macro_runtime_ns)
+{
+	uint64_t residual;
+
+	if (cn == NULL)
+		return -EINVAL;
+	if (observed_macro_runtime_ns == 0)
+		return 0;
+
+	residual = observed_macro_runtime_ns > cn->wcet_ns
+			? observed_macro_runtime_ns - cn->wcet_ns
+			: 0;
+	if (residual > cn->overhead.internal_topo_ns) {
+		cn->overhead.internal_topo_ns = residual;
+		cn->overhead_ns = cn->overhead.group_dispatch_ns
+				+ cn->overhead.internal_topo_ns
+				+ cn->overhead.activation_pending_ns
+				+ cn->overhead.buffer_port_iter_ns;
+	}
+	return 0;
+}
+
 int contracted_dag_add_edge(contracted_dag_t *cg,
 		contracted_node_t *src, contracted_node_t *dst)
 {

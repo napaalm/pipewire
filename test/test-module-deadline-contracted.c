@@ -939,6 +939,61 @@ PWTEST(contracted_edge_add_meta_null_safe)
 	return PWTEST_PASS;
 }
 
+PWTEST(contracted_observe_macro_runtime_non_zero_residual)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	pwtest_int_eq(contracted_node_add_member(n, 1, 100, 0), 0);
+	pwtest_int_eq(contracted_node_add_member(n, 2, 100, 0), 0);
+	/* Pretend two members claim 100 ns of WCET each (no overhead
+	 * applied yet). */
+	n->wcet_ns = 200;
+
+	pwtest_int_eq(contracted_node_observe_macro_runtime(n, 250), 0);
+	/* Effective WCET is now 200 + 50 (residual attributed to
+	 * internal_topo_ns). The overhead-zero default would have
+	 * propagated 200 to the analysis layer, under-budgeting the
+	 * macro-node by the dispatch cost. */
+	pwtest_int_eq((int)contracted_node_effective_wcet(n), 250);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 50);
+	pwtest_int_eq((int)n->overhead.group_dispatch_ns, 0);
+
+	/* A smaller subsequent observation does NOT shrink the budget:
+	 * overhead is a worst-case ceiling, not a moving average. */
+	pwtest_int_eq(contracted_node_observe_macro_runtime(n, 210), 0);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 50);
+
+	/* A larger observation raises the ceiling. */
+	pwtest_int_eq(contracted_node_observe_macro_runtime(n, 300), 0);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 100);
+	pwtest_int_eq((int)contracted_node_effective_wcet(n), 300);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
+PWTEST(contracted_observe_macro_runtime_null_and_zero)
+{
+	contracted_dag_t *cg = contracted_dag_create(1000, 1000);
+	contracted_node_t *n = contracted_dag_add_node(cg);
+	n->wcet_ns = 200;
+
+	pwtest_int_eq(contracted_node_observe_macro_runtime(NULL, 100), -EINVAL);
+	pwtest_int_eq(contracted_node_observe_macro_runtime(n, 0), 0);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 0);
+
+	/* Observation smaller than claimed sum-of-members WCET produces
+	 * zero residual -- the macro thread ran cheaper than the
+	 * pre-fusion baseline, which is welcome but never lowers the
+	 * budget below the structural sum. */
+	pwtest_int_eq(contracted_node_observe_macro_runtime(n, 150), 0);
+	pwtest_int_eq((int)n->overhead.internal_topo_ns, 0);
+	pwtest_int_eq((int)contracted_node_effective_wcet(n), 200);
+
+	contracted_dag_destroy(cg);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_contracted)
 {
 	pwtest_add(contracted_create_destroy_null_safe, PWTEST_NOARG);
@@ -975,6 +1030,8 @@ PWTEST_SUITE(module_deadline_contracted)
 	pwtest_add(contracted_edge_meta_builder_preserves_per_original, PWTEST_NOARG);
 	pwtest_add(contracted_edge_meta_builder_skips_zero_input, PWTEST_NOARG);
 	pwtest_add(contracted_edge_add_meta_null_safe, PWTEST_NOARG);
+	pwtest_add(contracted_observe_macro_runtime_non_zero_residual, PWTEST_NOARG);
+	pwtest_add(contracted_observe_macro_runtime_null_and_zero, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

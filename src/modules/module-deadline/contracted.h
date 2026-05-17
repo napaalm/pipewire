@@ -365,6 +365,41 @@ int contracted_node_set_overhead(contracted_node_t *cn,
 uint64_t contracted_node_effective_wcet(const contracted_node_t *cn);
 
 /*
+ * Instrumentation-driven residual-overhead update.
+ *
+ * The fusion path does not ship a per-component microbench: the
+ * dispatch / pending-update / port-iteration costs are interleaved
+ * with member work in the fused thread and cannot be probed in
+ * isolation without invasive instrumentation. Instead, the runtime
+ * supplies the aggregate: a measured macro-node execution time
+ * (already captured per cycle via CLOCK_THREAD_CPUTIME_ID in
+ * impl-node and surfaced through the wcet_sketch / MBPTA stack).
+ *
+ * The residual is
+ *
+ *   residual_ns = max(0, observed_macro_runtime_ns - cn->wcet_ns)
+ *
+ * where cn->wcet_ns is the pre-fusion sum of member WCETs. The
+ * residual is non-zero by construction whenever the fused thread
+ * runs longer than the work it claims to bundle, which is the
+ * empirical signal a fusion budget must carry: the dispatch cost
+ * is bounded but not zero. The residual is attributed to
+ * internal_topo_ns -- the catch-all for dispatch / pending
+ * bookkeeping that we cannot decompose without probes -- so
+ * contracted_node_set_overhead's additive aggregation keeps
+ * overhead_ns honest.
+ *
+ * The function takes the max across calls: overhead is a worst-case
+ * budget, not a moving average. Resetting requires a fresh
+ * contracted_overhead_components passed to set_overhead.
+ *
+ * Returns 0 on success, -EINVAL on NULL cn. observed_macro_runtime_ns
+ * == 0 returns 0 without mutation (no observation to fold in).
+ */
+int contracted_node_observe_macro_runtime(contracted_node_t *cn,
+		uint64_t observed_macro_runtime_ns);
+
+/*
  * Bridge between the contracted DAG and the existing scheduling-DAG
  * analysis. The analysis layer (dag_recalculate -> deadline split ->
  * worst-fit placement -> EDF feasibility) is the one place the
