@@ -404,11 +404,20 @@ void rt_diag_fusion_snapshot_render_text(const struct rt_diag_fusion_snapshot *s
  * complete the taxonomy. Tokens are lower_snake_case.
  */
 enum rt_diag_budget_kind {
-	RT_DIAG_BUDGET_DETERMINISTIC_WCET = 0,
-	RT_DIAG_BUDGET_PWCET              = 1,
-	RT_DIAG_BUDGET_EMPIRICAL_QUANTILE = 2,
-	RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK = 3,
-	RT_DIAG_BUDGET_MANUAL_OVERRIDE    = 4,
+	/*
+	 * Per-node operator override (no per-node property is wired
+	 * to this branch yet; reserved for a future
+	 * deadline.manual_override.<id>.runtime_ns key). Always wins
+	 * when set.
+	 */
+	RT_DIAG_BUDGET_MANUAL_OVERRIDE    = 0,
+	/*
+	 * Static deterministic WCET supplied by the plugin (no
+	 * plugin attribute is wired yet; reserved for a future
+	 * PW_KEY_NODE_WCET_NS or equivalent). Hard real-time
+	 * provenance.
+	 */
+	RT_DIAG_BUDGET_DETERMINISTIC_WCET = 1,
 	/*
 	 * Adaptive online upper-runtime budget calibrated to a target
 	 * overrun frequency via one-sided conformal prediction with an
@@ -418,30 +427,10 @@ enum rt_diag_budget_kind {
 	 * a deterministic WCET: strict hard-realtime operation still
 	 * requires manual / static / hybrid WCETs.
 	 */
-	RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL = 5,
+	RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL = 2,
 };
 
 const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k);
-
-/*
- * MBPTA estimator state mirror. The enum is intentionally a
- * caller-visible copy of mbpta.h's state machine so the diag
- * layer can render the tokens without depending on the
- * estimator TU. The accompanying pwcet_ns is the most recent
- * tail-extrapolation result; zero unless state == PWCET_VALID.
- * Tokens are the same lower_snake_case strings the estimator's
- * mbpta_state_name returns.
- */
-enum rt_diag_mbpta_state {
-	RT_DIAG_MBPTA_INSUFFICIENT_DATA   = 0,
-	RT_DIAG_MBPTA_IID_PENDING         = 1,
-	RT_DIAG_MBPTA_NON_GUMBEL          = 2,
-	RT_DIAG_MBPTA_PENDING_CONVERGENCE = 3,
-	RT_DIAG_MBPTA_PWCET_VALID         = 4,
-	RT_DIAG_MBPTA_DRIFT               = 5,
-};
-
-const char *rt_diag_mbpta_state_name(enum rt_diag_mbpta_state s);
 
 struct rt_diag_param_node {
 	uint32_t id;
@@ -453,73 +442,6 @@ struct rt_diag_param_node {
 	uint32_t cpu;
 	bool     applied;
 	enum rt_diag_budget_kind budget_kind;
-	uint64_t budget_sample_count;
-	enum rt_diag_mbpta_state mbpta_state;
-	uint64_t mbpta_pwcet_ns;
-	uint32_t mbpta_block_count;
-	/* MBPTA fit diagnostics. The first three are the most
-	 * recent statistical-test outcomes (Kolmogorov-Smirnov
-	 * statistic on the two-sample identical-distribution test;
-	 * Wald-Wolfowitz Z on the independence test;
-	 * continuous-rank-probability-score between successive
-	 * Gumbel fits); the last two are the per-fit Gumbel
-	 * location and scale parameters
-	 * (Cucu-Grosjean 2012 §II-A). The values are read
-	 * verbatim from mbpta_ks_stat / mbpta_runs_z / mbpta_crps /
-	 * mbpta_mu / mbpta_sigma. All zero until the first re-eval
-	 * round runs. */
-	double   mbpta_ks_stat;
-	double   mbpta_ks_pvalue;
-	double   mbpta_runs_z;
-	double   mbpta_runs_pvalue;
-	/* ET test on the GEV shape parameter k. mbpta_gev_shape_k is
-	 * the PWM estimator's point estimate; mbpta_et_pvalue is the
-	 * two-sided p-value for H_0: k = 0 (Gumbel sub-family of
-	 * GEV). The estimator routes to NON_GUMBEL when the p-value
-	 * falls below the configured alpha_et. */
-	double   mbpta_et_pvalue;
-	double   mbpta_gev_shape_k;
-	/* QQ-plot regression goodness-of-fit: coefficient of
-	 * determination R^2 and residual standard error
-	 * RSE = sqrt(SS_res / (n - 2)). R^2 close to 1 and small
-	 * RSE are evidence the block-maxima series is well-modelled
-	 * by a Gumbel. */
-	double   mbpta_gumbel_r2;
-	double   mbpta_gumbel_rse;
-	double   mbpta_crps;
-	double   mbpta_mu;
-	double   mbpta_sigma;
-	uint32_t mbpta_convergence_streak;
-	uint32_t mbpta_iid_reject_streak;
-
-	/* Effective per-node exceedance probability used in the
-	 * Gumbel inverse-CDF evaluation, after the
-	 * working-precision floor (Cucu-Grosjean 2012 §III-D step 6,
-	 * 1e-16) is applied. mbpta_eps_node_capped is true iff the
-	 * floor clipped the configured value -- surface both so the
-	 * runtime probabilistic guarantee in effect is visible. */
-	double   mbpta_effective_eps_node;
-	bool     mbpta_eps_node_capped;
-
-	/* Last invalidation reason recorded by the estimator
-	 * (mbpta.h enum mbpta_invalidation_reason, stringified).
-	 * Empty string when the estimator has never been
-	 * invalidated. Surfacing it gives an operator a direct
-	 * cause-of-rebuild signal when a follower's estimator keeps
-	 * dropping back to INSUFFICIENT_DATA. */
-	char     mbpta_last_invalidation_reason[32];
-
-	/* Composite estimator-key fingerprint -- FNV-1a-ish hash of
-	 * the components the plan calls out as estimator-key
-	 * dimensions: (driver period, fusion-group leader id,
-	 * topology generation, placement CPU). Two estimators with
-	 * the same fingerprint were observed under the same
-	 * sampling regime; a change in fingerprint between snapshots
-	 * is the cause-of-invalidation signal an operator can
-	 * cross-reference against the last-invalidation reason.
-	 * Zero when the follower has not yet been touched by a
-	 * reconcile pass. */
-	uint64_t mbpta_estimator_key;
 
 	/* Macro-node release-barrier count: the number of distinct
 	 * in-period predecessors the contracted scheduling-DAG node

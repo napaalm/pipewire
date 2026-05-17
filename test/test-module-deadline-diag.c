@@ -619,32 +619,10 @@ PWTEST(diag_params_render_text_golden)
 		"  nodes: 2\n"
 		"    node id=37 tid=302370 runtime=85494ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=4 applied=true"
-		" budget_kind=empirical_quantile budget_samples=128"
-		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
-		" mbpta_mu=0 mbpta_sigma=0"
-		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
-		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
-		" mbpta_et_p=0.000000 mbpta_k=0.000000"
-		" mbpta_r2=0.000000 mbpta_rse=0.000000"
-		" mbpta_crps=0.000000"
-		" mbpta_conv=0 mbpta_iid_reject=0"
-		" mbpta_eps_eff=0.0000000010000000 mbpta_eps_capped=false"
-		" mbpta_last_invalidation=none"
-		" mbpta_estimator_key=0x0000000000000000\n"
+		" budget_kind=adaptive_conformal\n"
 		"    node id=38 tid=302371 runtime=42620ns local_deadline=21333333ns"
 		" cumulative_deadline=21333333ns period=21333333ns cpu=5 applied=false"
-		" budget_kind=bootstrap_fallback budget_samples=0"
-		" mbpta_state=insufficient_data mbpta_pwcet=0ns mbpta_blocks=0"
-		" mbpta_mu=0 mbpta_sigma=0"
-		" mbpta_ks=0.000000 mbpta_ks_p=0.000000"
-		" mbpta_runs_z=0.000000 mbpta_runs_p=0.000000"
-		" mbpta_et_p=0.000000 mbpta_k=0.000000"
-		" mbpta_r2=0.000000 mbpta_rse=0.000000"
-		" mbpta_crps=0.000000"
-		" mbpta_conv=0 mbpta_iid_reject=0"
-		" mbpta_eps_eff=0.0000000000000001 mbpta_eps_capped=true"
-		" mbpta_last_invalidation=period"
-		" mbpta_estimator_key=0xfedcba9876543210\n";
+		" budget_kind=manual_override\n";
 
 	rt_diag_params_snapshot_init(&s);
 	s.driver_id = 63;
@@ -655,23 +633,13 @@ PWTEST(diag_params_render_text_golden)
 	n.runtime_budget_ns = 85494; n.local_deadline_ns = 21333333;
 	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
 	n.cpu = 4; n.applied = true;
-	n.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
-	n.budget_sample_count = 128;
-	n.mbpta_effective_eps_node = 1.0e-9;
-	n.mbpta_eps_node_capped = false;
+	n.budget_kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 	n.id = 38; n.tid = 302371;
 	n.runtime_budget_ns = 42620; n.local_deadline_ns = 21333333;
 	n.cumulative_deadline_ns = 21333333; n.period_ns = 21333333;
 	n.cpu = 5; n.applied = false;
-	n.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
-	n.budget_sample_count = 0;
-	n.mbpta_effective_eps_node = 1.0e-16;
-	n.mbpta_eps_node_capped = true;
-	snprintf(n.mbpta_last_invalidation_reason,
-		sizeof(n.mbpta_last_invalidation_reason), "%s",
-		"period");
-	n.mbpta_estimator_key = 0xfedcba9876543210ULL;
+	n.budget_kind = RT_DIAG_BUDGET_MANUAL_OVERRIDE;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&s, &n), 0);
 
 	fp = open_memstream(&buf, &len);
@@ -709,11 +677,7 @@ PWTEST(diag_json_empty_combined)
 		"\"raw_graph\":{\"nodes\":[],\"edges\":[]},"
 		"\"scheduling_dag\":{\"nodes\":[],\"edges\":[],\"excluded_edges\":[]},"
 		"\"fusion\":{\"groups\":[]},"
-		"\"parameters\":{\"nodes\":[],"
-		"\"pwcet_path_coverage_note\":\""
-		"pWCET claims do not extend to untriggered branches; "
-		"the result is only valid for paths actually observed "
-		"in the sample window (Cucu-Grosjean 2012 SIV).\"},"
+		"\"parameters\":{\"nodes\":[]},"
 		"\"peer_dispatch\":{\"inline_armed\":0,\"eventfd_path\":0}}\n";
 
 	struct rt_diag_combined c = { 0 };
@@ -755,21 +719,7 @@ PWTEST(diag_json_full_golden)
 		"\"runtime_ns\":85494,\"local_deadline_ns\":21333333,"
 		"\"cumulative_deadline_ns\":21333333,\"period_ns\":21333333,"
 		"\"cpu\":4,\"applied\":true,"
-		"\"budget_kind\":\"empirical_quantile\","
-		"\"budget_samples\":512,"
-		"\"mbpta\":{\"state\":\"pwcet_valid\",\"pwcet_ns\":91234,\"blocks\":50,"
-		"\"mu\":120000,\"sigma\":3500,"
-		"\"ks_stat\":0.041000,\"ks_pvalue\":0.500000,"
-		"\"runs_z\":-0.230000,\"runs_pvalue\":0.818000,"
-		"\"et_pvalue\":0.612000,\"gev_shape_k\":0.012500,"
-		"\"gumbel_r2\":0.987000,\"gumbel_rse\":85.500000,"
-		"\"crps\":0.072000,"
-		"\"convergence_streak\":4,"
-		"\"iid_reject_streak\":0,"
-		"\"effective_eps_node\":0.0000000010000000,"
-		"\"eps_node_capped\":false,"
-		"\"last_invalidation_reason\":\"fusion_group\","
-		"\"estimator_key\":\"0x0123456789abcdef\"},"
+		"\"budget_kind\":\"adaptive_conformal\","
 		"\"required_external_inputs\":0,"
 		"\"voluntary_ctxt_switches_in_process\":0,"
 		"\"conformal\":{\"state\":\"insufficient_data\","
@@ -785,11 +735,7 @@ PWTEST(diag_json_full_golden)
 		"\"last_budget_ns\":0,"
 		"\"last_invalidation_reason\":\"none\"},"
 		"\"budget_clipped\":false,"
-		"\"risk_objective_value\":0.000000}],"
-		"\"pwcet_path_coverage_note\":\""
-		"pWCET claims do not extend to untriggered branches; "
-		"the result is only valid for paths actually observed "
-		"in the sample window (Cucu-Grosjean 2012 SIV).\"},"
+		"\"risk_objective_value\":0.000000}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -831,30 +777,7 @@ PWTEST(diag_json_full_golden)
 	pn.runtime_budget_ns = 85494; pn.local_deadline_ns = 21333333;
 	pn.cumulative_deadline_ns = 21333333; pn.period_ns = 21333333;
 	pn.cpu = 4; pn.applied = true;
-	pn.budget_kind = RT_DIAG_BUDGET_EMPIRICAL_QUANTILE;
-	pn.budget_sample_count = 512;
-	pn.mbpta_state = RT_DIAG_MBPTA_PWCET_VALID;
-	pn.mbpta_pwcet_ns = 91234;
-	pn.mbpta_block_count = 50;
-	pn.mbpta_mu = 120000.0;
-	pn.mbpta_sigma = 3500.0;
-	pn.mbpta_ks_stat = 0.041;
-	pn.mbpta_ks_pvalue = 0.5;
-	pn.mbpta_runs_z = -0.23;
-	pn.mbpta_runs_pvalue = 0.818;
-	pn.mbpta_et_pvalue = 0.612;
-	pn.mbpta_gev_shape_k = 0.0125;
-	pn.mbpta_gumbel_r2 = 0.987;
-	pn.mbpta_gumbel_rse = 85.5;
-	pn.mbpta_crps = 0.072;
-	pn.mbpta_convergence_streak = 4;
-	pn.mbpta_iid_reject_streak = 0;
-	pn.mbpta_effective_eps_node = 1.0e-9;
-	pn.mbpta_eps_node_capped = false;
-	snprintf(pn.mbpta_last_invalidation_reason,
-		sizeof(pn.mbpta_last_invalidation_reason), "%s",
-		"fusion_group");
-	pn.mbpta_estimator_key = 0x0123456789abcdefULL;
+	pn.budget_kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;
@@ -924,36 +847,12 @@ PWTEST(diag_peer_dispatch_null_safe)
 	return PWTEST_PASS;
 }
 
-PWTEST(diag_mbpta_state_names_stable)
-{
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_INSUFFICIENT_DATA),
-		      "insufficient_data");
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_IID_PENDING),
-		      "iid_pending");
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_NON_GUMBEL),
-		      "non_gumbel");
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_PENDING_CONVERGENCE),
-		      "pending_convergence");
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_PWCET_VALID),
-		      "pwcet_valid");
-	pwtest_str_eq(rt_diag_mbpta_state_name(RT_DIAG_MBPTA_DRIFT), "drift");
-	pwtest_str_eq(rt_diag_mbpta_state_name((enum rt_diag_mbpta_state)999),
-		      "unknown");
-	return PWTEST_PASS;
-}
-
 PWTEST(diag_budget_kind_names_stable)
 {
-	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_DETERMINISTIC_WCET),
-		      "deterministic_wcet");
-	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_PWCET),
-		      "pwcet");
-	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_EMPIRICAL_QUANTILE),
-		      "empirical_quantile");
-	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK),
-		      "bootstrap_fallback");
 	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_MANUAL_OVERRIDE),
 		      "manual_override");
+	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_DETERMINISTIC_WCET),
+		      "deterministic_wcet");
 	pwtest_str_eq(rt_diag_budget_kind_name(RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL),
 		      "adaptive_conformal");
 	pwtest_str_eq(rt_diag_budget_kind_name((enum rt_diag_budget_kind)999),
@@ -1026,7 +925,6 @@ PWTEST_SUITE(module_deadline_diag)
 	pwtest_add(diag_peer_dispatch_render_text, PWTEST_NOARG);
 	pwtest_add(diag_peer_dispatch_null_safe, PWTEST_NOARG);
 	pwtest_add(diag_budget_kind_names_stable, PWTEST_NOARG);
-	pwtest_add(diag_mbpta_state_names_stable, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

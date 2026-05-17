@@ -362,7 +362,6 @@ struct node {
 	 * an operator can audit which source drove this cycle's
 	 * kernel runtime. */
 	enum rt_diag_budget_kind budget_kind;
-	uint64_t                 budget_sample_count;
 
 	/* Last-applied SCHED_DEADLINE tuple. Used by sched_cb to skip
 	 * a sched_setattr+sched_setaffinity pair when the four
@@ -1563,7 +1562,7 @@ static inline double wcet_sample_to_reference(struct impl *impl,
  * Pure predicate that walks the runtime budget-source hierarchy and
  * returns the kind that should drive the kernel runtime for this
  * follower this cycle, along with the value (in reference-CPU ns)
- * and the sample count that backs it. The hierarchy is fixed:
+ * and the sample count that backs it. Exactly three kinds exist:
  *
  *   1. RT_DIAG_BUDGET_MANUAL_OVERRIDE -- per-node operator override
  *      (no plumbing yet; reserved for a future per-node property).
@@ -1571,19 +1570,21 @@ static inline double wcet_sample_to_reference(struct impl *impl,
  *   2. RT_DIAG_BUDGET_DETERMINISTIC_WCET -- a hard static bound
  *      supplied by the plugin (no plumbing yet; reserved for a
  *      future plugin attribute). Used when the plugin exports it.
- *   3. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- adaptive-conformal
- *      one-sided upper budget. Used when the conformal estimator
- *      is in RT_CONF_VALID (or SHIFT, since SHIFT is still
- *      publishable; the diagnostic surface flags the drift).
- *   4. RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK -- peak-hold of observed
- *      samples while the higher-provenance sources are not yet
- *      ready. Always defined.
+ *   3. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- the adaptive-conformal
+ *      estimator's published budget, whether the estimator is in
+ *      BOOTSTRAP (using the configured bootstrap floor) or in
+ *      VALID / SHIFT (using the score-ring quantile + EWMA). When
+ *      the conformal estimator has not yet been instantiated for
+ *      this follower (the very first sample has not arrived) the
+ *      predicate reports the same kind with a peak-hold value as
+ *      a degenerate floor; the operator can read samples_used = 0
+ *      in the conformal sub-object to identify this state.
  *
  * The operator can constrain the hierarchy via deadline.budget.source:
- * BUDGET_SOURCE_BOOTSTRAP always returns peak-hold; the manual /
- * deterministic / adaptive_conformal values skip the kinds above
- * the requested one. BUDGET_SOURCE_AUTO (the default) walks the
- * full hierarchy.
+ * BUDGET_SOURCE_BOOTSTRAP returns the peak-hold floor under the
+ * conformal kind; the manual / deterministic / adaptive_conformal
+ * values skip the kinds above the requested one. BUDGET_SOURCE_AUTO
+ * (the default) walks the full hierarchy.
  *
  * Pure function: no PipeWire side effects, no global state mutation.
  * sample_ref is the reference-CPU-normalised most-recent sample;
@@ -1605,7 +1606,7 @@ static struct runtime_select_result runtime_select_for_node(
 		uint64_t period_ns SPA_UNUSED)
 {
 	struct runtime_select_result r = {
-		.kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK,
+		.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL,
 		.value_ns = SPA_MAX(peak_hold, sample_ref),
 		.sample_count = 0,
 	};
@@ -1732,7 +1733,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 				impl, n, sample_ref_u64, peak_hold, period);
 		n->wcet = sel.value_ns;
 		n->budget_kind = sel.kind;
-		n->budget_sample_count = sel.sample_count;
 	}
 
 	n->period = period;
@@ -2633,15 +2633,7 @@ static int populate_params_snapshot(struct impl *impl,
 		 * 2021) is the active source for the kernel runtime
 		 * budget today; the predicate runtime_select_for_node
 		 * stamped the per-follower budget_kind at sample time.
-		 *
-		 * MBPTA legacy telemetry fields stay zero. The mbpta
-		 * sub-object is pruned from the JSON snapshot by a
-		 * later commit; until then, the diag layer renders
-		 * the placeholder defaults.
 		 */
-		pn.mbpta_state = RT_DIAG_MBPTA_INSUFFICIENT_DATA;
-		pn.mbpta_pwcet_ns = 0;
-		pn.mbpta_block_count = 0;
 		/*
 		 * The budget-source predicate stamped the per-follower
 		 * fields when the last sample arrived; surface them
@@ -2651,10 +2643,8 @@ static int populate_params_snapshot(struct impl *impl,
 		 */
 		if (mn != NULL) {
 			pn.budget_kind = mn->budget_kind;
-			pn.budget_sample_count = mn->budget_sample_count;
 		} else {
-			pn.budget_kind = RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK;
-			pn.budget_sample_count = 0;
+			pn.budget_kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
 		}
 		/* Release-barrier and blocking-observation surfacing.
 		 * required_external_inputs comes from the contracted DAG

@@ -585,9 +585,7 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 		fprintf(out,
 			"    node id=%u tid=%d runtime=%lluns local_deadline=%lluns"
 			" cumulative_deadline=%lluns period=%lluns cpu=%u applied=%s"
-			" budget_kind=%s budget_samples=%llu"
-			" mbpta_state=%s mbpta_pwcet=%lluns mbpta_blocks=%u"
-			" mbpta_mu=",
+			" budget_kind=%s\n",
 			n->id, (int)n->tid,
 			(unsigned long long)n->runtime_budget_ns,
 			(unsigned long long)n->local_deadline_ns,
@@ -595,44 +593,7 @@ void rt_diag_params_snapshot_render_text(const struct rt_diag_params_snapshot *s
 			(unsigned long long)n->period_ns,
 			n->cpu,
 			n->applied ? "true" : "false",
-			rt_diag_budget_kind_name(n->budget_kind),
-			(unsigned long long)n->budget_sample_count,
-			rt_diag_mbpta_state_name(n->mbpta_state),
-			(unsigned long long)n->mbpta_pwcet_ns,
-			n->mbpta_block_count);
-		diag_fprintf_double(out, 0, n->mbpta_mu);
-		fputs(" mbpta_sigma=", out);
-		diag_fprintf_double(out, 0, n->mbpta_sigma);
-		fputs(" mbpta_ks=", out);
-		diag_fprintf_double(out, 6, n->mbpta_ks_stat);
-		fputs(" mbpta_ks_p=", out);
-		diag_fprintf_double(out, 6, n->mbpta_ks_pvalue);
-		fputs(" mbpta_runs_z=", out);
-		diag_fprintf_double(out, 6, n->mbpta_runs_z);
-		fputs(" mbpta_runs_p=", out);
-		diag_fprintf_double(out, 6, n->mbpta_runs_pvalue);
-		fputs(" mbpta_et_p=", out);
-		diag_fprintf_double(out, 6, n->mbpta_et_pvalue);
-		fputs(" mbpta_k=", out);
-		diag_fprintf_double(out, 6, n->mbpta_gev_shape_k);
-		fputs(" mbpta_r2=", out);
-		diag_fprintf_double(out, 6, n->mbpta_gumbel_r2);
-		fputs(" mbpta_rse=", out);
-		diag_fprintf_double(out, 6, n->mbpta_gumbel_rse);
-		fputs(" mbpta_crps=", out);
-		diag_fprintf_double(out, 6, n->mbpta_crps);
-		fprintf(out,
-			" mbpta_conv=%u mbpta_iid_reject=%u"
-			" mbpta_eps_eff=",
-			n->mbpta_convergence_streak,
-			n->mbpta_iid_reject_streak);
-		diag_fprintf_double(out, 16, n->mbpta_effective_eps_node);
-		fprintf(out, " mbpta_eps_capped=%s mbpta_last_invalidation=%s"
-			" mbpta_estimator_key=0x%016llx\n",
-			n->mbpta_eps_node_capped ? "true" : "false",
-			n->mbpta_last_invalidation_reason[0] != '\0'
-				? n->mbpta_last_invalidation_reason : "none",
-			(unsigned long long)n->mbpta_estimator_key);
+			rt_diag_budget_kind_name(n->budget_kind));
 	}
 }
 
@@ -788,27 +749,11 @@ static void json_write_fusion_section(FILE *out, const struct rt_diag_fusion_sna
 	fputs("]}", out);
 }
 
-const char *rt_diag_mbpta_state_name(enum rt_diag_mbpta_state s)
-{
-	switch (s) {
-	case RT_DIAG_MBPTA_INSUFFICIENT_DATA:   return "insufficient_data";
-	case RT_DIAG_MBPTA_IID_PENDING:         return "iid_pending";
-	case RT_DIAG_MBPTA_NON_GUMBEL:          return "non_gumbel";
-	case RT_DIAG_MBPTA_PENDING_CONVERGENCE: return "pending_convergence";
-	case RT_DIAG_MBPTA_PWCET_VALID:         return "pwcet_valid";
-	case RT_DIAG_MBPTA_DRIFT:               return "drift";
-	}
-	return "unknown";
-}
-
 const char *rt_diag_budget_kind_name(enum rt_diag_budget_kind k)
 {
 	switch (k) {
-	case RT_DIAG_BUDGET_DETERMINISTIC_WCET: return "deterministic_wcet";
-	case RT_DIAG_BUDGET_PWCET:              return "pwcet";
-	case RT_DIAG_BUDGET_EMPIRICAL_QUANTILE: return "empirical_quantile";
-	case RT_DIAG_BUDGET_BOOTSTRAP_FALLBACK: return "bootstrap_fallback";
 	case RT_DIAG_BUDGET_MANUAL_OVERRIDE:    return "manual_override";
+	case RT_DIAG_BUDGET_DETERMINISTIC_WCET: return "deterministic_wcet";
 	case RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL: return "adaptive_conformal";
 	}
 	return "unknown";
@@ -868,68 +813,7 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				"\"cumulative_deadline_ns\":%llu,"
 				"\"period_ns\":%llu,\"cpu\":%u,"
 				"\"applied\":%s,\"budget_kind\":\"%s\","
-				"\"budget_samples\":%llu,"
-				"\"mbpta\":{\"state\":\"%s\","
-				"\"pwcet_ns\":%llu,\"blocks\":%u,"
-				"\"mu\":",
-				n->id, (int)n->tid,
-				(unsigned long long)n->runtime_budget_ns,
-				(unsigned long long)n->local_deadline_ns,
-				(unsigned long long)n->cumulative_deadline_ns,
-				(unsigned long long)n->period_ns,
-				n->cpu,
-				n->applied ? "true" : "false",
-				rt_diag_budget_kind_name(n->budget_kind),
-				(unsigned long long)n->budget_sample_count,
-				rt_diag_mbpta_state_name(n->mbpta_state),
-				(unsigned long long)n->mbpta_pwcet_ns,
-				n->mbpta_block_count);
-			diag_fprintf_double(out, 0, n->mbpta_mu);
-			fputs(",\"sigma\":", out);
-			diag_fprintf_double(out, 0, n->mbpta_sigma);
-			fputs(",\"ks_stat\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_ks_stat);
-			fputs(",\"ks_pvalue\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_ks_pvalue);
-			fputs(",\"runs_z\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_runs_z);
-			fputs(",\"runs_pvalue\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_runs_pvalue);
-			fputs(",\"et_pvalue\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_et_pvalue);
-			fputs(",\"gev_shape_k\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_gev_shape_k);
-			fputs(",\"gumbel_r2\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_gumbel_r2);
-			fputs(",\"gumbel_rse\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_gumbel_rse);
-			fputs(",\"crps\":", out);
-			diag_fprintf_double(out, 6, n->mbpta_crps);
-			fprintf(out,
-				",\"convergence_streak\":%u,"
-				"\"iid_reject_streak\":%u,"
-				"\"effective_eps_node\":",
-				n->mbpta_convergence_streak,
-				n->mbpta_iid_reject_streak);
-			diag_fprintf_double(out, 16,
-					n->mbpta_effective_eps_node);
-			fprintf(out,
-				",\"eps_node_capped\":%s,"
-				"\"last_invalidation_reason\":",
-				n->mbpta_eps_node_capped ? "true" : "false");
-			json_write_escaped(out,
-				n->mbpta_last_invalidation_reason[0] != '\0'
-				? n->mbpta_last_invalidation_reason : "none");
-			{
-				char keybuf[32];
-				snprintf(keybuf, sizeof(keybuf),
-					"0x%016llx",
-					(unsigned long long)n->mbpta_estimator_key);
-				fputs(",\"estimator_key\":", out);
-				json_write_escaped(out, keybuf);
-			}
-			fprintf(out,
-				"},\"required_external_inputs\":%u,"
+				"\"required_external_inputs\":%u,"
 				"\"voluntary_ctxt_switches_in_process\":%llu,"
 				"\"conformal\":{\"state\":\"%s\","
 				"\"samples_seen\":%llu,\"samples_used\":%llu,"
@@ -938,6 +822,14 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 				"\"max_overrun_burst\":%llu,"
 				"\"current_overrun_burst\":%llu,"
 				"\"alpha_target\":",
+				n->id, (int)n->tid,
+				(unsigned long long)n->runtime_budget_ns,
+				(unsigned long long)n->local_deadline_ns,
+				(unsigned long long)n->cumulative_deadline_ns,
+				(unsigned long long)n->period_ns,
+				n->cpu,
+				n->applied ? "true" : "false",
+				rt_diag_budget_kind_name(n->budget_kind),
 				n->required_external_inputs,
 				(unsigned long long)n->voluntary_ctxt_switches_in_process,
 				rt_conformal_state_name(
@@ -984,17 +876,7 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			fputc('}', out);
 		}
 	}
-	/* Cucu-Grosjean 2012 §IV "Path Coverage": an MBPTA pWCET is
-	 * extrapolated from samples drawn from paths actually
-	 * executed in the sample window. Branches that never fired
-	 * in-window are not covered by the fit; an operator reading
-	 * the snapshot must know the claim's scope. Surface the
-	 * disclaimer alongside the per-node pWCET values so it
-	 * travels with the data. */
-	fputs("],\"pwcet_path_coverage_note\":\""
-	      "pWCET claims do not extend to untriggered branches; "
-	      "the result is only valid for paths actually observed "
-	      "in the sample window (Cucu-Grosjean 2012 SIV).\"}", out);
+	fputs("]}", out);
 }
 
 void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out)
