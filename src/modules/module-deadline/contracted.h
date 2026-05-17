@@ -419,7 +419,7 @@ uint64_t contracted_node_effective_wcet(const contracted_node_t *cn);
  * isolation without invasive instrumentation. Instead, the runtime
  * supplies the aggregate: a measured macro-node execution time
  * (already captured per cycle via CLOCK_THREAD_CPUTIME_ID in
- * impl-node and surfaced through the wcet_sketch / MBPTA stack).
+ * impl-node and surfaced through the adaptive-conformal estimator).
  *
  * The residual is
  *

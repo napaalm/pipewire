@@ -259,16 +259,16 @@ pw_fusion_decide(const struct pw_fusion_component *c,
  *     PARTIME_split   = E[cp_wcet] + cp_hops * wakeup_cost.
  *
  * The textbook estimator for an expected value is the sample mean.
- * The project's existing per-node WCET sketch (t-digest, in
- * src/modules/module-deadline/wcet_sketch.[ch]) targets a *high
- * quantile* (p95 by default) because the SCHED_DEADLINE budget
- * needs an upper bound that the task will fit into with high
- * probability. Borrowing that statistic for the fusion decision
- * would systematically over-state sum_wcet and under-trigger
- * fusion -- the opposite of what we want for a central-tendency
- * comparison. The sliding mean here is therefore intentionally a
- * *different* estimator from the SCHED_DEADLINE budget; the two
- * answer two different questions.
+ * The project's adaptive-conformal runtime-budget estimator
+ * (module-deadline/conformal.[ch]) targets a *one-sided upper
+ * bound* calibrated to a target overrun frequency, because the
+ * SCHED_DEADLINE budget needs a value the task will fit into with
+ * high probability. Borrowing that statistic for the fusion
+ * decision would systematically over-state sum_wcet and
+ * under-trigger fusion -- the opposite of what we want for a
+ * central-tendency comparison. The sliding mean here is therefore
+ * intentionally a *different* estimator from the SCHED_DEADLINE
+ * budget; the two answer two different questions.
  *
  * The previous implementation of this primitive (an exponential
  * moving average with alpha = 1/2^3 = 1/8) had the same
