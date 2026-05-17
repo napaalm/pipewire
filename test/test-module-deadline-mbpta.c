@@ -696,6 +696,47 @@ PWTEST(mbpta_et_pvalue_rejects_heavy_tailed_input)
 	return PWTEST_PASS;
 }
 
+/*
+ * The kernel `runtime` field carries pWCET(eps_node) only when both
+ *   (a) the per-node estimator is PWCET_VALID, and
+ *   (b) the operator has explicitly opted in via
+ *       deadline.mbpta.accept_probabilistic_hard = true.
+ *
+ * The two tests below pin both halves of this AND. mbpta_runtime_uses_pwcet
+ * is the pure predicate the runtime caller in module-deadline.c projects
+ * (mbpta_state, accept flag) through; gating both via the same function
+ * is what makes them testable without standing up the full reconcile
+ * pass.
+ */
+PWTEST(mbpta_runtime_field_is_pwcet_when_valid_and_opted_in)
+{
+	pwtest_bool_true(mbpta_runtime_uses_pwcet(MBPTA_PWCET_VALID, true));
+	return PWTEST_PASS;
+}
+
+PWTEST(mbpta_runtime_field_not_pwcet_when_opt_in_off)
+{
+	/* Opt-in off: even a converged PWCET_VALID fit does NOT drive
+	 * the kernel runtime. Telemetry stays emitted (the diag layer
+	 * continues to report the estimator state and pWCET value),
+	 * but the runtime falls back to empirical / soft / fallback
+	 * budgets. */
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_PWCET_VALID, false));
+
+	/* Opt-in on but state is not yet PWCET_VALID: still falls
+	 * back. Every non-PWCET_VALID state is enumerated to pin the
+	 * policy. */
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_INSUFFICIENT_DATA, true));
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_IID_PENDING, true));
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_NON_GUMBEL, true));
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_PENDING_CONVERGENCE, true));
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_DRIFT, true));
+
+	/* Both off: definitely falls back. */
+	pwtest_bool_false(mbpta_runtime_uses_pwcet(MBPTA_INSUFFICIENT_DATA, false));
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_mbpta)
 {
 	pwtest_add(mbpta_state_name_stable, PWTEST_NOARG);
@@ -725,6 +766,10 @@ PWTEST_SUITE(module_deadline_mbpta)
 			PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_defaults_to_one, PWTEST_NOARG);
 	pwtest_add(mbpta_et_pvalue_rejects_heavy_tailed_input,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_runtime_field_is_pwcet_when_valid_and_opted_in,
+			PWTEST_NOARG);
+	pwtest_add(mbpta_runtime_field_not_pwcet_when_opt_in_off,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;

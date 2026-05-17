@@ -1601,8 +1601,8 @@ static void apply_sample(struct impl *impl, struct node *n,
 	 * estimator has not yet incorporated still raises the
 	 * kernel runtime in the next cycle. */
 	if (n->mbpta != NULL &&
-	    impl->mbpta_accept_probabilistic_hard &&
-	    mbpta_state(n->mbpta) == MBPTA_PWCET_VALID) {
+	    mbpta_runtime_uses_pwcet(mbpta_state(n->mbpta),
+			    impl->mbpta_accept_probabilistic_hard)) {
 		uint64_t p = mbpta_pwcet_ns(n->mbpta);
 		uint64_t sample_ref_u64 = sample_ref > 0.0 ?
 			(uint64_t)sample_ref : 0;
@@ -2594,8 +2594,8 @@ static int populate_params_snapshot(struct impl *impl,
 			pn.mbpta_block_count = 0;
 		}
 		if (mn != NULL && mn->mbpta != NULL &&
-		    impl->mbpta_accept_probabilistic_hard &&
-		    mbpta_state(mn->mbpta) == MBPTA_PWCET_VALID) {
+		    mbpta_runtime_uses_pwcet(mbpta_state(mn->mbpta),
+				    impl->mbpta_accept_probabilistic_hard)) {
 			pn.budget_kind = RT_DIAG_BUDGET_PWCET;
 			pn.budget_sample_count = mbpta_sample_count(mn->mbpta);
 		} else if (mn != NULL && mn->sketch_ready) {

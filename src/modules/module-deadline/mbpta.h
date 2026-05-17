@@ -239,6 +239,28 @@ uint64_t mbpta_pwcet_ns(const mbpta_t *e);
 double mbpta_effective_eps_node(const mbpta_t *e);
 bool   mbpta_eps_node_capped(const mbpta_t *e);
 
+/*
+ * Pure policy predicate: should the kernel `runtime` field carry
+ * pWCET(eps_node) for a contracted node whose estimator is in the
+ * given state?
+ *
+ * Returns true iff state == MBPTA_PWCET_VALID AND
+ * accept_probabilistic_hard is true. This is the only combination
+ * the plan permits to drive the kernel runtime from a probabilistic
+ * tail extrapolation: a converged fit AND explicit operator opt-in.
+ * Every other combination falls back to empirical / fallback
+ * budgets (Cucu-Grosjean 2012 §III-D; see also Phase 8.9 of the
+ * project's scheduling-model reference, which surfaces the opt-in
+ * knob as deadline.mbpta.accept_probabilistic_hard).
+ *
+ * Pure data: no estimator handle required. The runtime caller in
+ * module-deadline.c projects (mbpta_state(estimator),
+ * impl->mbpta_accept_probabilistic_hard) through this predicate to
+ * decide between the pWCET path and the soft / fallback path.
+ */
+bool mbpta_runtime_uses_pwcet(enum mbpta_state state,
+		bool accept_probabilistic_hard);
+
 #ifdef __cplusplus
 }
 #endif

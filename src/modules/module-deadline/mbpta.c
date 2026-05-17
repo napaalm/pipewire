@@ -790,3 +790,9 @@ bool mbpta_eps_node_capped(const mbpta_t *e)
 		return false;
 	return e->cfg.eps_node < MBPTA_EPS_NODE_FLOOR;
 }
+
+bool mbpta_runtime_uses_pwcet(enum mbpta_state state,
+		bool accept_probabilistic_hard)
+{
+	return accept_probabilistic_hard && state == MBPTA_PWCET_VALID;
+}
