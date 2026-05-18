@@ -3562,6 +3562,132 @@ PWTEST(soft_redistribute_rejects_invalid_inputs)
 	return PWTEST_PASS;
 }
 
+/* --------------------------------------------------------------- *
+ * Driver-as-DAG-node shapes. When module-deadline runs with
+ * driver.schedule=on, the snapshot path includes the driver in
+ * t->nodes[] alongside its followers. The DAG library does not
+ * distinguish a "driver" id from a "follower" id -- it just sees a
+ * node with a WCET and a tid -- but the topology shapes the module
+ * now emits are new, so these tests pin the per-node budget contract
+ * on each of them. The driver_id used is purely a naming convention
+ * (10000) so the test reader can identify the driver at a glance.
+ * --------------------------------------------------------------- */
+
+/* Driver as sink of a chain follower_A -> driver. Distinct WCETs:
+ * the splitter must give the driver a proportional slice of the
+ * period, larger than follower_A's because the driver's WCET is
+ * larger. Pins: driver gets a non-zero, period-bounded budget that
+ * scales with its measured WCET. */
+PWTEST(driver_as_dag_sink_chain)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 300, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+
+	pwtest_bool_true(a->cumulative_deadline > 0);
+	pwtest_bool_true(d->cumulative_deadline > a->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+	/* Source: local == cumulative. */
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+	/* Sink: local == cumulative - cumulative(pred). */
+	pwtest_int_eq((int)d->local_deadline,
+		      (int)(d->cumulative_deadline - a->cumulative_deadline));
+	/* WCET scaling: driver has 3x A's WCET, so its local slice
+	 * is larger than A's. */
+	pwtest_bool_true(d->local_deadline > a->local_deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Driver as sink of a fan-in: follower_A, follower_B -> driver,
+ * with B carrying the longer cumulative path. The driver's
+ * local_deadline must equal cumulative - max(predecessor cumulative)
+ * -- pinning the join formula on the new shape. */
+PWTEST(driver_as_dag_sink_fan_in)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 300, 1002), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 200, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, driver_id), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+
+	uint64_t max_pred = a->cumulative_deadline >= b->cumulative_deadline
+		? a->cumulative_deadline : b->cumulative_deadline;
+	pwtest_int_eq((int)d->local_deadline,
+		      (int)(d->cumulative_deadline - max_pred));
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+	pwtest_bool_true(d->local_deadline > 0);
+	/* The heavier predecessor must drive the join. */
+	pwtest_bool_true(b->cumulative_deadline >= a->cumulative_deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Driver as source of a capture-style chain: driver -> follower_A.
+ * The driver's local == cumulative because it has no real
+ * predecessor; the follower's cumulative > the driver's. */
+PWTEST(driver_as_dag_source_capture_chain)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, driver_id, 150, 9999), 0);
+	pwtest_int_eq(add_real_node(g, 1, 250, 1001), 0);
+	pwtest_int_eq(dag_add_edge(g, driver_id, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	dag_node_t *a = find_node_by_id(g, 1);
+
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_bool_true(a->cumulative_deadline > d->cumulative_deadline);
+	pwtest_int_eq((int)a->local_deadline,
+		      (int)(a->cumulative_deadline - d->cumulative_deadline));
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Single-node DAG containing only the driver. Degenerate but
+ * legal: the driver runs alone, with no followers (a sink/source
+ * graph during teardown, or a workload that hasn't connected yet).
+ * The driver gets the full period as its local deadline. */
+PWTEST(driver_only_node)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, driver_id, 400, 9999), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	/* No real predecessor: local == cumulative. */
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(explicit_deadline_fields_populated_after_recalc, PWTEST_NOARG);
@@ -3677,6 +3803,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(soft_redistribute_overload_clips_nodes, PWTEST_NOARG);
 	pwtest_add(soft_redistribute_diamond_keeps_monotonicity, PWTEST_NOARG);
 	pwtest_add(soft_redistribute_rejects_invalid_inputs, PWTEST_NOARG);
+
+	pwtest_add(driver_as_dag_sink_chain, PWTEST_NOARG);
+	pwtest_add(driver_as_dag_sink_fan_in, PWTEST_NOARG);
+	pwtest_add(driver_as_dag_source_capture_chain, PWTEST_NOARG);
+	pwtest_add(driver_only_node, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

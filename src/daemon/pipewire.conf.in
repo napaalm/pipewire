@@ -145,6 +145,15 @@ context.modules = [
             # ---- Scheduling ----
             # Set SCHED_FLAG_RECLAIM (GRUB) on every sched_setattr.
             #sched.reclaim                           = true
+            # Include the driver's own data-loop thread in the
+            # scheduling DAG (sampled, given a SCHED_DEADLINE
+            # tuple alongside its followers). Default false leaves
+            # the driver on whatever policy the daemon / rtkit
+            # already gave it. Requires the driver to run on a
+            # dedicated dynamic data-loop
+            # (context.dynamic-data-loops = true); a driver still
+            # on the shared main loop is silently excluded.
+            #driver.schedule                         = false
 
             # ---- Budget source ----
             # Runtime-budget hierarchy cap: manual | deterministic |

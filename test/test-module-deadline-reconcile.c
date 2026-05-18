@@ -2104,6 +2104,177 @@ PWTEST(reconcile_singleton_fusion_leader_equals_follower_id)
 	return PWTEST_PASS;
 }
 
+/* --------------------------------------------------------------- *
+ * Driver-as-follower shapes (driver.schedule=on in module-deadline).
+ * The reconcile layer sees the driver as just-another-id in the
+ * followers[] array. These tests pin: callback fires for every node
+ * including the driver, the driver receives a sane (runtime, deadline,
+ * period) tuple, and the join formula at the driver sink holds.
+ * --------------------------------------------------------------- */
+
+static const struct cb_ctx *cb_find(const struct cb_ctx *c, uint32_t id)
+{
+	uint32_t i;
+	for (i = 0; i < c->calls; i++) {
+		if (c->last[i].id == id)
+			return (const struct cb_ctx *)c;
+	}
+	return NULL;
+}
+
+static int cb_index_of(const struct cb_ctx *c, uint32_t id)
+{
+	uint32_t i;
+	for (i = 0; i < c->calls; i++) {
+		if (c->last[i].id == id)
+			return (int)i;
+	}
+	return -1;
+}
+
+PWTEST(reconcile_driver_in_followers_fan_in)
+{
+	const uint32_t driver_id = 10000;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t followers[3];
+	reconcile_edge_t edges[2];
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+
+	followers[0].id   = 10;
+	followers[0].tid  = 100;
+	followers[0].wcet = 10000;
+	followers[1].id   = 11;
+	followers[1].tid  = 101;
+	followers[1].wcet = 20000;
+	followers[2].id   = driver_id;
+	followers[2].tid  = 9999;
+	followers[2].wcet = 30000;
+
+	edges[0] = (reconcile_edge_t){ .src = 10, .dst = driver_id };
+	edges[1] = (reconcile_edge_t){ .src = 11, .dst = driver_id };
+
+	rt.followers   = followers;
+	rt.n_followers = 3;
+	rt.edges       = edges;
+	rt.n_edges     = 2;
+	rt.period      = 1000000; /* 1 ms */
+	rt.generation  = 1;
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	pwtest_int_eq((int)cb.calls, 3);
+	pwtest_ptr_notnull(cb_find(&cb, 10));
+	pwtest_ptr_notnull(cb_find(&cb, 11));
+	pwtest_ptr_notnull(cb_find(&cb, driver_id));
+
+	int da = cb_index_of(&cb, 10);
+	int db = cb_index_of(&cb, 11);
+	int dd = cb_index_of(&cb, driver_id);
+	pwtest_bool_true(da >= 0 && db >= 0 && dd >= 0);
+
+	/* Every callback must carry the expected period and a sane
+	 * SCHED_DEADLINE tuple. */
+	pwtest_int_eq((int)cb.last[dd].period, 1000000);
+	pwtest_bool_true(cb.last[dd].runtime > 0);
+	pwtest_bool_true(cb.last[dd].deadline > 0);
+	pwtest_bool_true(cb.last[dd].deadline <= 1000000);
+	pwtest_bool_true(cb.last[dd].cumulative_deadline <= 1000000);
+	pwtest_int_eq((int)cb.last[dd].tid, 9999);
+
+	/* The driver is the join sink: its cumulative deadline is
+	 * at least as large as either predecessor's. */
+	pwtest_bool_true(cb.last[dd].cumulative_deadline >=
+		cb.last[da].cumulative_deadline);
+	pwtest_bool_true(cb.last[dd].cumulative_deadline >=
+		cb.last[db].cumulative_deadline);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_driver_only_no_edges)
+{
+	const uint32_t driver_id = 10000;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t followers[1];
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+
+	followers[0].id   = driver_id;
+	followers[0].tid  = 9999;
+	followers[0].wcet = 50000;
+
+	rt.followers   = followers;
+	rt.n_followers = 1;
+	rt.edges       = NULL;
+	rt.n_edges     = 0;
+	rt.period      = 1000000;
+	rt.generation  = 1;
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	pwtest_int_eq((int)cb.calls, 1);
+	pwtest_int_eq((int)cb.last[0].id, (int)driver_id);
+	pwtest_int_eq((int)cb.last[0].tid, 9999);
+	pwtest_bool_true(cb.last[0].runtime > 0);
+	/* Single node: the only node owns the full period as its
+	 * relative deadline. */
+	pwtest_int_eq((int)cb.last[0].cumulative_deadline,
+			(int)cb.last[0].deadline);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
+PWTEST(reconcile_driver_no_tid)
+{
+	const uint32_t driver_id = 10000;
+	reconcile_state_t *s = make_state_persistent(0.01);
+	struct cb_ctx cb = { 0 };
+	reconcile_follower_t followers[2];
+	reconcile_edge_t edges[1];
+	reconcile_topo_t rt;
+
+	pwtest_ptr_notnull(s);
+
+	followers[0].id   = 10;
+	followers[0].tid  = 100;
+	followers[0].wcet = 10000;
+	/* Driver with no published TID: a remote driver, or a
+	 * driver still on the shared main loop. In production the
+	 * topology snapshot would have excluded it (the
+	 * PW_KEY_NODE_LOOP_TID filter); this test exercises the
+	 * defensive path: reconcile sees the entry but the
+	 * downstream syscall (sched_groups_add) rejects tid <= 0. */
+	followers[1].id   = driver_id;
+	followers[1].tid  = 0;
+	followers[1].wcet = 20000;
+
+	edges[0] = (reconcile_edge_t){ .src = 10, .dst = driver_id };
+
+	rt.followers   = followers;
+	rt.n_followers = 2;
+	rt.edges       = edges;
+	rt.n_edges     = 1;
+	rt.period      = 1000000;
+	rt.generation  = 1;
+
+	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
+	pwtest_int_eq((int)cb.calls, 2);
+	/* The DAG layer fires the cb for both nodes; the kernel
+	 * syscall layer is what filters tid==0 out. */
+	int dd = cb_index_of(&cb, driver_id);
+	pwtest_bool_true(dd >= 0);
+	pwtest_int_eq((int)cb.last[dd].tid, 0);
+	pwtest_bool_true(cb.last[dd].runtime > 0);
+
+	reconcile_fini(s);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_reconcile)
 {
 	pwtest_add(reconcile_rec_1_first_build, PWTEST_NOARG);
@@ -2165,6 +2336,10 @@ PWTEST_SUITE(module_deadline_reconcile)
 			PWTEST_NOARG);
 	pwtest_add(reconcile_property_cumulative_monotonic_along_edges,
 			PWTEST_NOARG);
+
+	pwtest_add(reconcile_driver_in_followers_fan_in, PWTEST_NOARG);
+	pwtest_add(reconcile_driver_only_no_edges, PWTEST_NOARG);
+	pwtest_add(reconcile_driver_no_tid, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

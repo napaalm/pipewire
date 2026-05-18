@@ -765,6 +765,42 @@ PWTEST(fusion_oracle_enumerate_diamond_5)
 	return PWTEST_PASS;
 }
 
+/* Driver-as-member: when module-deadline's driver.schedule is on,
+ * the driver itself appears in the followers array of its own
+ * driver_id. The fusion validator's "same driver" predicate
+ * requires every member to share one driver_id; this test pins
+ * that the driver's own member (driver_id == its own id == 42,
+ * matching the convention used by neighbouring tests) coexists
+ * with two of its followers without tripping
+ * FUSION_REJ_CROSS_DRIVER. */
+PWTEST(fusion_validator_driver_member_accepts)
+{
+	struct fusion_candidate_member ms[] = {
+		{ 42, 9999, 42, 0 },   /* driver: id == tid == driver_id */
+		{ 1,   100, 42, 0 },   /* follower of driver 42 */
+		{ 2,   101, 42, 0 },   /* follower of driver 42 */
+	};
+	enum fusion_reject_reason r = FUSION_REJ_INTERNAL_MILESTONE;
+	pwtest_bool_true(fusion_validator_accept(ms, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_NONE);
+	return PWTEST_PASS;
+}
+
+/* Negative companion: a member whose driver_id disagrees with the
+ * driver's own id must still trip FUSION_REJ_CROSS_DRIVER. */
+PWTEST(fusion_validator_driver_member_cross_driver_rejects)
+{
+	struct fusion_candidate_member ms[] = {
+		{ 42, 9999, 42, 0 },   /* driver 42 */
+		{ 1,   100, 42, 0 },   /* follower of 42 */
+		{ 2,   101, 43, 0 },   /* belongs to driver 43 */
+	};
+	enum fusion_reject_reason r = FUSION_REJ_NONE;
+	pwtest_bool_false(fusion_validator_accept(ms, 3, &r));
+	pwtest_int_eq(r, FUSION_REJ_CROSS_DRIVER);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_fusion_validator)
 {
 	pwtest_add(fusion_validator_empty_group_accepts, PWTEST_NOARG);
@@ -806,6 +842,8 @@ PWTEST_SUITE(module_deadline_fusion_validator)
 			PWTEST_NOARG);
 	pwtest_add(fusion_oracle_enumerate_chain_5, PWTEST_NOARG);
 	pwtest_add(fusion_oracle_enumerate_diamond_5, PWTEST_NOARG);
+	pwtest_add(fusion_validator_driver_member_accepts, PWTEST_NOARG);
+	pwtest_add(fusion_validator_driver_member_cross_driver_rejects, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

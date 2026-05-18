@@ -196,6 +196,21 @@
  *                       path. Input to the offline calibration
  *                       tool `live-test/conformal_calibrate.py`.
  *                       Default off.
+ * - `driver.schedule`:  If true (default false), include the driver
+ *                       node's own data-loop thread in the scheduling
+ *                       DAG: its WCET is sampled from its self-entry
+ *                       in target_list, it becomes a node in the
+ *                       analysis (sink for playback graphs, source
+ *                       for capture), and it receives a
+ *                       SCHED_DEADLINE tuple alongside its followers.
+ *                       Default false: the driver keeps whatever
+ *                       policy the daemon (or rtkit) already gave it.
+ *                       Requires the driver to run on a dedicated
+ *                       dynamic data-loop (`context.dynamic-data-loops
+ *                       = true`); a driver still on the shared main
+ *                       loop has no `PW_KEY_NODE_LOOP_TID` published
+ *                       and is silently excluded, same fallback as
+ *                       followers without a TID.
  * - `recalc.sync`:      If true (default false), run the parameter
  *                       recalculation synchronously on the driver's RT
  *                       data-loop thread, as the module did before the
@@ -710,6 +725,19 @@ struct impl {
 	 */
 	char                 *conformal_trace_path;
 	FILE                 *conformal_trace_fp;
+
+	/* When true, the driver's own data-loop thread is part of the
+	 * scheduling DAG: its self-entry in target_list is sampled, it
+	 * is added to topo.nodes[], and it receives a SCHED_DEADLINE
+	 * tuple alongside its followers. Default false: the driver
+	 * keeps whatever policy the daemon (or rtkit) already gave it,
+	 * and only followers transition to SCHED_DEADLINE. The flag is
+	 * gating because the driver thread is the timing root of the
+	 * graph -- a bad tuple here stalls every follower at once, so
+	 * the safer default is to leave it alone until live
+	 * verification confirms a workload is healthy under the
+	 * extended policy. */
+	bool                  driver_schedule;
 };
 
 static void hist_dump(const char *who, struct node *drv);
@@ -1842,11 +1870,16 @@ static void recalc_params_sync(struct node *drv)
 		pid_t tid;
 		struct node *n;
 
-		/* Skip the driver's self entry in target_list (see
-		 * rt_push_samples for the full rationale). The driver's
-		 * own runtime is not a scheduling input and would only
-		 * confuse the follower bookkeeping. */
-		if (tnode == node)
+		/* Driver self-entry in target_list. When driver.schedule
+		 * is off, the driver's own runtime is not a scheduling
+		 * input and the entry is skipped here (matching the
+		 * async producer-side skip in rt_push_samples). When on,
+		 * the entry is kept and the driver becomes a regular
+		 * follower in the analysis: its runtime is sampled, a
+		 * struct node already exists (created by
+		 * context_driver_added), and its WCET feeds the DAG
+		 * along with the followers'. */
+		if (tnode == node && !impl->driver_schedule)
 			continue;
 
 		if (!pw_properties_get_bool(tnode->properties,
@@ -2002,21 +2035,22 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 
 		/* pw_impl_node_register hooks the driver into its own
 		 * target_list via from_driver_peer / to_driver_peer
-		 * (impl-node.c:1063-1064), so the driver's self-sample
-		 * would otherwise land in drv->ring with s->node_id ==
-		 * drv->node_id. On the consumer side, find_node_by_id
-		 * excludes drivers and returns NULL, so worker_drain_samples
-		 * would calloc a phantom follower struct sharing the
-		 * driver's id and insert it ahead of the driver in
-		 * nodes_by_id (node_register's bsearch puts duplicates
-		 * to the left of existing entries). Future
-		 * find_node_any_by_id(impl, driver_id) lookups would then
-		 * return the phantom struct (n->node == NULL), causing
-		 * snapshot_topology_main's "driver gone" early return to
-		 * leak the pending flag at 1 -- which permanently kills
-		 * snapshot queueing for that driver. Skip the self entry
-		 * at the producer instead. */
-		if (tnode == node)
+		 * (impl-node.c:1063-1064). When driver.schedule is off
+		 * the driver's self-sample is dropped at the producer
+		 * because the worker is then deliberately blind to it
+		 * (the worker's find_node_any_by_id lookup below resolves
+		 * the driver entry, but routing a driver-id sample into
+		 * apply_sample would still feed an unused WCET slot --
+		 * cheap, but pointless). When driver.schedule is on the
+		 * sample is kept: worker_drain_samples below resolves
+		 * the driver's pre-existing struct node via
+		 * find_node_any_by_id (no phantom is created), and the
+		 * driver's WCET feeds the DAG analysis the same way a
+		 * follower's does. The historical risk noted here -- a
+		 * phantom shadowing the driver in nodes_by_id when the
+		 * consumer used find_node_by_id and got NULL -- is gone
+		 * because the consumer now uses the any-variant. */
+		if (tnode == node && !drv->impl->driver_schedule)
 			continue;
 
 		runtime = get_runtime_ns(tnode, t->activation);
@@ -2039,7 +2073,14 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 		 * SAMPLE_CPU_UNKNOWN before the first placement; the
 		 * worker then skips normalisation and treats the sample
 		 * as already in reference-CPU units. */
-		struct node *n_lookup = find_node_by_id(drv->impl,
+		/* find_node_any_by_id (not the follower-only variant):
+		 * when tnode is the driver itself (driver.schedule on),
+		 * the follower-only lookup returns NULL and the placement
+		 * CPU falls to SAMPLE_CPU_UNKNOWN even after the driver
+		 * has been pinned -- losing the cycles-to-reference
+		 * normalisation. The any-variant returns whichever entry
+		 * exists; for follower ids the result is identical. */
+		struct node *n_lookup = find_node_any_by_id(drv->impl,
 				tnode->info.id);
 		s->cpu = (n_lookup != NULL && n_lookup->last_applied) ?
 				n_lookup->last_cpu : SAMPLE_CPU_UNKNOWN;
@@ -2066,7 +2107,17 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 		const struct sample *s = (const struct sample *)
 			((uint8_t *)drv->ring_slots + offset);
 
-		struct node *n = find_node_by_id(impl, s->node_id);
+		/* find_node_any_by_id: when driver.schedule is on, the
+		 * driver's self-sample arrives in this ring; the
+		 * follower-only lookup would return NULL for the driver
+		 * and the calloc branch below would insert a phantom
+		 * struct under the driver's id (the historical bug the
+		 * producer-side self-skip used to mask). The any-variant
+		 * resolves the driver entry created by
+		 * context_driver_added and the phantom branch is reserved
+		 * for genuinely new follower ids that arrive via samples
+		 * before node_added has run. */
+		struct node *n = find_node_any_by_id(impl, s->node_id);
 		if (n == NULL) {
 			n = calloc(1, sizeof(*n));
 			if (n) {
@@ -2985,7 +3036,15 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 
 	struct pw_impl_node *follower;
 	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
-		if (follower == dnode)
+		/* The driver appears at the head of its own follower_list
+		 * (impl-node.c registers the driver into its own list at
+		 * pw_impl_node_register). When driver.schedule is off it
+		 * is skipped here and never reaches the scheduling DAG;
+		 * when on, it is treated as just-another-node. The
+		 * dynamic-loop / TID filter below acts as the safe
+		 * fallback: a driver still on the shared main loop has
+		 * no TID published and is silently excluded. */
+		if (follower == dnode && !a->impl->driver_schedule)
 			continue;
 		if (!pw_properties_get_bool(follower->properties,
 					    PW_KEY_NODE_LOOP_DYNAMIC, false))
@@ -3027,7 +3086,14 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 	 * delay rationale is identical, so we filter both kinds with
 	 * the same one-liner. */
 	spa_list_for_each(follower, &dnode->follower_list, follower_link) {
-		if (follower == dnode)
+		/* Same driver self-skip rationale as the node loop above:
+		 * walking the driver's output_ports here is what supplies
+		 * the driver-as-source edges that capture graphs need.
+		 * Edges whose other endpoint is the driver are already
+		 * picked up by the follower iterations because every
+		 * follower with a link to the driver has the driver as
+		 * its output_link target. */
+		if (follower == dnode && !a->impl->driver_schedule)
 			continue;
 		struct pw_impl_port *p;
 		struct pw_impl_link *l;
@@ -3165,7 +3231,15 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	{
 		uint64_t this_gen = SPA_ATOMIC_LOAD(t->generation);
 		for (i = 0; i < t->n_nodes; i++) {
-			struct node *n = find_node_by_id(impl,
+			/* find_node_any_by_id (not find_node_by_id):
+			 * when driver.schedule is true, t->nodes[i].id
+			 * may be the driver's own id and the follower
+			 * variant deliberately filters drivers out.
+			 * Driver and follower struct nodes share the
+			 * same id-index and the same wcet/conformal
+			 * slots, so the any-variant returns the right
+			 * entry whichever it is. */
+			struct node *n = find_node_any_by_id(impl,
 					t->nodes[i].id);
 
 			followers[i].id = t->nodes[i].id;
@@ -3913,6 +3987,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		else
 			pw_log_warn("wcet.recalc-threshold %s ignored", s);
 	}
+
+	impl->driver_schedule = pw_properties_get_bool(props,
+			"driver.schedule", false);
 
 	impl->sync_mode = pw_properties_get_bool(props, "recalc.sync", false);
 	impl->worker_rt_prio = WORKER_DEFAULT_RT_PRIO;
