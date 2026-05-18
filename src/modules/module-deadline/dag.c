@@ -2133,7 +2133,17 @@ static bool prefer_cpu_choice(double projected, uint32_t cpu,
  * papers/Casini-PartitionedFP-RTSS2018.pdf -- worst-fit/best-fit
  * heuristics where the ordering of the input list dominates the
  * resulting feasibility ratio. */
-static int assign_cpus(dag_t *g)
+/* Worst-fit CPU placement. `relax=false` is the default hard-mode
+ * gate against g->admission_ceiling: a node is only accepted on a CPU
+ * whose projected utilisation stays at or below the ceiling, and the
+ * whole pass fails with EAGAIN if no CPU passes the gate. `relax=true`
+ * is the soft-mode fallback used by dag_recalculate_soft: the gate is
+ * dropped so the placer always picks the least-projected CPU, even if
+ * the resulting partition's density exceeds the ceiling. The
+ * placement order (utilisation-descending, with co-location groups
+ * forced onto the leader's CPU) is identical so the soft and hard
+ * outputs are directly comparable. */
+static int assign_cpus_internal(dag_t *g, bool relax)
 {
 	uint32_t count = g->indexed_count;
 	uint32_t unrelated_size = g->unrelated_size;
@@ -2248,7 +2258,9 @@ static int assign_cpus(dag_t *g)
 			 * placement is infeasible and the whole DAG fails
 			 * EAGAIN -- splitting a group across CPUs is not
 			 * allowed because it would invalidate the
-			 * thread-merge done by libpipewire. */
+			 * thread-merge done by libpipewire. In `relax` mode
+			 * the gate is dropped: the group must stay together,
+			 * so the leader's CPU is the only legal choice. */
 			uint32_t c = (uint32_t)forced_cpu;
 			double rc = g->relative_capacity[c];
 			double u_rel = u / rc;
@@ -2263,7 +2275,8 @@ static int assign_cpus(dag_t *g)
 					projected = candidate;
 			}
 
-			if (projected <= g->admission_ceiling + DAG_LOAD_EPSILON) {
+			if (relax ||
+			    projected <= g->admission_ceiling + DAG_LOAD_EPSILON) {
 				chosen = (int)c;
 				chosen_projected = projected;
 			}
@@ -2282,7 +2295,8 @@ static int assign_cpus(dag_t *g)
 						projected = candidate;
 				}
 
-				if (projected <= g->admission_ceiling + DAG_LOAD_EPSILON &&
+				if ((relax ||
+				     projected <= g->admission_ceiling + DAG_LOAD_EPSILON) &&
 						prefer_cpu_choice(projected, c,
 							chosen_projected, chosen)) {
 					chosen_projected = projected;
@@ -2325,6 +2339,11 @@ static int assign_cpus(dag_t *g)
 	free(cpu_peak);
 	free(info);
 	return 0;
+}
+
+static int assign_cpus(dag_t *g)
+{
+	return assign_cpus_internal(g, false);
 }
 
 double dag_per_cpu_density(const dag_t *g, uint32_t cpu)
@@ -3076,6 +3095,124 @@ int dag_recalculate(dag_t *g)
 	pw_log_debug("DAG recalculation completed in %.6f seconds", duration);
 
 	/* Success: the cached schedule is now clean. */
+	g->dirty = false;
+	return 0;
+}
+
+/* Soft-mode counterpart of dag_recalculate.
+ *
+ * When the strict hard-mode pipeline fails because the critical path
+ * alone exceeds the slowest-CPU-scaled deadline (or the minimum
+ * per-node reservation does), every downstream caller used to fall
+ * back to dag_foreach_node(state_dag, ...) which itself triggers the
+ * same dag_check_feasibility gate and also fails -- so no node gets
+ * any SCHED_DEADLINE parameters and the "hard realtime dropped"
+ * transition is observationally a no-op.
+ *
+ * This variant produces a kernel-valid (runtime, deadline, period,
+ * cpu) tuple for every real node by:
+ *
+ *   1. Reusing the same analysis prep as dag_recalculate (indexed
+ *      nodes, successors, unrelated sets, fictitious endpoints,
+ *      longest paths). Identical inputs, identical caches.
+ *   2. Skipping dag_check_feasibility: the soft fallback's whole
+ *      point is to keep going when the strict gate refuses.
+ *   3. Running dag_soft_redistribute_deadlines instead of the
+ *      assign_deadlines_iterative / dag_assign_cumulative_deadlines /
+ *      dag_compute_local_deadlines chain. The redistribution sets
+ *      cumulative_deadline, local_deadline, deadline_assigned and
+ *      budget_clipped per node; it never fails on a non-degenerate
+ *      DAG with a positive end-to-end deadline.
+ *   4. Mirroring local_deadline to the legacy `deadline` field so
+ *      assign_cpus's utilisation arithmetic has a valid denominator
+ *      (the placer uses min(deadline, period)).
+ *   5. Calling assign_cpus_internal(g, true): the relaxed worst-fit
+ *      that picks the least-projected CPU even when no CPU passes
+ *      the admission ceiling.
+ *
+ * Returns 0 on success (g->dirty cleared), -1 on any of the
+ * structural failures (cycle in the DAG, OOM, empty graph). On
+ * failure g is left dirty so a future caller can retry the strict
+ * pipeline.
+ *
+ * The function does not attempt to detect that strict feasibility
+ * has been restored -- the reconcile layer keeps calling
+ * dag_recalculate first and only falls back here on EAGAIN, so the
+ * promotion path remains the strict one and the hysteresis-driven
+ * SOFT_DEGRADED -> HARD transition fires from the existing
+ * post-recalc classification block.
+ */
+int dag_recalculate_soft(dag_t *g)
+{
+	int ret;
+	bool analysis_cached;
+
+	if (!g) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (spa_list_is_empty(&g->nodes)) {
+		dag_invalidate_analysis(g);
+		g->dirty = false;
+		return 0;
+	}
+
+	dag_invalidate_schedule(g);
+
+	analysis_cached = (g->indexed_nodes != NULL);
+
+	if (!analysis_cached) {
+		dag_node_t **sources, **sinks;
+		uint32_t nsources, nsinks;
+		find_sources_and_sinks(g, &sources, &nsources, &sinks, &nsinks);
+
+		if (nsources == 0 || nsinks == 0) {
+			free(sources);
+			free(sinks);
+			dag_mark_dirty(g);
+			errno = EINVAL;
+			return -1;
+		}
+
+		ret = dag_build_analysis(g, sources, nsources, sinks, nsinks);
+		free(sources);
+		free(sinks);
+		if (ret != 0) {
+			dag_mark_dirty(g);
+			return -1;
+		}
+	} else {
+		dag_populate_longest_paths(g);
+	}
+
+	{
+		double obj = 0.0;
+		uint32_t clipped = 0;
+		if (!dag_soft_redistribute_deadlines(g, &obj, &clipped)) {
+			dag_mark_dirty(g);
+			return -1;
+		}
+	}
+
+	/* assign_cpus reads min(deadline, period) as the per-node
+	 * denominator. dag_soft_redistribute_deadlines only populates
+	 * cumulative_deadline and local_deadline; copy the latter into
+	 * the legacy field so the placer's utilisation arithmetic
+	 * matches the hard-mode contract. */
+	{
+		dag_node_t *n;
+		spa_list_for_each(n, &g->nodes, link) {
+			if (!n->fictitious)
+				n->deadline = n->local_deadline;
+		}
+	}
+
+	if (assign_cpus_internal(g, true) < 0) {
+		dag_mark_dirty(g);
+		return -1;
+	}
+
 	g->dirty = false;
 	return 0;
 }

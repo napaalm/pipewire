@@ -1934,6 +1934,106 @@ PWTEST(feasibility_min_deadline_reservation)
 	return PWTEST_PASS;
 }
 
+/* dag_recalculate_soft: critical-path overrun (the same workload as
+ * feasibility_critical_path_overrun) must produce a complete
+ * SCHED_DEADLINE-valid assignment when run through the soft variant.
+ * Every real node ends up with a CPU, a non-zero local_deadline, and
+ * the soft heuristic flags the nodes whose wcet exceeds their
+ * redistributed slice as budget_clipped. */
+PWTEST(recalculate_soft_critical_path_overrun_assigns_all_nodes)
+{
+	dag_t *g = dag_create(20, 20, 1.0f, 1, NULL);
+	dag_node_t *a, *b, *c;
+	uint32_t clipped_total;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	/* The strict pipeline rejects (critical path 30 > deadline 20). */
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+	pwtest_bool_true(g->dirty);
+
+	/* The soft pipeline produces a complete assignment. */
+	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_bool_false(g->dirty);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+	pwtest_bool_true(a->deadline_assigned);
+	pwtest_bool_true(b->deadline_assigned);
+	pwtest_bool_true(c->deadline_assigned);
+	pwtest_bool_true(a->local_deadline > 0);
+	pwtest_bool_true(b->local_deadline > 0);
+	pwtest_bool_true(c->local_deadline > 0);
+	pwtest_int_ne((int)a->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_ne((int)b->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_ne((int)c->cpu, (int)DAG_CPU_INVALID);
+
+	/* Soft redistribution: 30 wcet over a 20-budget chain forces at
+	 * least one node to clip. */
+	clipped_total = (a->budget_clipped ? 1u : 0u) +
+			(b->budget_clipped ? 1u : 0u) +
+			(c->budget_clipped ? 1u : 0u);
+	pwtest_bool_true(clipped_total > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* dag_recalculate_soft on a workload that strictly fails admission_ceiling
+ * because every node lands on the only CPU. The relaxed placer must
+ * still complete the placement (no EAGAIN) and every node gets the
+ * same CPU. */
+PWTEST(recalculate_soft_relaxed_placement_overrides_admission_ceiling)
+{
+	dag_t *g = dag_create(100, 100, 0.10f, 1, NULL);
+	dag_node_t *a, *b;
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 60, 201), 0);
+	pwtest_int_eq(add_real_node(g, 2, 60, 202), 0);
+
+	errno = 0;
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(errno, EAGAIN);
+
+	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_int_eq((int)a->cpu, 0);
+	pwtest_int_eq((int)b->cpu, 0);
+	pwtest_bool_true(a->local_deadline > 0);
+	pwtest_bool_true(b->local_deadline > 0);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* dag_recalculate_soft on an empty DAG: same fast-path as the strict
+ * variant (no nodes -> clean, dirty=false). */
+PWTEST(recalculate_soft_empty_graph_is_noop)
+{
+	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
+
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_bool_false(g->dirty);
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(dirty_noop_after_clean_recalc)
 {
 	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
@@ -3511,6 +3611,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(feasibility_tight_critical_path, PWTEST_NOARG);
 	pwtest_add(feasibility_critical_path_overrun, PWTEST_NOARG);
 	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
+	pwtest_add(recalculate_soft_critical_path_overrun_assigns_all_nodes,
+			PWTEST_NOARG);
+	pwtest_add(recalculate_soft_relaxed_placement_overrides_admission_ceiling,
+			PWTEST_NOARG);
+	pwtest_add(recalculate_soft_empty_graph_is_noop, PWTEST_NOARG);
 	pwtest_add(cpu_placement_orders_by_descending_density, PWTEST_NOARG);
 	pwtest_add(cpu_placement_equal_density_lowest_cpu, PWTEST_NOARG);
 	pwtest_add(cp_aware_chain_plus_independent_placement, PWTEST_NOARG);

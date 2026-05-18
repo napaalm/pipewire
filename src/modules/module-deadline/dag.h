@@ -274,6 +274,18 @@ dag_node_t *dag_find_node(dag_t *g, uint32_t id);
 /* Recalculate scheduling parameters after changes */
 int dag_recalculate(dag_t *g);
 
+/* Soft-mode recalculate: same analysis prep as dag_recalculate, but
+ * with the strict critical-path / minimum-reservation feasibility
+ * gate skipped, deadlines assigned by proportional redistribution
+ * (dag_soft_redistribute_deadlines), and CPU placement via a relaxed
+ * worst-fit that always picks the least-projected CPU regardless of
+ * admission_ceiling. Used by the reconcile layer when dag_recalculate
+ * returns EAGAIN -- it produces a kernel-valid SCHED_DEADLINE tuple
+ * for every node so the schedule still applies (with budget_clipped
+ * markers on nodes whose wcet exceeds their redistributed slice), at
+ * the cost of dropping the hard-real-time guarantee. */
+int dag_recalculate_soft(dag_t *g);
+
 /*
  * Per-CPU EDF density. For every real node assigned to `cpu`, sum
  *
