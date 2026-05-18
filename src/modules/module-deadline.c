@@ -1801,6 +1801,13 @@ static void recalc_params_sync(struct node *drv)
 		pid_t tid;
 		struct node *n;
 
+		/* Skip the driver's self entry in target_list (see
+		 * rt_push_samples for the full rationale). The driver's
+		 * own runtime is not a scheduling input and would only
+		 * confuse the follower bookkeeping. */
+		if (tnode == node)
+			continue;
+
 		if (!pw_properties_get_bool(tnode->properties,
 				PW_KEY_NODE_LOOP_DYNAMIC, false))
 			continue;
@@ -1950,7 +1957,28 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 
 	spa_list_for_each(t, &node->rt.target_list, link) {
 		struct pw_impl_node *tnode = t->node;
-		uint64_t runtime = get_runtime_ns(tnode, t->activation);
+		uint64_t runtime;
+
+		/* pw_impl_node_register hooks the driver into its own
+		 * target_list via from_driver_peer / to_driver_peer
+		 * (impl-node.c:1063-1064), so the driver's self-sample
+		 * would otherwise land in drv->ring with s->node_id ==
+		 * drv->node_id. On the consumer side, find_node_by_id
+		 * excludes drivers and returns NULL, so worker_drain_samples
+		 * would calloc a phantom follower struct sharing the
+		 * driver's id and insert it ahead of the driver in
+		 * nodes_by_id (node_register's bsearch puts duplicates
+		 * to the left of existing entries). Future
+		 * find_node_any_by_id(impl, driver_id) lookups would then
+		 * return the phantom struct (n->node == NULL), causing
+		 * snapshot_topology_main's "driver gone" early return to
+		 * leak the pending flag at 1 -- which permanently kills
+		 * snapshot queueing for that driver. Skip the self entry
+		 * at the producer instead. */
+		if (tnode == node)
+			continue;
+
+		runtime = get_runtime_ns(tnode, t->activation);
 
 		uint32_t widx;
 		int32_t filled = spa_ringbuffer_get_write_index(&drv->ring, &widx);
@@ -3310,7 +3338,16 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 
 	n->impl = impl;
 	n->node = node;
-	n->node_id = node->info.id;
+	/* pw_context_emit_driver_added fires from inside insert_driver(),
+	 * which runs before pw_impl_node_register assigns node->info.id
+	 * (impl-node.c reads as: insert_driver(); registered=true;
+	 *  info.id = global->id). So node->info.id is still zero here for
+	 * every driver, which collapses the id-keyed index and breaks
+	 * snapshot routing. The global is already created by this point,
+	 * and global->id is what info.id will be set to a few lines later,
+	 * so use it as the stable id. */
+	n->node_id = node->global ? pw_global_get_id(node->global)
+				 : node->info.id;
 	n->is_driver = true;
 
 	/* Allocate the per-driver SPSC sample ring. Worker reads, RT
@@ -3318,8 +3355,8 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 	n->ring_capacity = WORKER_RING_CAPACITY;
 	n->ring_slots = calloc(n->ring_capacity, sizeof(struct sample));
 	if (n->ring_slots == NULL) {
-		pw_log_warn("driver %d: failed to allocate sample ring; module disabled for this driver",
-			    node->info.id);
+		pw_log_warn("driver %u: failed to allocate sample ring; module disabled for this driver",
+			    n->node_id);
 		free(n);
 		return;
 	}
@@ -3327,8 +3364,8 @@ static void context_driver_added(void *data, struct pw_impl_node *node)
 
 	spa_list_append(&impl->node_list, &n->link);
 	if (node_register(impl, n) < 0) {
-		pw_log_warn("driver %d: failed to register in id index; module disabled for this driver",
-			    node->info.id);
+		pw_log_warn("driver %u: failed to register in id index; module disabled for this driver",
+			    n->node_id);
 		spa_list_remove(&n->link);
 		free(n->ring_slots);
 		free(n);
@@ -3915,7 +3952,21 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 				CPU_SET(c, &impl->worker_affinity);
 		}
 
-		impl->worker_tloop = pw_thread_loop_new("deadline-recalc", NULL);
+		/* "thread-loop.start-signal" tells do_loop to call
+		 * pw_thread_loop_signal() right after pw_loop_enter()
+		 * sets impl->thread. Without this the next pw_loop_invoke
+		 * can race the new thread: while impl->thread is still 0,
+		 * loop_queue_invoke takes the in_thread=true path and runs
+		 * the callback synchronously on the caller (the main
+		 * thread), so worker_setup would promote the WRONG tid
+		 * (the daemon main loop) to SCHED_FIFO and leave the
+		 * actual worker at SCHED_OTHER. */
+		struct pw_properties *tloop_props = pw_properties_new(
+			"thread-loop.start-signal", "true",
+			NULL);
+		impl->worker_tloop = pw_thread_loop_new("deadline-recalc",
+				tloop_props ? &tloop_props->dict : NULL);
+		pw_properties_free(tloop_props);
 		if (impl->worker_tloop == NULL) {
 			pw_log_error("failed to create deadline-recalc thread loop: %m");
 			goto worker_failed;
@@ -3937,7 +3988,16 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			goto worker_failed;
 		}
 
+		/* Lock + start + wait pattern: the lock is released by
+		 * pw_thread_loop_wait() while sleeping on the condvar,
+		 * so the worker thread can reach pw_loop_enter() (which
+		 * takes the same mutex). When the worker signals from
+		 * do_loop after entering, wait() returns with the lock
+		 * held and impl->thread already set to the worker's
+		 * pthread_t. */
+		pw_thread_loop_lock(impl->worker_tloop);
 		if (pw_thread_loop_start(impl->worker_tloop) < 0) {
+			pw_thread_loop_unlock(impl->worker_tloop);
 			pw_log_error("failed to start deadline-recalc thread: %m");
 			pw_loop_destroy_source(impl->worker_loop, impl->worker_wake);
 			impl->worker_wake = NULL;
@@ -3945,10 +4005,13 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->worker_tloop = NULL;
 			goto worker_failed;
 		}
+		pw_thread_loop_wait(impl->worker_tloop);
+		pw_thread_loop_unlock(impl->worker_tloop);
 
-		/* Apply scheduling+affinity to the worker thread itself
-		 * via a synchronous invoke. Failure is non-fatal: the
-		 * worker still works, just at SCHED_OTHER. */
+		/* impl->thread is now set; loop_queue_invoke will take
+		 * the cross-thread path and post worker_setup to the
+		 * worker's queue. Failure is non-fatal: the worker still
+		 * works, just at SCHED_OTHER. */
 		struct worker_setup_arg setup = {
 			.aff = impl->worker_affinity,
 			.rt_prio = impl->worker_rt_prio,
