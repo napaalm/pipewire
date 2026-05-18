@@ -85,22 +85,20 @@
  * ## Module Options
  *
  * - `cpus.available`: The list of CPUs to which the threads are bound.
- *                       If unset or empty, the default is every CPU
- *                       currently reachable through the pipewire
- *                       process' affinity mask (typically every online
- *                       CPU). Restrict explicitly only when you want a
- *                       subset of cores reserved for audio.
+ *                       If unset or empty, the default is `[ 0 1 2 3 ]`.
+ *                       Override explicitly to reserve a different
+ *                       subset of cores for audio.
  * - `cpus.utilization`: The maximum CPU utilization (per core) that DEADLINE
  *                       threads are allowed to consume. The default is 0.95.
  * - `cpus.smt-policy`:  How to handle SMT-paired logical CPUs within
- *                       `cpus.available`. `strict` (the default) refuses
- *                       the module load if any two CPUs in the set share
- *                       a physical core: the kernel admission is per
- *                       logical CPU and would silently overcommit the
- *                       physical capacity. `dedupe` keeps the lowest-id
- *                       sibling per core and drops the others. `ignore`
- *                       accepts the set unchanged and logs a warning;
- *                       only useful for diagnostic comparisons.
+ *                       `cpus.available`. `dedupe` (the default) keeps
+ *                       the lowest-id sibling per core and drops the
+ *                       others, so the kernel admission test never
+ *                       overcommits a physical core. `strict` refuses
+ *                       the module load if any two CPUs in the set
+ *                       share a physical core. `ignore` accepts the
+ *                       set unchanged and logs a warning; only useful
+ *                       for diagnostic comparisons.
  * - `cpus.dvfs-policy`: Which cpufreq frequency to use when computing
  *                       per-CPU capacity. `conservative` (the default)
  *                       uses `cpuinfo_min_freq`: any budget that fits
@@ -243,8 +241,8 @@
  * context.modules = [
  * {   name = libpipewire-module-deadline
  *     args = {
- *         # cpus.available defaults to every CPU the process can run
- *         # on; uncomment to restrict explicitly.
+ *         # cpus.available defaults to [ 0 1 2 3 ]; uncomment to
+ *         # override explicitly.
  *         # cpus.available = [ 2 3 4 5 6 7 ]
  *         cpus.utilization = 0.95
  *     }
@@ -3420,27 +3418,15 @@ static const struct pw_context_events context_events = {
 	.driver_removed = context_driver_removed,
 };
 
-/* Fill impl->cpus[] with every CPU reachable through the pipewire
- * process' current affinity mask. This is the fallback when
- * cpus.available is unset or empty: it gives the operator "use every
- * CPU the kernel lets us touch" without forcing them to enumerate the
- * topology by hand. Returns the number of CPUs written, or 0 if the
- * affinity query itself fails (the caller will then refuse to load). */
-static int default_cpus_from_affinity(struct impl *impl)
+/* Fill impl->cpus[] with the default deadline-CPU set [ 0 1 2 3 ].
+ * Used when cpus.available is unset or empty: the operator picks a
+ * different subset by setting the property explicitly. */
+static int default_cpus(struct impl *impl)
 {
-	cpu_set_t set;
-	int i, n = 0;
-
-	CPU_ZERO(&set);
-	if (sched_getaffinity(0, sizeof(set), &set) < 0) {
-		pw_log_warn("sched_getaffinity failed: %m");
-		return 0;
-	}
-	for (i = 0; i < CPU_SETSIZE && n < MAX_CPUS; i++) {
-		if (CPU_ISSET(i, &set))
-			impl->cpus[n++] = i;
-	}
-	return n;
+	int i;
+	for (i = 0; i < 4; i++)
+		impl->cpus[i] = i;
+	return 4;
 }
 
 static void parse_cpus(struct impl *impl, const char *cpus_str)
@@ -3449,7 +3435,7 @@ static void parse_cpus(struct impl *impl, const char *cpus_str)
 	int i = 0, v;
 
 	if (cpus_str == NULL || cpus_str[0] == '\0') {
-		impl->n_cpus = default_cpus_from_affinity(impl);
+		impl->n_cpus = default_cpus(impl);
 		return;
 	}
 
@@ -3466,22 +3452,22 @@ static void parse_cpus(struct impl *impl, const char *cpus_str)
 		}
 	}
 	if (i == 0)
-		i = default_cpus_from_affinity(impl);
+		i = default_cpus(impl);
 	impl->n_cpus = i;
 }
 
 static enum cpu_smt_policy parse_smt_policy(const char *s)
 {
 	if (s == NULL)
-		return CPU_SMT_STRICT;
+		return CPU_SMT_DEDUPE;
 	if (strcmp(s, "strict") == 0)
 		return CPU_SMT_STRICT;
 	if (strcmp(s, "dedupe") == 0)
 		return CPU_SMT_DEDUPE;
 	if (strcmp(s, "ignore") == 0)
 		return CPU_SMT_IGNORE;
-	pw_log_warn("cpus.smt-policy '%s' not recognised; using 'strict'", s);
-	return CPU_SMT_STRICT;
+	pw_log_warn("cpus.smt-policy '%s' not recognised; using 'dedupe'", s);
+	return CPU_SMT_DEDUPE;
 }
 
 static enum cpu_dvfs_policy parse_dvfs_policy(const char *s)
