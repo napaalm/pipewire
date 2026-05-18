@@ -125,11 +125,100 @@ context.modules = [
 
     { name = libpipewire-module-deadline
         args = {
-            # cpus.available defaults to every CPU reachable through
-            # the process affinity mask. Set it explicitly to reserve
-            # a subset of cores for audio:
-            #   cpus.available = [ 2 3 4 5 6 7 ]
-            cpus.utilization = 0.95
+            # Every key below is shown with its default value. Uncomment
+            # to override.
+
+            # ---- CPU set & topology ----
+            # CPUs eligible for SCHED_DEADLINE follower placement.
+            #cpus.available                          = [ 0 1 2 3 ]
+            # Maximum per-core utilisation the worst-fit placer may pack.
+            #cpus.utilization                        = 0.95
+            # SMT-sibling handling: dedupe | strict | ignore.
+            #cpus.smt-policy                         = dedupe
+            # cpufreq used for capacity: conservative (cpuinfo_min_freq)
+            # or assume-max (cpuinfo_max_freq).
+            #cpus.dvfs-policy                        = conservative
+            # Test affordance: JSON topology override that bypasses sysfs
+            # probing (see cpu_topology_from_json for the schema).
+            #cpus.topology-override                  = ""
+
+            # ---- Scheduling ----
+            # Set SCHED_FLAG_RECLAIM (GRUB) on every sched_setattr.
+            #sched.reclaim                           = true
+
+            # ---- Budget source ----
+            # Runtime-budget hierarchy cap: manual | deterministic |
+            # adaptive_conformal | bootstrap. The unset default lets the
+            # module pick automatically (currently adaptive_conformal).
+            #deadline.budget.source                  = adaptive_conformal
+
+            # ---- Adaptive-conformal estimator ----
+            # Target graph-level overrun frequency and adaptive clamps
+            # (Gibbs & Candes 2021).
+            #deadline.conformal.alpha_graph          = 1e-3
+            #deadline.conformal.alpha_min            = 1e-5
+            #deadline.conformal.alpha_max            = 5e-2
+            # Step size of the adaptive alpha update.
+            #deadline.conformal.eta                  = 5e-3
+            # Score-ring size per follower; must be in [2, 4096].
+            #deadline.conformal.window               = 1024
+            # Observations between rolling quantile recomputes.
+            #deadline.conformal.recalc_period        = 1
+            # EWMA gains for the location and abs-deviation scale
+            # predictors.
+            #deadline.conformal.ewma_location_lambda = 0.05
+            #deadline.conformal.ewma_scale_lambda    = 0.05
+            # Additive (ns) and multiplicative guards on the raw
+            # prediction.
+            #deadline.conformal.guard_ns             = 1500
+            #deadline.conformal.guard_percent        = 0.05
+            # Lower bound on the EWMA scale used in score normalisation.
+            #deadline.conformal.sigma_floor_ns       = 1
+            # Lower clamp on the emitted budget.
+            #deadline.conformal.runtime_floor_ns     = 1000
+            # Observations required for BOOTSTRAP -> VALID.
+            #deadline.conformal.bootstrap_min_samples = 64
+            # Bootstrap floor published while in BOOTSTRAP (0 = use
+            # runtime_floor_ns).
+            #deadline.conformal.bootstrap_runtime_ns = 0
+            # Per-update accounting cap (ns) for the estimator.
+            #deadline.conformal.max_update_cost_ns   = 5000
+            # Risk-budget allocation across followers:
+            # uniform | density_weighted | slope_weighted.
+            #deadline.conformal.risk_allocation      = uniform
+            # Allow BOOTSTRAP to reuse a compatible-history budget when
+            # a previously observed mode-key fingerprint recurs.
+            #deadline.conformal.compatible_history   = true
+            # Per-sample JSONL trace export (input to
+            # live-test/conformal_calibrate.py). Both keys required.
+            #deadline.conformal.trace_export         = false
+            #deadline.conformal.trace_path           = ""
+
+            # ---- Diagnostic dumps ----
+            #debug.dump-raw-graph                    = false
+            #debug.dump-sched-graph                  = false
+            #debug.dump-fusion                       = false
+            # If non-empty, the worker writes a JSON reconcile snapshot
+            # to this path on every apply pass.
+            #debug.snapshot-json-path                = ""
+
+            # ---- Recalc worker ----
+            # Run the recalc synchronously on the driver's RT loop
+            # (benchmark-only; production should leave it false).
+            #recalc.sync                             = false
+            # SCHED_FIFO priority of the async recalc worker. Must be
+            # strictly lower than the audio processing priority.
+            #recalc.rt-prio                          = 5
+            # Per-callback sleep (us) to simulate a slow analysis stage.
+            #recalc.fake-delay-us                    = 0
+            # Keep a persistent DAG across wakes; false falls back to
+            # the legacy destroy-and-rebuild path.
+            #recalc.persistent                       = true
+
+            # ---- WCET caching ----
+            # Fractional WCET drift required to mark the cached DAG
+            # dirty. Must be in [0, 1); 0 disables the gate.
+            #wcet.recalc-threshold                   = 0.01
         }
     }
 
