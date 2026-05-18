@@ -776,6 +776,7 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 	struct dag *macro_dag = NULL;
 	dag_node_t *n;
 	int r;
+	bool soft_fallback_used = false;
 
 	/* Filter unsound fusion groups before contraction. A rejected
 	 * group has its members' group_ids cleared, which makes the
@@ -820,20 +821,49 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		 * scheduler. */
 		if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
 			pw_log_warn("reconcile: contracted-DAG analysis "
-				"rejected the schedule (%m); falling "
-				"back to per-node deadline split; "
-				"hard-real-time guarantees dropped");
+				"rejected the schedule (%m); retrying with "
+				"soft fallback (proportional deadlines + "
+				"relaxed placement); hard-real-time "
+				"guarantees dropped");
 		}
-		state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
-		state->feas.density_passed = false;
-		state->feas.dbf_passed = false;
-		state->feas.consecutive_hard_passes = 0;
-		snprintf(state->feas.reason, sizeof(state->feas.reason),
-				"placer_rejected");
-		dag_destroy(macro_dag);
-		contracted_dag_destroy(cg);
-		errno = e;
-		return dag_foreach_node(state_dag, sched_cb, sched_data);
+
+		/* Retry on EAGAIN with the soft variant. EAGAIN means
+		 * the strict feasibility gate or the admission-aware
+		 * worst-fit refused; the soft variant skips both gates
+		 * and produces a kernel-valid tuple for every node, so
+		 * SCHED_DEADLINE still gets applied (with budget_clipped
+		 * markers on the overshooting nodes). The post-recalc
+		 * feasibility classification below then runs on the soft
+		 * assignment and naturally lands on SOFT_DEGRADED because
+		 * a clipped node makes density > 1; that overrides
+		 * whatever we'd stamp here, so we don't pre-set it. */
+		if (e == EAGAIN && dag_recalculate_soft(macro_dag) == 0) {
+			pw_log_debug("reconcile: soft fallback produced a "
+				"complete assignment; emitting "
+				"SCHED_DEADLINE for every node");
+			soft_fallback_used = true;
+			/* Fall through to the success path: apply the
+			 * macro-DAG schedule back to cg and run the
+			 * existing feasibility / soft redistribution /
+			 * emission flow on it. The post-recalc
+			 * classification may decide the relaxed
+			 * placement is kernel-feasible (density <= 1
+			 * even when it violates the user-configured
+			 * admission ceiling) and stamp HARD; that's
+			 * overridden back to SOFT_DEGRADED below
+			 * because we *did* drop the user's contract. */
+		} else {
+			state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
+			state->feas.density_passed = false;
+			state->feas.dbf_passed = false;
+			state->feas.consecutive_hard_passes = 0;
+			snprintf(state->feas.reason, sizeof(state->feas.reason),
+					"placer_rejected");
+			dag_destroy(macro_dag);
+			contracted_dag_destroy(cg);
+			errno = e;
+			return dag_foreach_node(state_dag, sched_cb, sched_data);
+		}
 	}
 
 	contracted_dag_apply_dag_schedule(cg, macro_dag);
@@ -918,6 +948,21 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		}
 
 		state->feas = f;
+	}
+
+	/* When the soft fallback was used, the placement violated the
+	 * user-configured admission_ceiling. The post-recalc classifier
+	 * checks the kernel-side bound (density <= 1) which can still
+	 * pass on a relaxed-but-not-overloaded placement, so the verdict
+	 * above may flip back to HARD. That hides from the operator the
+	 * fact that we dropped their contract. Force SOFT_DEGRADED and
+	 * stamp a dedicated reason so the snapshot reflects the actual
+	 * mode the daemon is running in. */
+	if (soft_fallback_used) {
+		state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
+		state->feas.consecutive_hard_passes = 0;
+		snprintf(state->feas.reason, sizeof(state->feas.reason),
+				"soft_fallback");
 	}
 
 	/*
