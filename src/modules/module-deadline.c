@@ -904,7 +904,21 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline,
 		 * follower's last_applied cache. The caller in
 		 * apply_sched_groups clears last_applied on rc != 0;
 		 * here we log the errno + the offending tuple so the
-		 * downstream investigation has the full data. */
+		 * downstream investigation has the full data.
+		 *
+		 * ESRCH is special: the target thread no longer exists
+		 * (a client like pw-play just exited and its follower
+		 * has not yet been removed from the topology snapshot).
+		 * This is graceful-removal latency, not a scheduling
+		 * decision the kernel disagrees with, so don't escalate
+		 * the log level and return a distinct code so the caller
+		 * can avoid forcing the driver into SOFT_DEGRADED. */
+		if (errno == ESRCH) {
+			pw_log_debug("sched_setattr: tid %d gone (ESRCH);"
+				" follower will be dropped on next snapshot",
+				tid);
+			return -ESRCH;
+		}
 		if (errno == EINVAL)
 			pw_log_warn("sched_setattr rejected DEADLINE tuple"
 				" for tid %d (errno=EINVAL, r=%lu d=%lu p=%lu);"
@@ -934,6 +948,17 @@ static int set_cpu_affinity(pid_t tid, int cpu)
 
 	ret = sched_setaffinity(tid, sizeof(cpuset), &cpuset);
 	if (ret < 0) {
+		/* ESRCH: thread already gone (client disconnected between
+		 * the snapshot capture and this syscall). Treat the same
+		 * way as set_deadline_sched: log at debug, return a
+		 * distinct code so the caller does not escalate to
+		 * SOFT_DEGRADED for a transient removal race. */
+		if (errno == ESRCH) {
+			pw_log_debug("sched_setaffinity: tid %d gone (ESRCH);"
+				" follower will be dropped on next snapshot",
+				tid);
+			return -ESRCH;
+		}
 		if (errno == EINVAL)
 			pw_log_warn("invalid affinity for tid %d: cpu %d", tid, cpu);
 		else
@@ -1136,7 +1161,14 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
 				kernel_deadline, g->period,
 				impl->sched_reclaim);
-		rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
+		/* If the deadline syscall already reports the TID is gone
+		 * (ESRCH), don't bother with the affinity syscall on the
+		 * same dead TID -- it would return ESRCH too, just adding
+		 * to the debug noise without any new information. */
+		if (rc_sched == -ESRCH)
+			rc_aff = -ESRCH;
+		else
+			rc_aff = set_cpu_affinity(g->tid, impl->cpus[g->cpu]);
 
 		if (anchor == NULL)
 			continue;
@@ -1147,6 +1179,17 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			anchor->last_period   = g->period;
 			anchor->last_cpu      = g->cpu;
 			anchor->last_applied  = true;
+		} else if (rc_sched == -ESRCH || rc_aff == -ESRCH) {
+			/* Graceful follower removal: the thread exited
+			 * between snapshot capture and the apply pass.
+			 * Drop the per-anchor cache so a TID-reuse case
+			 * (different node hopping onto the same id) is
+			 * re-evaluated, but do NOT trigger the
+			 * SOFT_DEGRADED transition -- the kernel did not
+			 * reject any schedule we computed; the schedulee
+			 * simply ceased to exist. The next topology
+			 * snapshot will drop the dead follower. */
+			anchor->last_applied = false;
 		} else {
 			anchor->last_applied = false;
 			any_failure = true;
