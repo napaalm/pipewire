@@ -59,6 +59,7 @@
 #include <pipewire/impl.h>
 #include <pipewire/thread.h>
 #include <pipewire/thread-loop.h>
+#include <pipewire/cycle-counter.h>
 
 /** \page page_module_deadline Deadline
  *
@@ -3720,6 +3721,34 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	int res = 0;
 
 	PW_LOG_TOPIC_INIT(mod_topic);
+
+	/* Hard precondition: the executor measures per-cycle CPU work via
+	 * perf_event_open(PERF_COUNT_HW_CPU_CYCLES) bound to each data-loop
+	 * thread. Without that counter the adaptive-conformal estimator
+	 * cannot observe frequency-invariant samples and the heterogeneous
+	 * runtime model degrades to a wall-clock-only path that the
+	 * scheduler is no longer designed to support. Refuse to load
+	 * unconditionally when the kernel will not grant the open: the
+	 * operator must either lower /proc/sys/kernel/perf_event_paranoid to
+	 * <= 1 (sysctl, /etc/sysctl.d, or a tuned profile) or grant
+	 * CAP_PERFMON to the daemon. Honour PIPEWIRE_DISABLE_MODULE_DEADLINE
+	 * first so a disabled module never trips this gate. */
+	{
+		const char *disabled = getenv("PIPEWIRE_DISABLE_MODULE_DEADLINE");
+		bool is_disabled = disabled != NULL && disabled[0] != '\0' &&
+				strcmp(disabled, "0") != 0;
+		if (!is_disabled && !pw_cycle_counter_supported()) {
+			pw_log_error("module-deadline refuses to load: perf "
+					"hardware CPU cycles are not available to "
+					"user space (kernel.perf_event_paranoid > 1 "
+					"or perf disabled). Set "
+					"kernel.perf_event_paranoid <= 1 (sysctl "
+					"or /etc/sysctl.d) and retry, or set "
+					"PIPEWIRE_DISABLE_MODULE_DEADLINE=1 to "
+					"keep the module loaded but inert.");
+			return -EACCES;
+		}
+	}
 
 	impl = calloc(1, sizeof(struct impl));
 	if (impl == NULL)
