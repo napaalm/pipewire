@@ -1073,6 +1073,251 @@ PWTEST(conformal_compatible_history_field_round_trips)
 	return PWTEST_PASS;
 }
 
+/* ---------------------------------------------------------------- */
+/* Section H: mode-keyed estimator table.                            */
+/* ---------------------------------------------------------------- */
+
+PWTEST(conformal_mode_key_equal_compares_every_field)
+{
+	struct rt_conformal_mode_key a = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key b = a;
+	pwtest_bool_true(rt_conformal_mode_key_equal(&a, &b));
+
+	b.sample_rate_hz = 44100;
+	pwtest_bool_false(rt_conformal_mode_key_equal(&a, &b));
+
+	b = a;
+	b.quantum_frames = 512;
+	pwtest_bool_false(rt_conformal_mode_key_equal(&a, &b));
+
+	b = a;
+	b.core_class = RT_CONF_CORE_LITTLE;
+	pwtest_bool_false(rt_conformal_mode_key_equal(&a, &b));
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_create_destroy_null_safe)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 0);
+	rt_conformal_table_destroy(t);
+
+	/* NULL config refused. */
+	pwtest_ptr_null(rt_conformal_table_create(NULL, 4));
+
+	/* Invalid config refused (alpha_target out of range). */
+	cfg.alpha_target = 5.0;
+	pwtest_ptr_null(rt_conformal_table_create(&cfg, 4));
+
+	/* NULL destroy is a no-op. */
+	rt_conformal_table_destroy(NULL);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_keys_route_to_distinct_estimators)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_runtime_ns = 1000;
+	cfg.runtime_floor_ns = 100;
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 8);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key k_big_1024 = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key k_little_1024 = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_LITTLE };
+	struct rt_conformal_mode_key k_big_512 = {
+		.sample_rate_hz = 48000, .quantum_frames = 512,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key k_big_44k = {
+		.sample_rate_hz = 44100, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+
+	/* Each observe() on a fresh key allocates an entry. */
+	(void)rt_conformal_table_observe(t, &k_big_1024, 5000);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 1);
+	(void)rt_conformal_table_observe(t, &k_little_1024, 9000);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 2);
+	(void)rt_conformal_table_observe(t, &k_big_512, 4000);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 3);
+	(void)rt_conformal_table_observe(t, &k_big_44k, 5500);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 4);
+
+	/* Backing estimators are distinct objects with independent
+	 * sample counters. */
+	rt_conformal_t *e_big_1024 = rt_conformal_table_get(t, &k_big_1024);
+	rt_conformal_t *e_little_1024 = rt_conformal_table_get(t, &k_little_1024);
+	rt_conformal_t *e_big_512 = rt_conformal_table_get(t, &k_big_512);
+	pwtest_ptr_notnull(e_big_1024);
+	pwtest_ptr_notnull(e_little_1024);
+	pwtest_ptr_notnull(e_big_512);
+	pwtest_bool_true(e_big_1024 != e_little_1024);
+	pwtest_bool_true(e_big_1024 != e_big_512);
+	pwtest_bool_true(e_little_1024 != e_big_512);
+
+	/* Observe more samples on big-1024 only; the other estimators
+	 * stay at one sample each. */
+	for (int i = 0; i < 5; i++)
+		(void)rt_conformal_table_observe(t, &k_big_1024, 5000 + i);
+	pwtest_int_eq((int)rt_conformal_samples_seen(e_big_1024), 6);
+	pwtest_int_eq((int)rt_conformal_samples_seen(e_little_1024), 1);
+	pwtest_int_eq((int)rt_conformal_samples_seen(e_big_512), 1);
+
+	pwtest_int_eq((int)rt_conformal_table_evictions(t), 0);
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_evicts_lru_when_cap_exceeded)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_runtime_ns = 1000;
+	cfg.runtime_floor_ns = 100;
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 2);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key k1 = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key k2 = {
+		.sample_rate_hz = 48000, .quantum_frames = 512,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key k3 = {
+		.sample_rate_hz = 48000, .quantum_frames = 256,
+		.core_class = RT_CONF_CORE_BIG };
+
+	(void)rt_conformal_table_observe(t, &k1, 5000);
+	(void)rt_conformal_table_observe(t, &k2, 5000);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 2);
+	pwtest_int_eq((int)rt_conformal_table_evictions(t), 0);
+
+	/* Touch k2 again so k1 becomes the LRU victim. */
+	(void)rt_conformal_table_observe(t, &k2, 5100);
+
+	(void)rt_conformal_table_observe(t, &k3, 6000);
+	pwtest_int_eq((int)rt_conformal_table_mode_count(t), 2);
+	pwtest_int_eq((int)rt_conformal_table_evictions(t), 1);
+
+	/* k1 was evicted; k2 and k3 remain. */
+	pwtest_ptr_null(rt_conformal_table_get(t, &k1));
+	pwtest_ptr_notnull(rt_conformal_table_get(t, &k2));
+	pwtest_ptr_notnull(rt_conformal_table_get(t, &k3));
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_returns_zero_on_unobserved_key)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_runtime_ns = 1000;
+	cfg.runtime_floor_ns = 100;
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key k = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+	pwtest_int_eq((int)rt_conformal_table_budget(t, &k, 1000000), 0);
+
+	(void)rt_conformal_table_observe(t, &k, 5000);
+	pwtest_int_gt((int)rt_conformal_table_budget(t, &k, 1000000), 0);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_invalidate_all_resets_every_entry)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_runtime_ns = 1000;
+	cfg.runtime_floor_ns = 100;
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key k1 = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG };
+	struct rt_conformal_mode_key k2 = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_LITTLE };
+
+	for (int i = 0; i < 5; i++) {
+		(void)rt_conformal_table_observe(t, &k1, 5000 + i);
+		(void)rt_conformal_table_observe(t, &k2, 9000 + i);
+	}
+	pwtest_int_eq((int)rt_conformal_samples_seen(
+				rt_conformal_table_get(t, &k1)), 5);
+	pwtest_int_eq((int)rt_conformal_samples_seen(
+				rt_conformal_table_get(t, &k2)), 5);
+
+	rt_conformal_table_invalidate_all(t, RT_CONF_INVALIDATED_PERIOD);
+
+	/* Entries persist but their samples_used counters are zeroed by
+	 * rt_conformal_invalidate. */
+	rt_conformal_t *e1 = rt_conformal_table_get(t, &k1);
+	rt_conformal_t *e2 = rt_conformal_table_get(t, &k2);
+	pwtest_ptr_notnull(e1);
+	pwtest_ptr_notnull(e2);
+	pwtest_int_eq((int)rt_conformal_samples_used(e1), 0);
+	pwtest_int_eq((int)rt_conformal_samples_used(e2), 0);
+	pwtest_int_eq((int)rt_conformal_last_invalidation_reason(e1),
+			RT_CONF_INVALIDATED_PERIOD);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_collect_keys_iterates_every_populated_entry)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_runtime_ns = 1000;
+	cfg.runtime_floor_ns = 100;
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key keys[3] = {
+		{ .sample_rate_hz = 48000, .quantum_frames = 1024,
+		  .core_class = RT_CONF_CORE_BIG },
+		{ .sample_rate_hz = 48000, .quantum_frames = 512,
+		  .core_class = RT_CONF_CORE_BIG },
+		{ .sample_rate_hz = 44100, .quantum_frames = 1024,
+		  .core_class = RT_CONF_CORE_LITTLE },
+	};
+
+	for (int i = 0; i < 3; i++)
+		(void)rt_conformal_table_observe(t, &keys[i], 5000);
+
+	struct rt_conformal_mode_key out[4];
+	uint32_t cnt = 4;
+	pwtest_int_eq(rt_conformal_table_collect_keys(t, out, &cnt), 0);
+	pwtest_int_eq((int)cnt, 3);
+
+	/* Every input key must appear exactly once in the output. */
+	for (int i = 0; i < 3; i++) {
+		int found = 0;
+		for (uint32_t j = 0; j < cnt; j++)
+			if (rt_conformal_mode_key_equal(&out[j], &keys[i]))
+				found++;
+		pwtest_int_eq(found, 1);
+	}
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_conformal)
 {
 	pwtest_add(conformal_state_name_stable, PWTEST_NOARG);
@@ -1137,6 +1382,21 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_fusion_group_invalidation_resets_state,
 			PWTEST_NOARG);
 	pwtest_add(conformal_topology_generation_invalidation_resets_state,
+			PWTEST_NOARG);
+
+	/* Section H: mode-keyed estimator table. */
+	pwtest_add(conformal_mode_key_equal_compares_every_field,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_create_destroy_null_safe, PWTEST_NOARG);
+	pwtest_add(conformal_table_keys_route_to_distinct_estimators,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_evicts_lru_when_cap_exceeded,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_returns_zero_on_unobserved_key,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_invalidate_all_resets_every_entry,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_collect_keys_iterates_every_populated_entry,
 			PWTEST_NOARG);
 
 	return PWTEST_PASS;

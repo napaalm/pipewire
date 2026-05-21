@@ -719,3 +719,198 @@ void rt_conformal_enable(rt_conformal_t *e)
 		recompute_state(e);
 	}
 }
+
+/* ------------------------------------------------------------------
+ * Mode-keyed estimator table
+ *
+ * A small fixed-cap open-addressed cache: each entry pairs a mode key
+ * with a per-mode rt_conformal_t. Lookup is linear scan since
+ * max_modes is bounded at RT_CONFORMAL_TABLE_MAX_MODES (16). LRU
+ * tracking uses a monotonically increasing tick stamped on every
+ * touch; eviction picks the entry with the smallest tick.
+ * ------------------------------------------------------------------ */
+
+struct rt_conformal_table_entry {
+	bool occupied;
+	struct rt_conformal_mode_key key;
+	rt_conformal_t *estimator;
+	uint64_t last_touch_tick;
+};
+
+struct rt_conformal_table {
+	struct rt_conformal_config cfg;
+	uint32_t max_modes;
+	uint64_t tick;
+	uint64_t evictions;
+	struct rt_conformal_table_entry entries[RT_CONFORMAL_TABLE_MAX_MODES];
+};
+
+rt_conformal_table_t *rt_conformal_table_create(
+		const struct rt_conformal_config *cfg,
+		uint32_t max_modes)
+{
+	if (cfg == NULL)
+		return NULL;
+	if (rt_conformal_config_validate(cfg) != 0)
+		return NULL;
+
+	rt_conformal_table_t *t = calloc(1, sizeof(*t));
+	if (t == NULL)
+		return NULL;
+	t->cfg = *cfg;
+	if (max_modes == 0)
+		max_modes = 1;
+	if (max_modes > RT_CONFORMAL_TABLE_MAX_MODES)
+		max_modes = RT_CONFORMAL_TABLE_MAX_MODES;
+	t->max_modes = max_modes;
+	return t;
+}
+
+void rt_conformal_table_destroy(rt_conformal_table_t *t)
+{
+	if (t == NULL)
+		return;
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (t->entries[i].occupied && t->entries[i].estimator != NULL)
+			rt_conformal_destroy(t->entries[i].estimator);
+	}
+	free(t);
+}
+
+void rt_conformal_table_invalidate_all(rt_conformal_table_t *t,
+		enum rt_conformal_invalidation_reason reason)
+{
+	if (t == NULL)
+		return;
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (t->entries[i].occupied && t->entries[i].estimator != NULL)
+			rt_conformal_invalidate(t->entries[i].estimator, reason);
+	}
+}
+
+static int rt_conformal_table_find(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *k)
+{
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (t->entries[i].occupied &&
+				rt_conformal_mode_key_equal(&t->entries[i].key, k))
+			return (int)i;
+	}
+	return -1;
+}
+
+static int rt_conformal_table_find_or_create(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *k)
+{
+	int idx = rt_conformal_table_find(t, k);
+	if (idx >= 0)
+		return idx;
+
+	/* Find a free slot. */
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (!t->entries[i].occupied) {
+			t->entries[i].estimator = rt_conformal_create(&t->cfg);
+			if (t->entries[i].estimator == NULL)
+				return -1;
+			t->entries[i].key = *k;
+			t->entries[i].occupied = true;
+			t->entries[i].last_touch_tick = ++t->tick;
+			return (int)i;
+		}
+	}
+
+	/* No free slot: evict the least-recently-touched entry. The
+	 * caller-facing eviction counter lets the operator notice this
+	 * pressure; the table stays bounded by design. */
+	uint32_t victim = 0;
+	uint64_t oldest = t->entries[0].last_touch_tick;
+	for (uint32_t i = 1; i < t->max_modes; i++) {
+		if (t->entries[i].last_touch_tick < oldest) {
+			oldest = t->entries[i].last_touch_tick;
+			victim = i;
+		}
+	}
+	if (t->entries[victim].estimator != NULL) {
+		rt_conformal_destroy(t->entries[victim].estimator);
+		t->entries[victim].estimator = NULL;
+	}
+	t->entries[victim].estimator = rt_conformal_create(&t->cfg);
+	if (t->entries[victim].estimator == NULL) {
+		t->entries[victim].occupied = false;
+		return -1;
+	}
+	t->entries[victim].key = *k;
+	t->entries[victim].occupied = true;
+	t->entries[victim].last_touch_tick = ++t->tick;
+	t->evictions++;
+	return (int)victim;
+}
+
+bool rt_conformal_table_observe(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *k,
+		uint64_t runtime_ns)
+{
+	if (t == NULL || k == NULL)
+		return false;
+	int idx = rt_conformal_table_find_or_create(t, k);
+	if (idx < 0)
+		return false;
+	t->entries[idx].last_touch_tick = ++t->tick;
+	return rt_conformal_observe(t->entries[idx].estimator, runtime_ns);
+}
+
+uint64_t rt_conformal_table_budget(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *k,
+		uint64_t period_ns)
+{
+	if (t == NULL || k == NULL)
+		return 0;
+	int idx = rt_conformal_table_find(t, k);
+	if (idx < 0)
+		return 0;
+	t->entries[idx].last_touch_tick = ++t->tick;
+	return rt_conformal_budget(t->entries[idx].estimator, period_ns);
+}
+
+rt_conformal_t *rt_conformal_table_get(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *k)
+{
+	if (t == NULL || k == NULL)
+		return NULL;
+	int idx = rt_conformal_table_find(t, k);
+	return idx < 0 ? NULL : t->entries[idx].estimator;
+}
+
+uint32_t rt_conformal_table_mode_count(const rt_conformal_table_t *t)
+{
+	if (t == NULL)
+		return 0;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < t->max_modes; i++)
+		if (t->entries[i].occupied)
+			n++;
+	return n;
+}
+
+int rt_conformal_table_collect_keys(const rt_conformal_table_t *t,
+		struct rt_conformal_mode_key *out_keys, uint32_t *count)
+{
+	if (t == NULL || out_keys == NULL || count == NULL)
+		return -1;
+	uint32_t cap = *count;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (!t->entries[i].occupied)
+			continue;
+		if (n < cap)
+			out_keys[n] = t->entries[i].key;
+		n++;
+	}
+	*count = n < cap ? n : cap;
+	return 0;
+}
+
+uint64_t rt_conformal_table_evictions(const rt_conformal_table_t *t)
+{
+	return t ? t->evictions : 0;
+}

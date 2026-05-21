@@ -349,6 +349,126 @@ enum rt_conformal_invalidation_reason
  */
 size_t rt_conformal_state_data_size(void);
 
+/*
+ * Mode-keyed estimator table.
+ *
+ * The single-estimator API above operates on a flat per-follower
+ * instance: switching sample rate, quantum, or CPU class invalidates
+ * the cached score ring and forces a fresh bootstrap. The mode-keyed
+ * table partitions samples by the triple
+ *
+ *   (sample_rate_hz, quantum_frames, core_class)
+ *
+ * so each combination owns its own rt_conformal_t. The entity id
+ * (typically a follower's node_id) is the table's owner; the mode key
+ * is the per-sample partition. Switching modes routes new samples into
+ * a different estimator without disturbing the others, and switching
+ * back picks up the previously calibrated state.
+ *
+ * Fusion-group ownership: when several PipeWire nodes have been
+ * collapsed onto a single data-loop thread, the schedulable entity is
+ * the fusion-group leader, not the individual member nodes. The
+ * table is therefore owned by the leader's id; member-only churn
+ * (a new follower joining a chain that already has a stable thread)
+ * keeps the per-mode calibration warm. When fusion membership itself
+ * changes the workload's per-period cost distribution, the caller
+ * should clear every per-mode entry via
+ * rt_conformal_table_invalidate_all(t, RT_CONF_INVALIDATED_FUSION_GROUP)
+ * -- the same invalidation reason the single-estimator path uses --
+ * so the table reverts to bootstrap pending fresh samples under the
+ * new membership.
+ *
+ * The table is small: each follower keeps at most max_modes entries
+ * (default 8). When the cap is reached the least-recently-used entry
+ * is recycled to make room for the new mode key and a one-shot warning
+ * surfaces the eviction so the operator can widen the cap if the
+ * workload genuinely needs more concurrent modes.
+ *
+ * Threading mirrors the single-estimator contract: the table is
+ * single-threaded; the audio recalc worker serialises every entry.
+ */
+
+enum rt_core_class_compat {
+	RT_CONF_CORE_LITTLE = 0,
+	RT_CONF_CORE_BIG    = 1,
+	RT_CONF_CORE_N      = 2,
+};
+
+struct rt_conformal_mode_key {
+	uint32_t sample_rate_hz;
+	uint32_t quantum_frames;
+	uint8_t  core_class;     /* enum rt_core_class_compat */
+	uint8_t  _pad[3];
+};
+
+static inline bool
+rt_conformal_mode_key_equal(const struct rt_conformal_mode_key *a,
+		const struct rt_conformal_mode_key *b)
+{
+	return a->sample_rate_hz == b->sample_rate_hz &&
+		a->quantum_frames == b->quantum_frames &&
+		a->core_class == b->core_class;
+}
+
+typedef struct rt_conformal_table rt_conformal_table_t;
+
+/* Create a mode-keyed table backed by per-mode rt_conformal_t
+ * instances. Every entry will be created from a private copy of cfg.
+ * max_modes is clamped to [1, RT_CONFORMAL_TABLE_MAX_MODES]. Returns
+ * NULL on EINVAL or on out-of-memory; emits no log on its own. */
+#define RT_CONFORMAL_TABLE_MAX_MODES 16u
+rt_conformal_table_t *rt_conformal_table_create(
+		const struct rt_conformal_config *cfg,
+		uint32_t max_modes);
+
+void rt_conformal_table_destroy(rt_conformal_table_t *t);
+
+/* Discard every cached mode state. The configuration snapshot is
+ * preserved; subsequent observe() calls re-populate entries lazily.
+ * Useful when a graph-level event (topology change, fusion-group
+ * recomposition) invalidates every per-mode calibration at once. */
+void rt_conformal_table_invalidate_all(rt_conformal_table_t *t,
+		enum rt_conformal_invalidation_reason reason);
+
+/* Record one sample against the estimator that owns `key`. The entry
+ * is created on first touch; on cap overflow the least-recently-used
+ * existing entry is evicted (a single-line warning is emitted at most
+ * once per table life). Returns true if the observe triggered a
+ * deferred-quantile recompute on the active entry, false otherwise.
+ * NULL-safe (returns false). */
+bool rt_conformal_table_observe(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *key,
+		uint64_t runtime_ns);
+
+/* Publish the budget for the estimator owning `key`. When the key has
+ * not been observed yet, return 0 so the caller can apply its own
+ * bootstrap policy. NULL-safe (returns 0). */
+uint64_t rt_conformal_table_budget(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *key,
+		uint64_t period_ns);
+
+/* Borrow the rt_conformal_t backing `key`, or NULL if none exists yet.
+ * The pointer is owned by the table and stays valid until the next
+ * observe() that triggers an eviction, or until destroy. Diagnostic
+ * accessors (rt_conformal_state(), rt_conformal_alpha_eff(), ...) can
+ * be called on the returned pointer. */
+rt_conformal_t *rt_conformal_table_get(rt_conformal_table_t *t,
+		const struct rt_conformal_mode_key *key);
+
+/* Number of modes currently held in the table (0..max_modes). */
+uint32_t rt_conformal_table_mode_count(const rt_conformal_table_t *t);
+
+/* Iterate every populated entry's key. Returns 0 on success and copies
+ * up to *count keys into out_keys; on entry *count is the buffer size,
+ * on exit it is the number of entries actually copied. */
+int rt_conformal_table_collect_keys(const rt_conformal_table_t *t,
+		struct rt_conformal_mode_key *out_keys,
+		uint32_t *count);
+
+/* Cumulative eviction counter (modes recycled because max_modes was
+ * exceeded). */
+uint64_t rt_conformal_table_evictions(const rt_conformal_table_t *t);
+
 #ifdef __cplusplus
 }
 #endif
