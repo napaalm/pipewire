@@ -820,7 +820,8 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		 * per-original-node analysis as a best-effort
 		 * scheduler. */
 		if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
-			pw_log_warn("reconcile: contracted-DAG analysis "
+			pw_log_warn("HDL-W030-CRITICAL-PATH-INFEASIBLE: "
+				"reconcile: contracted-DAG analysis "
 				"rejected the schedule (%m); retrying with "
 				"soft fallback (proportional deadlines + "
 				"relaxed placement); hard-real-time "
@@ -838,9 +839,12 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		 * a clipped node makes density > 1; that overrides
 		 * whatever we'd stamp here, so we don't pre-set it. */
 		if (e == EAGAIN && dag_recalculate_soft(macro_dag) == 0) {
-			pw_log_debug("reconcile: soft fallback produced a "
-				"complete assignment; emitting "
-				"SCHED_DEADLINE for every node");
+			pw_log_warn("HDL-W050-CPU-OVERUTILIZED-RESCALED: "
+				"reconcile: soft fallback accepted a "
+				"relaxed placement (some CPU may exceed "
+				"admission_ceiling); emitting SCHED_DEADLINE "
+				"with budget_clipped markers on overshooting "
+				"followers");
 			soft_fallback_used = true;
 			/* Fall through to the success path: apply the
 			 * macro-DAG schedule back to cg and run the
@@ -937,7 +941,8 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 			f.consecutive_hard_passes = 0;
 			snprintf(f.reason, sizeof(f.reason), "%s", reason);
 			if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
-				pw_log_warn("reconcile: schedule infeasible "
+				pw_log_warn("HDL-W030-CRITICAL-PATH-INFEASIBLE: "
+					"reconcile: schedule infeasible "
 					"(reason=%s, max_density=%.3f, "
 					"dbf_failing_t=%" PRIu64 "); "
 					"hard-real-time guarantees dropped, "

@@ -949,13 +949,15 @@ static int set_deadline_sched(pid_t tid, uint64_t runtime, uint64_t deadline,
 			return -ESRCH;
 		}
 		if (errno == EINVAL)
-			pw_log_warn("sched_setattr rejected DEADLINE tuple"
+			pw_log_warn("HDL-W070-SCHEDULE-APPLY-FAILED: "
+				"sched_setattr rejected DEADLINE tuple"
 				" for tid %d (errno=EINVAL, r=%lu d=%lu p=%lu);"
 				" hard guarantees from in-process predicates"
 				" no longer apply for this period",
 				tid, runtime, deadline, period);
 		else
-			pw_log_error("sched_setattr failed for tid %d"
+			pw_log_error("HDL-W070-SCHEDULE-APPLY-FAILED: "
+				"sched_setattr failed for tid %d"
 				" (errno=%d %s, r=%lu d=%lu p=%lu);"
 				" hard guarantees dropped for this period",
 				tid, errno, strerror(errno),
@@ -3692,6 +3694,88 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 			impl->topology.cpus[i].relative_capacity_nominal;
 	}
 
+	/* cpus.classes overrides the auto-classification on a per-CPU
+	 * basis. Format: a JSON array of strings aligned with the
+	 * cpus.available order, each "little" or "big". Anything else is
+	 * logged and skipped. On homogeneous x86 the auto-classifier
+	 * stamps every CPU as big; this knob lets the live-test runners
+	 * exercise the heterogeneous worst-fit and warm-up state machine
+	 * by declaring a fake split. */
+	const char *classes_str = pw_properties_get(props, "cpus.classes");
+	if (classes_str != NULL && classes_str[0] != '\0') {
+		struct spa_json it[2];
+		spa_json_init(&it[0], classes_str, strlen(classes_str));
+		if (spa_json_enter_array(&it[0], &it[1]) <= 0)
+			spa_json_init(&it[1], classes_str, strlen(classes_str));
+		char val[16];
+		uint32_t idx = 0;
+		while (spa_json_get_string(&it[1], val, sizeof(val)) > 0 &&
+				idx < impl->topology.num_cpus) {
+			enum rt_core_class cc;
+			if (strncmp(val, "little", 6) == 0)
+				cc = RT_CORE_LITTLE;
+			else if (strncmp(val, "big", 3) == 0)
+				cc = RT_CORE_BIG;
+			else {
+				pw_log_warn("cpus.classes[%u]=%s ignored "
+						"(expected \"little\" or "
+						"\"big\")", idx, val);
+				idx++;
+				continue;
+			}
+			cpu_topology_set_core_class(&impl->topology,
+					impl->topology.cpus[idx].cpu_id, cc);
+			idx++;
+		}
+	}
+
+	/* cpus.freq-source picks the default frequency basis the placer
+	 * uses for cycles-to-runtime conversion: scaling_min (the safe
+	 * default, identical to the cpufreq conservative policy),
+	 * scaling_max, or user (each CPU's value must come from
+	 * cpus.freq.<id>.user-hz; CPUs without an override keep the
+	 * dvfs-policy fallback). */
+	const char *freq_source_str = pw_properties_get(props, "cpus.freq-source");
+	if (freq_source_str != NULL && freq_source_str[0] != '\0') {
+		enum cpu_freq_source src;
+		if (strcmp(freq_source_str, "scaling_min") == 0 ||
+				strcmp(freq_source_str, "min") == 0)
+			src = CPU_FREQ_SCALING_MIN;
+		else if (strcmp(freq_source_str, "scaling_max") == 0 ||
+				strcmp(freq_source_str, "max") == 0)
+			src = CPU_FREQ_SCALING_MAX;
+		else if (strcmp(freq_source_str, "user") == 0)
+			src = CPU_FREQ_USER;
+		else {
+			pw_log_warn("cpus.freq-source=%s ignored "
+					"(expected scaling_min|scaling_max|user)",
+					freq_source_str);
+			src = (impl->dvfs_policy == CPU_DVFS_ASSUME_MAX) ?
+				CPU_FREQ_SCALING_MAX : CPU_FREQ_SCALING_MIN;
+		}
+		cpu_topology_resolve_frequencies(&impl->topology, src);
+	}
+
+	/* Per-CPU user frequency override. Keys take the form
+	 * cpus.freq.<cpu_id>.user-hz=<value-in-Hz>. */
+	for (i = 0; i < impl->topology.num_cpus; i++) {
+		char key[64];
+		snprintf(key, sizeof(key), "cpus.freq.%u.user-hz",
+				impl->topology.cpus[i].cpu_id);
+		const char *v = pw_properties_get(props, key);
+		if (v == NULL || v[0] == '\0')
+			continue;
+		char *end;
+		unsigned long long uhz = strtoull(v, &end, 0);
+		if (end == v || uhz == 0) {
+			pw_log_warn("%s=%s ignored (expected positive Hz)",
+					key, v);
+			continue;
+		}
+		cpu_topology_set_freq_override(&impl->topology,
+				impl->topology.cpus[i].cpu_id, (uint64_t)uhz);
+	}
+
 	pw_log_info("cpu-topology: smt-policy=%s dvfs-policy=%s num_cpus=%u",
 			impl->smt_policy == CPU_SMT_STRICT ? "strict" :
 			impl->smt_policy == CPU_SMT_DEDUPE ? "dedupe" : "ignore",
@@ -3703,11 +3787,16 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 		pw_log_info("cpu-topology: cpu%u core=%u island=%u "
 				"raw_cap=%" PRIu64 " min_freq_khz=%" PRIu64
 				" max_freq_khz=%" PRIu64
-				" relative_capacity=%.3f nominal=%.3f",
+				" relative_capacity=%.3f nominal=%.3f "
+				"core_class=%s sched_freq_hz=%" PRIu64
+				" freq_source=%s",
 				ci->cpu_id, ci->core_id, ci->island_id,
 				ci->raw_capacity, ci->min_freq_khz,
 				ci->max_freq_khz, ci->relative_capacity,
-				ci->relative_capacity_nominal);
+				ci->relative_capacity_nominal,
+				rt_core_class_name(ci->core_class),
+				ci->sched_frequency_hz,
+				cpu_freq_source_name(ci->sched_frequency_source));
 	}
 	return 0;
 }

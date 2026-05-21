@@ -1615,7 +1615,8 @@ static int dag_check_feasibility(dag_t *g)
 	double scaled_deadline = (double)g->deadline * min_rel_cap;
 
 	if ((double)critical > scaled_deadline) {
-		pw_log_warn("DAG critical path %" PRIu64 " ns exceeds "
+		pw_log_warn("HDL-W030-CRITICAL-PATH-INFEASIBLE: "
+				"DAG critical path %" PRIu64 " ns exceeds "
 				"slowest-CPU-scaled deadline %.0f ns "
 				"(global deadline %" PRIu64 " ns, "
 				"min relative capacity %.3f)",
@@ -1624,7 +1625,8 @@ static int dag_check_feasibility(dag_t *g)
 		return -1;
 	}
 	if (min_reservation > g->deadline) {
-		pw_log_warn("DAG minimum per-node deadline reservation %"
+		pw_log_warn("HDL-W030-CRITICAL-PATH-INFEASIBLE: "
+				"DAG minimum per-node deadline reservation %"
 				PRIu64 " ns exceeds global deadline %" PRIu64 " ns",
 				min_reservation, g->deadline);
 		errno = EAGAIN;
@@ -2974,6 +2976,15 @@ bool dag_soft_redistribute_deadlines(dag_t *g,
 		*out_clipped_count = clipped;
 	if (out_objective != NULL)
 		*out_objective = objective;
+
+	if (clipped > 0) {
+		pw_log_warn("HDL-W040-RUNTIME-CLAMPED: "
+				"soft redistribute clipped %u node(s) "
+				"to local_deadline (risk_objective=%.4f); "
+				"those nodes will use scheduled_runtime = "
+				"local_deadline as a degraded reservation",
+				(unsigned)clipped, objective);
+	}
 
 	return true;
 }
