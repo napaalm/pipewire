@@ -56,6 +56,33 @@ extern "C" {
 
 #define CPU_TOPOLOGY_MAX_SIBLINGS 8u
 
+/* Heterogeneous-CPU class. The placer derives runtime estimates per
+ * class instead of per CPU so a node moving between two CPUs of the
+ * same class reuses statistics; a node moving between classes routes
+ * into a different statistical state (the same key that partitions
+ * the conformal estimator). RT_CORE_BIG is the default on a
+ * homogeneous host: every CPU lands in the single high-capacity class,
+ * which makes the heterogeneous machinery degrade gracefully to the
+ * original homogeneous behaviour. */
+enum rt_core_class {
+	RT_CORE_LITTLE   = 0,
+	RT_CORE_BIG      = 1,
+	RT_CORE_CLASS_N  = 2,
+};
+
+const char *rt_core_class_name(enum rt_core_class c);
+
+/* Source from which sched_frequency_hz was derived. The placer uses
+ * the resolved value (in Hz) to convert cycle estimates to a kernel
+ * runtime; the source is preserved for diagnostics. */
+enum cpu_freq_source {
+	CPU_FREQ_SCALING_MIN = 0,   /* /sys/.../scaling_min_freq * 1000 */
+	CPU_FREQ_SCALING_MAX = 1,   /* /sys/.../scaling_max_freq * 1000 */
+	CPU_FREQ_USER        = 2,   /* explicit user-frequency-hz */
+};
+
+const char *cpu_freq_source_name(enum cpu_freq_source s);
+
 struct cpu_info {
 	uint32_t cpu_id;
 	uint32_t core_id;            /* physical core id (SMT sibling key) */
@@ -65,6 +92,30 @@ struct cpu_info {
 	uint64_t raw_capacity;       /* sysfs cpu_capacity, default 1024 */
 	uint64_t min_freq_khz;
 	uint64_t max_freq_khz;
+	/* Heterogeneous-CPU class. Auto-assigned by
+	 * cpu_topology_recompute_relative from relative_capacity_nominal
+	 * (CPUs at the top of the capacity range -- within
+	 * CPU_TOPOLOGY_BIG_THRESHOLD of the maximum -- land in
+	 * RT_CORE_BIG, every other CPU in RT_CORE_LITTLE). A homogeneous
+	 * host gets every CPU in RT_CORE_BIG. The module-level config
+	 * cpus.classes may override the auto-assignment per-CPU at the
+	 * cost of bypassing the capacity check; the JSON probe accepts
+	 * core_class for unit-test scenarios. */
+	enum rt_core_class core_class;
+	/* Scheduling frequency in Hz used by the placer to convert a
+	 * per-CPU-type cycle estimate into a kernel runtime budget:
+	 *
+	 *   runtime_ns = ceil(cycles_est * 1e9 / sched_frequency_hz)
+	 *
+	 * Distinct from the live cpufreq policy: the placer needs a
+	 * deterministic value so admission and utilisation arithmetic
+	 * are stable even when the governor varies the actual frequency.
+	 * Resolved at probe time from cpu_topology_recompute_relative
+	 * (default: freq_for_policy * 1000) or from an explicit
+	 * user-frequency-hz override via cpu_topology_set_freq_override
+	 * / cpus.freq.<id>.user-hz. */
+	uint64_t sched_frequency_hz;
+	enum cpu_freq_source sched_frequency_source;
 	/* "Target" capacity scalar in (0, 1] -- raw_capacity *
 	 * freq_for_policy, normalised by the maximum nominal capacity
 	 * in the set. This is what the placer compares per-CPU load
@@ -133,6 +184,35 @@ bool cpu_topology_has_smt_pair(const struct cpu_topology *t,
 
 /* Release `t->cpus`. Safe to call on a zero-initialised cpu_topology. */
 void cpu_topology_destroy(struct cpu_topology *t);
+
+/* Auto-classification threshold on relative_capacity_nominal. A CPU
+ * whose nominal capacity is at or above the threshold lands in
+ * RT_CORE_BIG; everything else in RT_CORE_LITTLE. Exposed so the unit
+ * suite can pin the boundary value. */
+#define CPU_TOPOLOGY_BIG_THRESHOLD 0.85
+
+/* Override a single CPU's core class. Returns 0 on success, -1 with
+ * errno set on ENOENT (cpu_id not present) or EINVAL (null inputs).
+ * Useful for the fake big.LITTLE config knob (cpus.classes) on
+ * homogeneous hardware: the operator declares which physical CPUs
+ * should be treated as LITTLE for scheduling purposes even when their
+ * underlying capacity is identical. */
+int cpu_topology_set_core_class(struct cpu_topology *t, uint32_t cpu_id,
+		enum rt_core_class core_class);
+
+/* Override a single CPU's sched_frequency_hz with an explicit value
+ * (in Hz, the same unit cpu_info::sched_frequency_hz uses) and stamp
+ * sched_frequency_source = CPU_FREQ_USER. A zero or otherwise invalid
+ * frequency is rejected with -1/EINVAL. Returns 0 on success,
+ * -1/ENOENT on unknown cpu_id, -1/EINVAL on null inputs. */
+int cpu_topology_set_freq_override(struct cpu_topology *t, uint32_t cpu_id,
+		uint64_t sched_frequency_hz);
+
+/* Resolve every CPU's sched_frequency_hz from the chosen freq-source
+ * (scaling_min / scaling_max). User-overridden CPUs (source ==
+ * CPU_FREQ_USER) keep their existing value. Returns 0 on success. */
+int cpu_topology_resolve_frequencies(struct cpu_topology *t,
+		enum cpu_freq_source default_source);
 
 /*
  * Test affordance: build a cpu_topology directly from a JSON string,

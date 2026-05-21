@@ -304,6 +304,176 @@ PWTEST(cpu_topo_nominal_vs_target_under_conservative)
 	return PWTEST_PASS;
 }
 
+/* ===================================================================
+ * Heterogeneous core-class auto-classification: when capacities span
+ * the BIG-threshold, the recompute pass tags top-of-range CPUs as
+ * RT_CORE_BIG and everything else as RT_CORE_LITTLE. A homogeneous
+ * fixture lands every CPU in RT_CORE_BIG so the degenerate case keeps
+ * the original semantics.
+ * =================================================================== */
+PWTEST(cpu_topo_core_class_homogeneous_all_big)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq((int)t.cpus[0].core_class, RT_CORE_BIG);
+	pwtest_int_eq((int)t.cpus[1].core_class, RT_CORE_BIG);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_core_class_split_by_capacity)
+{
+	/* Two raw-capacity tiers: 1024 (BIG) and 512 (LITTLE). The
+	 * threshold is 0.85 and the small CPU sits at 0.5 nominal, so
+	 * it lands in RT_CORE_LITTLE. */
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 2, raw_capacity = 512,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 3, raw_capacity = 512,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq((int)find_cpu(&t, 0)->core_class, RT_CORE_BIG);
+	pwtest_int_eq((int)find_cpu(&t, 1)->core_class, RT_CORE_BIG);
+	pwtest_int_eq((int)find_cpu(&t, 2)->core_class, RT_CORE_LITTLE);
+	pwtest_int_eq((int)find_cpu(&t, 3)->core_class, RT_CORE_LITTLE);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_core_class_json_override_survives_recompute)
+{
+	/* Capacity is homogeneous so the recompute pass would auto-stamp
+	 * BIG everywhere. Pinning core_class via JSON must survive the
+	 * recompute; this is the path the cpus.classes config knob
+	 * reuses on homogeneous hardware. */
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000,"
+		"    core_class = \"little\" },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000,"
+		"    core_class = \"big\" }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq((int)find_cpu(&t, 0)->core_class, RT_CORE_LITTLE);
+	pwtest_int_eq((int)find_cpu(&t, 1)->core_class, RT_CORE_BIG);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_set_core_class_overrides_and_unknown_fails)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 7, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq((int)t.cpus[0].core_class, RT_CORE_BIG);
+	pwtest_int_eq(cpu_topology_set_core_class(&t, 7, RT_CORE_LITTLE), 0);
+	pwtest_int_eq((int)t.cpus[0].core_class, RT_CORE_LITTLE);
+
+	errno = 0;
+	pwtest_int_eq(cpu_topology_set_core_class(&t, 999, RT_CORE_LITTLE), -1);
+	pwtest_int_eq(errno, ENOENT);
+
+	errno = 0;
+	pwtest_int_eq(cpu_topology_set_core_class(NULL, 7, RT_CORE_LITTLE), -1);
+	pwtest_int_eq(errno, EINVAL);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+/* ===================================================================
+ * Per-CPU sched_frequency_hz: resolved from kHz * 1000 with the dvfs
+ * policy on probe, overridable by cpu_topology_set_freq_override
+ * (stamps source = CPU_FREQ_USER) and by cpu_topology_resolve_frequencies
+ * (rewrites non-user CPUs to a chosen source).
+ * =================================================================== */
+PWTEST(cpu_topo_sched_frequency_resolved_from_dvfs_policy)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 2200000, max_freq_khz = 3800000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq((int)t.cpus[0].sched_frequency_source, CPU_FREQ_SCALING_MIN);
+	pwtest_int_eq((long)t.cpus[0].sched_frequency_hz, 2200000L * 1000L);
+	cpu_topology_destroy(&t);
+
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_ASSUME_MAX, &t), 0);
+	pwtest_int_eq((int)t.cpus[0].sched_frequency_source, CPU_FREQ_SCALING_MAX);
+	pwtest_int_eq((long)t.cpus[0].sched_frequency_hz, 3800000L * 1000L);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_set_freq_override_pins_source_to_user)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 4, raw_capacity = 1024,"
+		"    min_freq_khz = 2200000, max_freq_khz = 3800000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 4, 2500000000ULL), 0);
+	pwtest_int_eq((int)t.cpus[0].sched_frequency_source, CPU_FREQ_USER);
+	pwtest_int_eq((long)t.cpus[0].sched_frequency_hz, 2500000000L);
+
+	errno = 0;
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 4, 0), -1);
+	pwtest_int_eq(errno, EINVAL);
+	errno = 0;
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 999, 2500000000ULL), -1);
+	pwtest_int_eq(errno, ENOENT);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_resolve_frequencies_preserves_user_override)
+{
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 2200000, max_freq_khz = 3800000 },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 2200000, max_freq_khz = 3800000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 1, 2500000000ULL), 0);
+	pwtest_int_eq(cpu_topology_resolve_frequencies(&t, CPU_FREQ_SCALING_MAX), 0);
+	/* cpu_id=0 picked up the scaling_max value. */
+	pwtest_int_eq((long)find_cpu(&t, 0)->sched_frequency_hz, 3800000L * 1000L);
+	pwtest_int_eq((int)find_cpu(&t, 0)->sched_frequency_source,
+			CPU_FREQ_SCALING_MAX);
+	/* cpu_id=1 kept its USER value. */
+	pwtest_int_eq((long)find_cpu(&t, 1)->sched_frequency_hz, 2500000000L);
+	pwtest_int_eq((int)find_cpu(&t, 1)->sched_frequency_source, CPU_FREQ_USER);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(cpu_topology)
 {
 	pwtest_add(cpu_topo_homogeneous_json_all_ones, PWTEST_NOARG);
@@ -316,6 +486,19 @@ PWTEST_SUITE(cpu_topology)
 	pwtest_add(cpu_topo_sysfs_missing_fallback, PWTEST_NOARG);
 	pwtest_add(cpu_topo_sysfs_homogeneous_cpu0, PWTEST_NOARG);
 	pwtest_add(cpu_topo_nominal_vs_target_under_conservative, PWTEST_NOARG);
+
+	pwtest_add(cpu_topo_core_class_homogeneous_all_big, PWTEST_NOARG);
+	pwtest_add(cpu_topo_core_class_split_by_capacity, PWTEST_NOARG);
+	pwtest_add(cpu_topo_core_class_json_override_survives_recompute,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_set_core_class_overrides_and_unknown_fails,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_sched_frequency_resolved_from_dvfs_policy,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_set_freq_override_pins_source_to_user,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_resolve_frequencies_preserves_user_override,
+			PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

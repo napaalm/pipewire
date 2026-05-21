@@ -23,6 +23,26 @@ PW_LOG_TOPIC_STATIC(cpu_topo_topic, "mod.deadline.cpu-topology");
  * capacities at exactly 1.0 on hosts that don't report cpu_capacity. */
 #define CPU_TOPO_DEFAULT_CAPACITY 1024u
 
+const char *rt_core_class_name(enum rt_core_class c)
+{
+	switch (c) {
+	case RT_CORE_LITTLE:    return "little";
+	case RT_CORE_BIG:       return "big";
+	case RT_CORE_CLASS_N:   break;
+	}
+	return "unknown";
+}
+
+const char *cpu_freq_source_name(enum cpu_freq_source s)
+{
+	switch (s) {
+	case CPU_FREQ_SCALING_MIN: return "scaling_min";
+	case CPU_FREQ_SCALING_MAX: return "scaling_max";
+	case CPU_FREQ_USER:        return "user";
+	}
+	return "unknown";
+}
+
 /* Neutral frequency default when /sys/.../cpufreq/cpuinfo_{min,max}_freq
  * are missing. The value cancels through C_max so it never affects
  * relative_capacity; using 1 (kHz) keeps the arithmetic in finite-range
@@ -184,8 +204,107 @@ static void cpu_topology_recompute_relative(struct cpu_topology *t,
 			break;
 		}
 	}
+
+	/* Auto-classify into RT_CORE_LITTLE / RT_CORE_BIG by nominal
+	 * capacity. A homogeneous host clusters every CPU at 1.0 and
+	 * lands in RT_CORE_BIG -- the heterogeneous machinery degrades
+	 * to homogeneous behaviour. Resolve sched_frequency_hz from the
+	 * dvfs policy: conservative -> min_freq, assume_max -> max_freq.
+	 * Both are converted from kHz to Hz so downstream code can
+	 * uniformly use Hz. Probe-time auto-classification only stamps
+	 * CPUs whose source has not already been set to USER; explicit
+	 * user-frequency overrides survive a recompute. */
+	for (i = 0; i < t->num_cpus; i++) {
+		double rel_nom = t->cpus[i].relative_capacity_nominal;
+		t->cpus[i].core_class = (rel_nom >= CPU_TOPOLOGY_BIG_THRESHOLD)
+			? RT_CORE_BIG : RT_CORE_LITTLE;
+		if (t->cpus[i].sched_frequency_source != CPU_FREQ_USER) {
+			uint64_t freq_khz = (dvfs == CPU_DVFS_ASSUME_MAX) ?
+				t->cpus[i].max_freq_khz :
+				t->cpus[i].min_freq_khz;
+			if (freq_khz == 0)
+				freq_khz = CPU_TOPO_DEFAULT_FREQ_KHZ;
+			t->cpus[i].sched_frequency_hz = freq_khz * 1000ULL;
+			t->cpus[i].sched_frequency_source =
+				(dvfs == CPU_DVFS_ASSUME_MAX) ?
+				CPU_FREQ_SCALING_MAX : CPU_FREQ_SCALING_MIN;
+		}
+	}
+
 	free(nom);
 	free(tgt);
+}
+
+int cpu_topology_set_core_class(struct cpu_topology *t, uint32_t cpu_id,
+		enum rt_core_class core_class)
+{
+	uint32_t i;
+	if (!t || (unsigned)core_class >= RT_CORE_CLASS_N) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (i = 0; i < t->num_cpus; i++) {
+		if (t->cpus[i].cpu_id == cpu_id) {
+			t->cpus[i].core_class = core_class;
+			return 0;
+		}
+	}
+	errno = ENOENT;
+	return -1;
+}
+
+int cpu_topology_set_freq_override(struct cpu_topology *t, uint32_t cpu_id,
+		uint64_t sched_frequency_hz)
+{
+	uint32_t i;
+	if (!t || sched_frequency_hz == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (i = 0; i < t->num_cpus; i++) {
+		if (t->cpus[i].cpu_id == cpu_id) {
+			t->cpus[i].sched_frequency_hz = sched_frequency_hz;
+			t->cpus[i].sched_frequency_source = CPU_FREQ_USER;
+			return 0;
+		}
+	}
+	errno = ENOENT;
+	return -1;
+}
+
+int cpu_topology_resolve_frequencies(struct cpu_topology *t,
+		enum cpu_freq_source default_source)
+{
+	uint32_t i;
+	if (!t) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (i = 0; i < t->num_cpus; i++) {
+		if (t->cpus[i].sched_frequency_source == CPU_FREQ_USER)
+			continue;
+		uint64_t freq_khz;
+		switch (default_source) {
+		case CPU_FREQ_SCALING_MIN:
+			freq_khz = t->cpus[i].min_freq_khz;
+			break;
+		case CPU_FREQ_SCALING_MAX:
+			freq_khz = t->cpus[i].max_freq_khz;
+			break;
+		case CPU_FREQ_USER:
+			/* Treat as no-op for default; refuse to invent a
+			 * user frequency the operator did not supply. */
+			continue;
+		default:
+			errno = EINVAL;
+			return -1;
+		}
+		if (freq_khz == 0)
+			freq_khz = CPU_TOPO_DEFAULT_FREQ_KHZ;
+		t->cpus[i].sched_frequency_hz = freq_khz * 1000ULL;
+		t->cpus[i].sched_frequency_source = default_source;
+	}
+	return 0;
 }
 
 /* Pass over `t` filling each cpu_info::smt_siblings/num_siblings with
@@ -435,21 +554,60 @@ static int json_field_uint64(struct spa_json *o, const char *want_key,
 	return 1;
 }
 
+/* Match a JSON object's value against the literal core-class tokens
+ * "little" / "big". Returns 1 if the value was consumed and decoded
+ * into *out, 0 if the key doesn't match the literal "core_class",
+ * -1 on malformed input. */
+static int json_field_core_class(struct spa_json *o, const char *want,
+		const char *key, int key_len, enum rt_core_class *out)
+{
+	const char *val;
+	int val_len;
+	char buf[16];
+	if ((int)strlen(want) != key_len || strncmp(key, want, key_len) != 0)
+		return 0;
+	val_len = spa_json_next(o, &val);
+	if (val_len <= 0)
+		return -1;
+	if (val_len >= (int)sizeof(buf))
+		return -1;
+	memcpy(buf, val, val_len);
+	buf[val_len] = '\0';
+	/* JSON strings come back wrapped in their delimiter; strip the
+	 * leading quote if present so "big" and big both work. */
+	const char *s = buf;
+	if (*s == '"')
+		s++;
+	if (strncmp(s, "little", 6) == 0) {
+		*out = RT_CORE_LITTLE;
+		return 1;
+	}
+	if (strncmp(s, "big", 3) == 0) {
+		*out = RT_CORE_BIG;
+		return 1;
+	}
+	return -1;
+}
+
 /* Parse one { cpu_id=..., ... } object into ci. Returns 0 on success,
  * -1 on malformed input. Per-field presence flags let the caller fall
  * back on cpu_id-derived defaults only for fields that were actually
  * omitted (rather than explicitly set to 0). */
 static int parse_json_cpu(struct spa_json *o, struct cpu_info *ci,
-		bool *have_core_id, bool *have_island_id)
+		bool *have_core_id, bool *have_island_id,
+		bool *have_core_class, bool *have_user_freq_hz)
 {
 	const char *key;
 	int key_len;
 	uint64_t v;
+	enum rt_core_class cc;
 	int rc;
 	bool got_cpu_id = false;
 
 	*have_core_id = false;
 	*have_island_id = false;
+	*have_core_class = false;
+	*have_user_freq_hz = false;
 
 	while ((key_len = spa_json_next(o, &key)) > 0) {
 		rc = json_field_uint64(o, "cpu_id", key, key_len, &v);
@@ -475,6 +633,19 @@ static int parse_json_cpu(struct spa_json *o, struct cpu_info *ci,
 		rc = json_field_uint64(o, "max_freq_khz", key, key_len, &v);
 		if (rc < 0) return -1;
 		if (rc > 0) { ci->max_freq_khz = v; continue; }
+
+		rc = json_field_core_class(o, "core_class", key, key_len, &cc);
+		if (rc < 0) return -1;
+		if (rc > 0) { ci->core_class = cc; *have_core_class = true; continue; }
+
+		rc = json_field_uint64(o, "user_frequency_hz", key, key_len, &v);
+		if (rc < 0) return -1;
+		if (rc > 0) {
+			ci->sched_frequency_hz = v;
+			ci->sched_frequency_source = CPU_FREQ_USER;
+			*have_user_freq_hz = true;
+			continue;
+		}
 
 		/* Unknown field: skip its value. */
 		const char *skip;
@@ -524,7 +695,18 @@ int cpu_topology_from_json(const char *json,
 
 		uint32_t cap = 8;
 		struct cpu_info *cpus = calloc(cap, sizeof(*cpus));
-		if (!cpus) {
+		/* Side arrays remembering which fields the JSON pinned per
+		 * CPU. We need them because cpu_topology_recompute_relative
+		 * unconditionally derives core_class from
+		 * relative_capacity_nominal; any explicit JSON override is
+		 * re-applied after the recompute so the test affordance
+		 * survives. */
+		bool *json_core_class = calloc(cap, sizeof(*json_core_class));
+		enum rt_core_class *json_cc = calloc(cap, sizeof(*json_cc));
+		if (!cpus || !json_core_class || !json_cc) {
+			free(cpus);
+			free(json_core_class);
+			free(json_cc);
 			errno = ENOMEM;
 			return -1;
 		}
@@ -532,23 +714,36 @@ int cpu_topology_from_json(const char *json,
 
 		while (spa_json_enter_object(&arr, &obj) > 0) {
 			if (n == cap) {
-				cap *= 2;
-				struct cpu_info *r = realloc(cpus, cap * sizeof(*cpus));
-				if (!r) {
-					free(cpus);
+				uint32_t new_cap = cap * 2;
+				struct cpu_info *r = realloc(cpus, new_cap * sizeof(*cpus));
+				bool *r_json_cc = realloc(json_core_class,
+						new_cap * sizeof(*json_core_class));
+				enum rt_core_class *r_cc = realloc(json_cc,
+						new_cap * sizeof(*json_cc));
+				if (!r || !r_json_cc || !r_cc) {
+					free(r ? r : cpus);
+					free(r_json_cc ? r_json_cc : json_core_class);
+					free(r_cc ? r_cc : json_cc);
 					errno = ENOMEM;
 					return -1;
 				}
 				cpus = r;
+				json_core_class = r_json_cc;
+				json_cc = r_cc;
+				cap = new_cap;
 			}
 			memset(&cpus[n], 0, sizeof(cpus[n]));
 			cpus[n].raw_capacity = CPU_TOPO_DEFAULT_CAPACITY;
 			cpus[n].min_freq_khz = CPU_TOPO_DEFAULT_FREQ_KHZ;
 			cpus[n].max_freq_khz = CPU_TOPO_DEFAULT_FREQ_KHZ;
 			bool have_core_id, have_island_id;
+			bool have_core_class, have_user_freq_hz;
 			if (parse_json_cpu(&obj, &cpus[n],
-					&have_core_id, &have_island_id) < 0) {
+					&have_core_id, &have_island_id,
+					&have_core_class, &have_user_freq_hz) < 0) {
 				free(cpus);
+				free(json_core_class);
+				free(json_cc);
 				goto bad;
 			}
 			/* Missing-field fallback: every CPU is its own core
@@ -558,6 +753,9 @@ int cpu_topology_from_json(const char *json,
 				cpus[n].core_id = cpus[n].cpu_id;
 			if (!have_island_id)
 				cpus[n].island_id = cpus[n].cpu_id;
+			json_core_class[n] = have_core_class;
+			json_cc[n] = cpus[n].core_class;
+			(void)have_user_freq_hz; /* survives through recompute */
 			n++;
 		}
 
@@ -565,6 +763,16 @@ int cpu_topology_from_json(const char *json,
 		out->num_cpus = n;
 		cpu_topology_fill_siblings(out);
 		cpu_topology_recompute_relative(out, dvfs);
+		/* Re-apply explicit JSON core_class overrides; the recompute
+		 * pass stamps every CPU from capacity, so a homogeneous JSON
+		 * fixture that asked for an artificial little/big split
+		 * would otherwise lose the distinction. */
+		for (uint32_t k = 0; k < n; k++) {
+			if (json_core_class[k])
+				out->cpus[k].core_class = json_cc[k];
+		}
+		free(json_core_class);
+		free(json_cc);
 		return 0;
 	}
 
