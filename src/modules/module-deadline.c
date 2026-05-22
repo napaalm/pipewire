@@ -3971,28 +3971,28 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	 */
 	rt_conformal_config_defaults(&impl->conformal_cfg);
 	if ((s = pw_properties_get(props, "deadline.conformal.alpha_graph")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.alpha_target = v;
 		else
 			pw_log_warn("deadline.conformal.alpha_graph %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.alpha_min")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.alpha_min = v;
 		else
 			pw_log_warn("deadline.conformal.alpha_min %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.alpha_max")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.alpha_max = v;
 		else
 			pw_log_warn("deadline.conformal.alpha_max %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.eta")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.eta = v;
 		else
@@ -4013,14 +4013,14 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			pw_log_warn("deadline.conformal.recalc_period %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.ewma_location_lambda")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.ewma_location_lambda = v;
 		else
 			pw_log_warn("deadline.conformal.ewma_location_lambda %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.ewma_scale_lambda")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v > 0.0 && v < 1.0)
 			impl->conformal_cfg.ewma_scale_lambda = v;
 		else
@@ -4034,7 +4034,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			pw_log_warn("deadline.conformal.guard_ns %s ignored", s);
 	}
 	if ((s = pw_properties_get(props, "deadline.conformal.guard_percent")) != NULL) {
-		char *end; double v = strtod(s, &end);
+		char *end; double v = spa_strtod(s, &end);
 		if (end != s && v >= 0.0 && v < 1.0)
 			impl->conformal_cfg.guard_percent = v;
 		else
@@ -4108,6 +4108,27 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		else
 			pw_log_warn("deadline.conformal.risk_allocation %s ignored", s);
 	}
+	if ((s = pw_properties_get(props, "deadline.conformal.burst_threshold")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v <= UINT32_MAX)
+			impl->conformal_cfg.burst_threshold = (uint32_t)v;
+		else
+			pw_log_warn("deadline.conformal.burst_threshold %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.burst_penalty")) != NULL) {
+		char *end; double v = spa_strtod(s, &end);
+		if (end != s && v >= 1.0 && v <= 1e6)
+			impl->conformal_cfg.burst_penalty = v;
+		else
+			pw_log_warn("deadline.conformal.burst_penalty %s ignored", s);
+	}
+	if ((s = pw_properties_get(props, "deadline.conformal.shift_burst_threshold")) != NULL) {
+		char *end; unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v <= UINT32_MAX)
+			impl->conformal_cfg.shift_burst_threshold = (uint32_t)v;
+		else
+			pw_log_warn("deadline.conformal.shift_burst_threshold %s ignored", s);
+	}
 	if (rt_conformal_config_validate(&impl->conformal_cfg) != 0) {
 		pw_log_warn("deadline.conformal.* parsed values do not pass"
 				" validation; reverting to defaults");
@@ -4171,7 +4192,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->wcet_recalc_threshold = 0.01;
 	if ((s = pw_properties_get(props, "wcet.recalc-threshold")) != NULL) {
 		char *end;
-		double v = strtod(s, &end);
+		double v = spa_strtod(s, &end);
 		if (end != s && v >= 0.0 && v < 1.0)
 			impl->wcet_recalc_threshold = v;
 		else
