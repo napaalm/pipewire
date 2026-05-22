@@ -470,6 +470,26 @@ struct node {
 	 * kernel runtime. */
 	enum rt_diag_budget_kind budget_kind;
 
+	/* True iff the last runtime_select_for_node call on this
+	 * follower satisfied the budget query via the LITTLE-bootstrap
+	 * fallback in rt_conformal_table_budget_for_class (the BIG
+	 * entry was not yet ready). Reset to false on every selection
+	 * that returns from the target-class entry. Used for
+	 * rate-limited HDL-W011 emission and surfaced through the diag
+	 * snapshot. */
+	bool budget_used_bootstrap;
+
+	/* Edge-triggered guards for the HDL-W warning catalogue so a
+	 * sustained condition emits one line per transition instead of
+	 * flooding the log on every sample. Each flag is set when the
+	 * corresponding condition first holds and cleared when it
+	 * clears. The follower's own id keys the rate-limit; topology
+	 * churn that recreates the node resets the flags via the
+	 * usual node_unregister path. */
+	bool warned_no_class_stats;       /* HDL-W010 */
+	bool warned_big_bootstrap_from_little; /* HDL-W011 */
+	bool warned_predicted_below_cputime;   /* HDL-W020 */
+
 	/* Last-applied SCHED_DEADLINE tuple. Used by sched_cb to skip
 	 * a sched_setattr+sched_setaffinity pair when the four
 	 * components (runtime, deadline, period, cpu) all match the
@@ -1676,12 +1696,34 @@ struct runtime_select_result {
 	uint64_t                 sample_count;
 };
 
+static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
+		uint32_t sample_cpu);
+
+/* Derive the conformal mode-key class for a node's current placement.
+ * Returns the core_class of the node's last-applied CPU when one is
+ * known; falls back to RT_CONF_CORE_LITTLE before the first placement
+ * so a freshly-created follower queries the LITTLE bucket (the warm-up
+ * class the spec assumes for new nodes). The cast is wire-safe because
+ * rt_core_class and rt_core_class_compat share the LITTLE=0 / BIG=1
+ * encoding. */
+static inline uint8_t node_target_mode_class(const struct impl *impl,
+		const struct node *n)
+{
+	if (impl == NULL || n == NULL)
+		return (uint8_t)RT_CONF_CORE_LITTLE;
+	if (!n->last_applied)
+		return (uint8_t)RT_CONF_CORE_LITTLE;
+	return sample_cpu_to_mode_class(impl, n->last_cpu);
+}
+
 static struct runtime_select_result runtime_select_for_node(
 		const struct impl *impl,
 		struct node *n,
 		uint64_t sample_ref,
 		uint64_t peak_hold,
-		uint64_t period_ns SPA_UNUSED)
+		uint64_t period_ns SPA_UNUSED,
+		uint32_t sample_rate_hz,
+		uint32_t quantum_frames)
 {
 	struct runtime_select_result r = {
 		.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL,
@@ -1714,6 +1756,45 @@ static struct runtime_select_result runtime_select_for_node(
 	}
 	if (pref == BUDGET_SOURCE_DETERMINISTIC)
 		return r;
+
+	/*
+	 * Class-aware adaptive-conformal upper budget. When the
+	 * mode-keyed table is populated and the operator has not
+	 * pinned the budget to BOOTSTRAP, query the entry that matches
+	 * the follower's currently-assigned CPU class. The query also
+	 * honours the LITTLE -> BIG bootstrap fallback inside the
+	 * library: a BIG request with no BIG entry yet ready borrows
+	 * the LITTLE entry's budget and flags `used_bootstrap`. The
+	 * bootstrap state surfaces through HDL-W011 in apply_sample so
+	 * the operator can correlate degraded reservations with the
+	 * warm-up phase. */
+	if (n->conformal_table != NULL && sample_rate_hz != 0 &&
+			quantum_frames != 0 &&
+			pref != BUDGET_SOURCE_BOOTSTRAP) {
+		uint8_t target_class = node_target_mode_class(impl, n);
+		bool used_bootstrap = false;
+		uint64_t c = rt_conformal_table_budget_for_class(
+				n->conformal_table,
+				sample_rate_hz, quantum_frames,
+				target_class, 0, &used_bootstrap);
+		if (c > 0) {
+			r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
+			r.value_ns = SPA_MAX(c, sample_ref);
+			/* Borrow the legacy estimator's sample-count
+			 * reading as a stand-in: the table holds many
+			 * sub-estimators and exposing a per-class total
+			 * here would require a new accessor; the legacy
+			 * value still gives an order-of-magnitude
+			 * "how warmed up is this follower?" signal. */
+			if (n->conformal != NULL)
+				r.sample_count = rt_conformal_samples_used(
+						n->conformal);
+			/* Stash the bootstrap flag on the node for the
+			 * caller's diagnostic emission. */
+			n->budget_used_bootstrap = used_bootstrap;
+			return r;
+		}
+	}
 
 	/*
 	 * Adaptive-conformal upper budget. Used when the estimator
@@ -1897,10 +1978,80 @@ static void apply_sample(struct impl *impl, struct node *n,
 		uint64_t sample_ref_u64 = sample_ref > 0.0
 			? (uint64_t)sample_ref : 0;
 		uint64_t peak_hold = SPA_MAX(n->wcet, sample_ref_u64);
+		bool prev_used_bootstrap = n->budget_used_bootstrap;
+		n->budget_used_bootstrap = false;
 		struct runtime_select_result sel = runtime_select_for_node(
-				impl, n, sample_ref_u64, peak_hold, period);
+				impl, n, sample_ref_u64, peak_hold, period,
+				sample_rate_hz, quantum_frames);
 		n->wcet = sel.value_ns;
 		n->budget_kind = sel.kind;
+
+		uint32_t fid = n->node ? n->node->info.id : n->node_id;
+
+		/* HDL-W011 edge-triggered: emit when the table query
+		 * just satisfied a BIG request from LITTLE statistics
+		 * (the bootstrap fallback engaged). Clears when the BIG
+		 * entry becomes ready and the next selection no longer
+		 * needs the bootstrap. */
+		if (n->budget_used_bootstrap && !prev_used_bootstrap) {
+			pw_log_warn("HDL-W011-BIG-BOOTSTRAP-FROM-LITTLE: "
+					"node %u: BIG core_class has no ready "
+					"conformal statistics yet; reservation "
+					"budget %lu ns derived from LITTLE "
+					"window. Stops once BIG window warms up.",
+					fid, sel.value_ns);
+			n->warned_big_bootstrap_from_little = true;
+		} else if (!n->budget_used_bootstrap && prev_used_bootstrap) {
+			pw_log_info("node %u: BIG core_class statistics "
+					"ready; bootstrap from LITTLE no longer "
+					"in use (HDL-W011 cleared)", fid);
+			n->warned_big_bootstrap_from_little = false;
+		}
+
+		/* HDL-W010 edge-triggered: emit when neither the target
+		 * class nor (when applicable) the LITTLE bootstrap
+		 * produced a publishable budget. The selection then
+		 * falls through to the peak-hold floor; the schedule
+		 * stays kernel-valid but the operator should know the
+		 * per-class window is still warming up. */
+		bool class_stats_missing = (sel.kind ==
+				RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL) &&
+				sel.sample_count == 0 &&
+				sample_ref_u64 > 0 && n->conformal_table != NULL;
+		if (class_stats_missing && !n->warned_no_class_stats) {
+			pw_log_warn("HDL-W010-MISSING-CLASS-STATS: node %u: "
+					"no per-class conformal statistics "
+					"ready yet; falling back to peak-hold "
+					"floor %lu ns until the window fills.",
+					fid, sel.value_ns);
+			n->warned_no_class_stats = true;
+		} else if (!class_stats_missing && n->warned_no_class_stats) {
+			pw_log_info("node %u: per-class conformal statistics "
+					"now ready (HDL-W010 cleared)", fid);
+			n->warned_no_class_stats = false;
+		}
+
+		/* HDL-W020 edge-triggered: published budget below the
+		 * last measured CPU-time runtime. Indicates the
+		 * estimator's score-ring has not yet caught up with a
+		 * recent jump in the workload's cost; the reservation
+		 * is at risk of an overrun. */
+		bool predicted_below_cputime = runtime > 0 &&
+				sel.value_ns > 0 &&
+				sel.value_ns < runtime;
+		if (predicted_below_cputime &&
+				!n->warned_predicted_below_cputime) {
+			pw_log_warn("HDL-W020-PREDICTED-BELOW-LAST-CPUTIME: "
+					"node %u: predicted budget %lu ns is "
+					"below last measured runtime %lu ns. "
+					"Workload may have spiked; estimator "
+					"will catch up over the next samples.",
+					fid, sel.value_ns, runtime);
+			n->warned_predicted_below_cputime = true;
+		} else if (!predicted_below_cputime &&
+				n->warned_predicted_below_cputime) {
+			n->warned_predicted_below_cputime = false;
+		}
 	}
 
 	/*
