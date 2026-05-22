@@ -56,15 +56,75 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	if (cfg == NULL)
 		return;
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->alpha_target          = 1e-3;
+	/*
+	 * Tuning rationale (recent calibration against polyphonic synth
+	 * + filter-chain workloads):
+	 *
+	 * - alpha_target 1e-4 (was 1e-3): target the 99.99 % one-sided
+	 *   quantile so a sudden burst of expensive cycles is not
+	 *   eligible for the empirical-quantile rank that lives below
+	 *   the peak score in the ring.
+	 *
+	 * - alpha_max 5e-3 (was 5e-2): adaptive_conformal must not
+	 *   relax above the 99.5 % quantile during the quiet intervals
+	 *   between bursts. The previous 5e-2 ceiling let alpha_eff
+	 *   drift into the 95 % regime, which dropped the published
+	 *   budget below the peak score in the ring and made the next
+	 *   burst overrun the reservation.
+	 *
+	 * - window 4096 (was 1024): at the common 42 ms graph period
+	 *   the score ring now retains observed peaks for ~170 s
+	 *   instead of ~43 s, so a sustained-spike trace that fits in
+	 *   a few seconds of activity still influences the budget two
+	 *   minutes later. RT_CONFORMAL_MAX_WINDOW remains the ceiling.
+	 *
+	 * - ewma_scale_lambda 0.005 (was 0.05): the EWMA scale
+	 *   multiplies the stored score in the budget formula. The
+	 *   previous 0.05 gain decayed the elevated scale within
+	 *   ~14 samples (~0.6 s) after a burst, collapsing
+	 *   Q * scale -- and therefore the budget -- back to baseline
+	 *   even though the peak score was still in the ring. The new
+	 *   gain keeps the scale's memory of a burst alive for ~140
+	 *   samples (~6 s) so the budget tracks the score ring.
+	 *
+	 * - ewma_location_lambda 0.01 (was 0.05): paired slowing on
+	 *   the location predictor for similar reasons; mu now half-
+	 *   decays over ~70 samples (~3 s) and stays above the quiet-
+	 *   interval mean long enough to hold the prediction tight to
+	 *   recent peak behaviour.
+	 *
+	 * - bootstrap_runtime_ns 100 us (was 0): a freshly admitted
+	 *   follower spends its first bootstrap_min_samples
+	 *   activations on the bootstrap floor; publishing 0
+	 *   collapsed to runtime_floor_ns (1 us) and the placer
+	 *   excluded the node from the DAG until a real sample
+	 *   arrived (wcet=0 gate). 100 us is large enough that the
+	 *   node enters the DAG immediately with a usable runtime
+	 *   estimate, but small enough that several simultaneously
+	 *   bootstrapping followers do not collectively push the
+	 *   critical path past the global deadline and trip the
+	 *   strict feasibility gate.
+	 *
+	 * - burst_threshold 2, burst_penalty 4.0 (Gibbs & Candes 2021
+	 *   §4): after two consecutive overruns the alpha_eff descent
+	 *   is multiplied by four. The asymmetric response tightens
+	 *   the quantile faster than the symmetric eta * (target -
+	 *   event) update, which matters in a polyphonic synth where
+	 *   bursts span dozens of cycles.
+	 *
+	 * - shift_burst_threshold 4 (was 8): the SHIFT marker fires
+	 *   sooner so the diagnostic surface flags a sustained-spike
+	 *   regime before half a second of overruns have accumulated.
+	 */
+	cfg->alpha_target          = 1e-4;
 	cfg->alpha_min             = 1e-5;
-	cfg->alpha_max             = 5e-2;
+	cfg->alpha_max             = 5e-3;
 	cfg->eta                   = 0.005;
-	cfg->ewma_location_lambda  = 0.05;
-	cfg->ewma_scale_lambda     = 0.05;
-	cfg->window                = 1024;
+	cfg->ewma_location_lambda  = 0.01;
+	cfg->ewma_scale_lambda     = 0.005;
+	cfg->window                = 4096;
 	cfg->bootstrap_min_samples = 64;
-	cfg->bootstrap_runtime_ns  = 0;
+	cfg->bootstrap_runtime_ns  = 100000;
 	cfg->guard_ns              = 1500;
 	cfg->guard_percent         = 0.05;
 	cfg->sigma_floor_ns        = 1;
@@ -74,9 +134,9 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	cfg->risk_allocation       = RT_CONF_RISK_ALLOC_UNIFORM;
 	cfg->max_update_cost_ns    = 5000;
 	cfg->trace_export          = false;
-	cfg->burst_threshold       = 0;       /* extension off by default */
-	cfg->burst_penalty         = 1.0;
-	cfg->shift_burst_threshold = 8;
+	cfg->burst_threshold       = 2;
+	cfg->burst_penalty         = 4.0;
+	cfg->shift_burst_threshold = 4;
 }
 
 int rt_conformal_config_validate(const struct rt_conformal_config *cfg)

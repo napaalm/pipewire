@@ -153,7 +153,7 @@ context.modules = [
             # dedicated dynamic data-loop
             # (context.dynamic-data-loops = true); a driver still
             # on the shared main loop is silently excluded.
-            #driver.schedule                         = false
+            driver.schedule                         = true
 
             # ---- Budget source ----
             # Runtime-budget hierarchy cap: manual | deterministic |
@@ -162,23 +162,35 @@ context.modules = [
             #deadline.budget.source                  = adaptive_conformal
 
             # ---- Adaptive-conformal estimator ----
+            # All deadline.conformal.* floating-point parsers honour the
+            # C locale, so values are written with '.' as decimal
+            # separator regardless of the LC_NUMERIC the daemon is
+            # launched under.
+            #
             # Target graph-level overrun frequency and adaptive clamps
-            # (Gibbs & Candes 2021).
-            #deadline.conformal.alpha_graph          = 1e-3
+            # (Gibbs & Candes 2021). alpha_max caps how far the
+            # adaptive loop can relax during quiet intervals.
+            #deadline.conformal.alpha_graph          = 1e-4
             #deadline.conformal.alpha_min            = 1e-5
-            #deadline.conformal.alpha_max            = 5e-2
+            #deadline.conformal.alpha_max            = 5e-3
             # Step size of the adaptive alpha update.
             #deadline.conformal.eta                  = 5e-3
             # Score-ring size per follower; must be in [2, 4096].
-            #deadline.conformal.window               = 1024
+            # At a 42 ms graph period, 4096 retains observed peaks for
+            # ~170 s before the ring evicts them.
+            #deadline.conformal.window               = 4096
             # Observations between rolling quantile recomputes.
             #deadline.conformal.recalc_period        = 1
             # EWMA gains for the location and abs-deviation scale
-            # predictors.
-            #deadline.conformal.ewma_location_lambda = 0.05
-            #deadline.conformal.ewma_scale_lambda    = 0.05
+            # predictors. Smaller = longer memory of bursts. The scale
+            # gain controls how long after a spike the score quantile
+            # still inflates the published budget.
+            #deadline.conformal.ewma_location_lambda = 0.01
+            #deadline.conformal.ewma_scale_lambda    = 0.005
             # Additive (ns) and multiplicative guards on the raw
-            # prediction.
+            # prediction. guard_percent above ~0.15 risks triggering
+            # the strict feasibility gate on a busy chain when the
+            # placer is using cpus.dvfs-policy=conservative.
             #deadline.conformal.guard_ns             = 1500
             #deadline.conformal.guard_percent        = 0.05
             # Lower bound on the EWMA scale used in score normalisation.
@@ -188,8 +200,21 @@ context.modules = [
             # Observations required for BOOTSTRAP -> VALID.
             #deadline.conformal.bootstrap_min_samples = 64
             # Bootstrap floor published while in BOOTSTRAP (0 = use
-            # runtime_floor_ns).
-            #deadline.conformal.bootstrap_runtime_ns = 0
+            # runtime_floor_ns). 100 us is large enough for the
+            # follower to enter the DAG immediately with a usable
+            # estimate, small enough that several bootstrapping
+            # followers do not collectively trip feasibility.
+            #deadline.conformal.bootstrap_runtime_ns = 100000
+            # Asymmetric tightening on consecutive overruns
+            # (Gibbs & Candes 2021 §4): once burst_threshold
+            # consecutive overruns are observed, multiply the
+            # alpha_eff decrease by burst_penalty so the quantile
+            # tightens faster than the symmetric loop would.
+            #deadline.conformal.burst_threshold      = 2
+            #deadline.conformal.burst_penalty        = 4.0
+            # SHIFT-state hint surfaced in diagnostics once a sustained
+            # overrun burst of this length lands.
+            #deadline.conformal.shift_burst_threshold = 4
             # Per-update accounting cap (ns) for the estimator.
             #deadline.conformal.max_update_cost_ns   = 5000
             # Risk-budget allocation across followers:
@@ -198,8 +223,7 @@ context.modules = [
             # Allow BOOTSTRAP to reuse a compatible-history budget when
             # a previously observed mode-key fingerprint recurs.
             #deadline.conformal.compatible_history   = true
-            # Per-sample JSONL trace export (input to
-            # live-test/conformal_calibrate.py). Both keys required.
+            # Per-sample JSONL trace export. Both keys required.
             #deadline.conformal.trace_export         = false
             #deadline.conformal.trace_path           = ""
 
