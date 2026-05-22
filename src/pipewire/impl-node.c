@@ -2226,10 +2226,20 @@ int pw_impl_node_set_data_loop(struct pw_impl_node *node, struct pw_loop *new_lo
 	 *    migration that is still in flight. */
 	pw_impl_node_emit_data_loop_changed(node, old_loop, new_loop);
 
-	/* 7. refresh the published TID. */
+	/* 7. refresh the published TID and propagate it. do_gettid
+	 *    writes PW_KEY_NODE_LOOP_TID via pw_properties_setf, which
+	 *    bypasses pw_impl_node_update_properties and therefore does
+	 *    not bump node->info.change_mask. Without the PROPS bit set,
+	 *    the remote-node info-changed listener that forwards property
+	 *    deltas to the server (pw_client_node_update with
+	 *    SPA_NODE_CHANGE_MASK_PROPS) leaves the server-side proxy
+	 *    pinned to the dead TID of the old pthread, and any
+	 *    consumer that drives kernel scheduling off the published TID
+	 *    (sched_setattr, sched_setaffinity) hits ESRCH every cycle. */
 	pw_loop_invoke(new_loop, do_gettid, SPA_ID_INVALID, NULL, 0, true,
 			node->properties);
-	pw_impl_node_emit_info_changed(node, &node->info);
+	node->info.change_mask |= PW_NODE_CHANGE_MASK_PROPS;
+	emit_info_changed(node, false);
 
 	pw_log_info("%p: relocation complete, new loop:'%s' new tid:%s",
 			node, new_loop->name,
