@@ -696,6 +696,21 @@ struct impl {
 	bool                  heterogeneous;
 	uint32_t              heterogeneous_iterations;
 
+	/* Class assignment for a follower that has not yet been
+	 * placed (n->last_applied == false) and for a sample whose
+	 * placement CPU is unknown (SAMPLE_CPU_UNKNOWN). The value is
+	 * RT_CONF_CORE_LITTLE on a topology that contains at least
+	 * one LITTLE-class CPU (the usual case) and RT_CONF_CORE_BIG
+	 * on an all-BIG topology. The fallback is silent: a topology
+	 * with no LITTLE CPU is not a misconfiguration, it just means
+	 * the warm-up phase accumulates directly into the BIG class
+	 * entry and the LITTLE-to-BIG bootstrap fallback in
+	 * rt_conformal_table_budget_for_class never has cause to fire.
+	 * Migration from LITTLE to BIG is the only direction that
+	 * benefits from a bootstrap, so its absence on a homogeneous-
+	 * BIG host has no operational impact. */
+	uint8_t               default_warmup_class;
+
 	/* Operator policy when the recalc reports a workload that
 	 * cannot be admitted under the strict feasibility gate. The
 	 * default ("keep-previous") leaves the last successfully
@@ -1701,18 +1716,19 @@ static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
 
 /* Derive the conformal mode-key class for a node's current placement.
  * Returns the core_class of the node's last-applied CPU when one is
- * known; falls back to RT_CONF_CORE_LITTLE before the first placement
- * so a freshly-created follower queries the LITTLE bucket (the warm-up
- * class the spec assumes for new nodes). The cast is wire-safe because
- * rt_core_class and rt_core_class_compat share the LITTLE=0 / BIG=1
- * encoding. */
+ * known; falls back to the impl-wide default warm-up class before the
+ * first placement so a freshly-created follower queries the bucket
+ * that the topology can actually fill (LITTLE on hosts with any
+ * LITTLE-class CPU, BIG on an all-BIG host). The cast is wire-safe
+ * because rt_core_class and rt_core_class_compat share the LITTLE=0
+ * / BIG=1 encoding. */
 static inline uint8_t node_target_mode_class(const struct impl *impl,
 		const struct node *n)
 {
 	if (impl == NULL || n == NULL)
 		return (uint8_t)RT_CONF_CORE_LITTLE;
 	if (!n->last_applied)
-		return (uint8_t)RT_CONF_CORE_LITTLE;
+		return impl->default_warmup_class;
 	return sample_cpu_to_mode_class(impl, n->last_cpu);
 }
 
@@ -1847,12 +1863,12 @@ static struct runtime_select_result runtime_select_for_node(
 /* Derive the conformal mode-key components from a placement CPU.
  * Returns the core_class enum value (cast to uint8_t to match the
  * mode_key field type) when the topology has been built and the
- * cpu is in range; falls back to RT_CONF_CORE_LITTLE so a sample
- * collected before the topology probe finishes routes deterministically
- * into the LITTLE bucket. The fallback is conservative: misrouting a
- * pre-topology sample into LITTLE means the per-class statistics
- * accumulate one extra LITTLE observation while still being usable
- * once the probe completes. */
+ * cpu is in range; falls back to the impl-wide default warm-up
+ * class for an unknown or out-of-range sample CPU so a pre-
+ * topology sample routes deterministically into the bucket the
+ * topology can actually fill. A pre-init impl has no default yet:
+ * RT_CONF_CORE_LITTLE is the unconditional fallback there so the
+ * mode key remains stable across the rest of module init. */
 static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
 		uint32_t sample_cpu)
 {
@@ -1860,7 +1876,7 @@ static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
 		return (uint8_t)RT_CONF_CORE_LITTLE;
 	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
 			sample_cpu >= impl->topology.num_cpus)
-		return (uint8_t)RT_CONF_CORE_LITTLE;
+		return impl->default_warmup_class;
 	enum rt_core_class c = impl->topology.cpus[sample_cpu].core_class;
 	return (c == RT_CORE_BIG) ? (uint8_t)RT_CONF_CORE_BIG
 				  : (uint8_t)RT_CONF_CORE_LITTLE;
@@ -1988,11 +2004,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 
 		uint32_t fid = n->node ? n->node->info.id : n->node_id;
 
-		/* HDL-W011 edge-triggered: emit when the table query
-		 * just satisfied a BIG request from LITTLE statistics
-		 * (the bootstrap fallback engaged). Clears when the BIG
-		 * entry becomes ready and the next selection no longer
-		 * needs the bootstrap. */
 		if (n->budget_used_bootstrap && !prev_used_bootstrap) {
 			pw_log_warn("HDL-W011-BIG-BOOTSTRAP-FROM-LITTLE: "
 					"node %u: BIG core_class has no ready "
@@ -2008,12 +2019,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 			n->warned_big_bootstrap_from_little = false;
 		}
 
-		/* HDL-W010 edge-triggered: emit when neither the target
-		 * class nor (when applicable) the LITTLE bootstrap
-		 * produced a publishable budget. The selection then
-		 * falls through to the peak-hold floor; the schedule
-		 * stays kernel-valid but the operator should know the
-		 * per-class window is still warming up. */
 		bool class_stats_missing = (sel.kind ==
 				RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL) &&
 				sel.sample_count == 0 &&
@@ -2031,14 +2036,6 @@ static void apply_sample(struct impl *impl, struct node *n,
 			n->warned_no_class_stats = false;
 		}
 
-		/* HDL-W020 one-shot per node: published budget below the
-		 * last measured CPU-time runtime. The condition is
-		 * sample-volatile (a single noisy cycle can flap it on
-		 * and off), so the flag is set on the first occurrence
-		 * and never cleared for the lifetime of the follower
-		 * struct; a single line per follower is enough to
-		 * surface the under-estimation pattern without flooding
-		 * the log. */
 		bool predicted_below_cputime = runtime > 0 &&
 				sel.value_ns > 0 &&
 				sel.value_ns < runtime;
@@ -4571,34 +4568,30 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->heterogeneous ? "true" : "false",
 			impl->heterogeneous_iterations);
 
-	/* HDL-W001 surfaces the configuration error where the
-	 * operator asked for heterogeneous behaviour but every
-	 * available CPU has been classified as BIG. Without a LITTLE
-	 * core present, the bootstrap fallback in
-	 * rt_conformal_table_budget_for_class can never satisfy a
-	 * cold-start BIG request, and the warm-up policy that the
-	 * conformal table assumes (LITTLE samples accumulate first,
-	 * BIG bootstraps from them) cannot fire. Emit once at init so
-	 * the operator sees the misconfiguration before any sample
-	 * lands and reroutes traffic through the unsuitable fallback. */
-	if (impl->heterogeneous) {
+	/* Pick the class an unplaced follower defaults to during the
+	 * warm-up phase. On a topology that includes at least one
+	 * LITTLE-class CPU the warm-up routes into the LITTLE bucket
+	 * so a later migration onto a BIG core can borrow LITTLE
+	 * statistics through the directional bootstrap fallback. On
+	 * an all-BIG topology the warm-up routes directly into the
+	 * BIG bucket; the bootstrap fallback has no LITTLE source and
+	 * never needs to fire. Both paths are silent steady states --
+	 * heterogeneous=true on a uniform host is not an error, it
+	 * just collapses to BIG-only behaviour. */
+	{
 		uint32_t little_cpus = 0;
 		for (uint32_t k = 0; k < impl->topology.num_cpus; k++) {
 			if (impl->topology.cpus[k].core_class == RT_CORE_LITTLE)
 				little_cpus++;
 		}
-		if (little_cpus == 0) {
-			pw_log_warn("HDL-W001-NO-LITTLE-CPU: "
-					"deadline.heterogeneous=true but no "
-					"available CPU is classified as LITTLE. "
-					"The per-class warm-up and the LITTLE-"
-					"bootstrap fallback that a fresh BIG "
-					"placement relies on are unreachable; "
-					"either lower the dvfs-policy / "
-					"freq-source threshold, set cpus.classes "
-					"explicitly, or run with "
-					"deadline.heterogeneous=false.");
-		}
+		impl->default_warmup_class = (little_cpus > 0)
+				? (uint8_t)RT_CONF_CORE_LITTLE
+				: (uint8_t)RT_CONF_CORE_BIG;
+		pw_log_info("deadline.default_warmup_class = %s "
+				"(LITTLE cpus = %u of %u)",
+				impl->default_warmup_class == RT_CONF_CORE_LITTLE
+					? "little" : "big",
+				little_cpus, impl->topology.num_cpus);
 	}
 
 	impl->on_infeasible = DEADLINE_ON_INFEASIBLE_KEEP_PREVIOUS;
