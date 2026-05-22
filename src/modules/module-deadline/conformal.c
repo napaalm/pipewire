@@ -197,7 +197,6 @@ const char *rt_conformal_invalidation_reason_name(
 	case RT_CONF_INVALIDATED_NONE:                return "none";
 	case RT_CONF_INVALIDATED_PERIOD:              return "period";
 	case RT_CONF_INVALIDATED_FUSION_GROUP:        return "fusion_group";
-	case RT_CONF_INVALIDATED_TOPOLOGY_GENERATION: return "topology_generation";
 	case RT_CONF_INVALIDATED_CPU_CLASS:           return "cpu_class";
 	case RT_CONF_INVALIDATED_OPERATOR_REQUEST:    return "operator_request";
 	case RT_CONF_INVALIDATED_PLUGIN_MODE:         return "plugin_mode";

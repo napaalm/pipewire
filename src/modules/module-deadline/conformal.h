@@ -103,17 +103,15 @@ const char *rt_conformal_state_name(enum rt_conformal_state s);
 /*
  * Why the mode key was rebuilt. Surfaced via
  * rt_conformal_last_invalidation_reason() and rendered as a stable
- * lowercase token for operator diagnostics. The set is intentionally
- * the same dimensions the existing MBPTA estimator key fingerprint
- * folds: period, fusion-leader, topology generation, CPU placement,
- * plus operator request and plugin-mode change. Sharing the
- * vocabulary lets a single typed reason describe both estimators.
+ * lowercase token for operator diagnostics. The set covers the
+ * dimensions that genuinely shift the per-node runtime distribution:
+ * period, fusion-leader, CPU placement, plus operator request and
+ * plugin-mode change.
  */
 enum rt_conformal_invalidation_reason {
 	RT_CONF_INVALIDATED_NONE                = 0,
 	RT_CONF_INVALIDATED_PERIOD              = 1,
 	RT_CONF_INVALIDATED_FUSION_GROUP        = 2,
-	RT_CONF_INVALIDATED_TOPOLOGY_GENERATION = 3,
 	RT_CONF_INVALIDATED_CPU_CLASS           = 4,
 	RT_CONF_INVALIDATED_OPERATOR_REQUEST    = 5,
 	RT_CONF_INVALIDATED_PLUGIN_MODE         = 6,

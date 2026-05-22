@@ -68,9 +68,6 @@ PWTEST(conformal_invalidation_reason_name_stable)
 	pwtest_str_eq(rt_conformal_invalidation_reason_name(
 			RT_CONF_INVALIDATED_FUSION_GROUP), "fusion_group");
 	pwtest_str_eq(rt_conformal_invalidation_reason_name(
-			RT_CONF_INVALIDATED_TOPOLOGY_GENERATION),
-			"topology_generation");
-	pwtest_str_eq(rt_conformal_invalidation_reason_name(
 			RT_CONF_INVALIDATED_CPU_CLASS), "cpu_class");
 	pwtest_str_eq(rt_conformal_invalidation_reason_name(
 			RT_CONF_INVALIDATED_OPERATOR_REQUEST),
@@ -1041,25 +1038,6 @@ PWTEST(conformal_fusion_group_invalidation_resets_state)
 	return PWTEST_PASS;
 }
 
-PWTEST(conformal_topology_generation_invalidation_resets_state)
-{
-	struct rt_conformal_config cfg = cfg_small();
-	rt_conformal_t *e = rt_conformal_create(&cfg);
-	uint32_t i;
-	pwtest_ptr_notnull(e);
-
-	for (i = 0; i < 50; i++)
-		rt_conformal_observe(e, 40000);
-
-	rt_conformal_invalidate(e,
-			RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
-	pwtest_int_eq((int)rt_conformal_last_invalidation_reason(e),
-			(int)RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
-
-	rt_conformal_destroy(e);
-	return PWTEST_PASS;
-}
-
 PWTEST(conformal_compatible_history_field_round_trips)
 {
 	/* compatible_history is a parsed boolean; defaults to true.
@@ -1594,8 +1572,6 @@ PWTEST_SUITE(module_deadline_conformal)
 			PWTEST_NOARG);
 
 	pwtest_add(conformal_fusion_group_invalidation_resets_state,
-			PWTEST_NOARG);
-	pwtest_add(conformal_topology_generation_invalidation_resets_state,
 			PWTEST_NOARG);
 
 	/* Section H: mode-keyed estimator table. */
