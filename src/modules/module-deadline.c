@@ -135,15 +135,18 @@
  *                       `manual`, `deterministic`,
  *                       `adaptive_conformal` (default automatic),
  *                       `bootstrap`. The hierarchy is
- *                       manual -> deterministic -> adaptive_conformal
- *                       -> peak-hold-bootstrap; restricting via this
- *                       knob skips kinds above the chosen layer.
- *                       Strict hard-realtime operation requires
- *                       `manual` or `deterministic` (a configured
- *                       static bound); `adaptive_conformal` is a
- *                       soft / weakly-hard estimate, not a
- *                       deterministic WCET (Bernat, Burns & Llamosi
- *                       2001).
+ *                       manual -> deterministic -> adaptive_conformal;
+ *                       restricting via this knob skips kinds above
+ *                       the chosen layer. `bootstrap` is now an
+ *                       "opt out of admission" knob: the follower
+ *                       is never promoted to SCHED_DEADLINE and
+ *                       always stays at whatever module-rt gave it
+ *                       (SCHED_FIFO at the audio priority). Strict
+ *                       hard-realtime operation requires `manual` or
+ *                       `deterministic` (a configured static bound);
+ *                       `adaptive_conformal` is a soft / weakly-hard
+ *                       estimate, not a deterministic WCET (Bernat,
+ *                       Burns & Llamosi 2001).
  * - `deadline.conformal.alpha_graph` / `alpha_min` / `alpha_max`:
  *                       Target graph-level overrun frequency and
  *                       the clamps the adaptive alpha update
@@ -442,19 +445,26 @@ struct node {
 	bool enabled:1;
 	bool is_driver:1;
 
-	/* Per-node peak-hold WCET, in reference-CPU units. Only
-	 * meaningful for follower nodes (is_driver=false); the driver
-	 * sentinel keeps zeros. The conformal estimator below owns the
-	 * online prediction; n->wcet retains the running max so the
-	 * selection predicate can fall back on a peak-hold floor while
-	 * the estimator is in its bootstrap window. */
+	/* Per-node admission WCET, in reference-CPU units. 0 means
+	 * "not admitted yet": the follower's conformal estimator has
+	 * not cleared bootstrap, so the worker filters this node out
+	 * of the DAG and apply_sched_groups will not issue a
+	 * sched_setattr -- the thread runs under whatever module-rt
+	 * gave it (SCHED_FIFO at the audio priority by default).
+	 * A non-zero value is the conformal estimator's published
+	 * upper-budget for the next cycle, in reference-CPU units;
+	 * sched_cb denormalises it for the placement CPU before
+	 * passing it to sched_setattr. apply_sample re-reads this
+	 * field on every sample, so a state transition
+	 * BOOTSTRAP -> VALID/SHIFT flips it positive and the next
+	 * reconcile pass admits the follower. */
 	uint64_t wcet;
 	uint64_t period;
 
 	/* Decremented in apply_sample; while > 0 the incoming sample is
-	 * dropped before it reaches the conformal estimator, the
-	 * mode-keyed table, and the peak-hold floor. Set by the main
-	 * thread to TOPO_CHANGE_WARMUP_SAMPLES when the driver's topology
+	 * dropped before it reaches the conformal estimator or the
+	 * mode-keyed table. Set by the main thread to
+	 * TOPO_CHANGE_WARMUP_SAMPLES when the driver's topology
 	 * fingerprint changes (a follower joined / left / a link was
 	 * re-routed), so the first few cycles after the change cannot
 	 * pollute the statistical model with set-up-time spikes the
@@ -1337,12 +1347,12 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		 * is rate-limited to one line per leader id per apply pass
 		 * via the existing last_applied gate above, and only fires
 		 * when the conformal estimator has a non-zero EWMA location
-		 * to compare against (a pre-warm-up driver lands on the
-		 * peak-hold fallback and is unaffected here). The threshold
-		 * (sum_runtime < mu) is the smallest signal that still
-		 * surfaces in practice: any reservation below the average
-		 * cycle cost lets the kernel throttle on more than half of
-		 * the activations. */
+		 * to compare against (an un-admitted driver has no real
+		 * conformal location yet and is unaffected here). The
+		 * threshold (sum_runtime < mu) is the smallest signal that
+		 * still surfaces in practice: any reservation below the
+		 * average cycle cost lets the kernel throttle on more than
+		 * half of the activations. */
 		if (anchor != NULL && anchor->is_driver &&
 				anchor->conformal != NULL) {
 			double mu = rt_conformal_mu_ns(anchor->conformal);
@@ -1745,31 +1755,34 @@ static inline double wcet_sample_to_reference(struct impl *impl,
  *
  *   1. RT_DIAG_BUDGET_MANUAL_OVERRIDE -- per-node operator override
  *      (no plumbing yet; reserved for a future per-node property).
- *      Always wins when set.
+ *      Always wins when set and admits the follower immediately.
  *   2. RT_DIAG_BUDGET_DETERMINISTIC_WCET -- a hard static bound
  *      supplied by the plugin (no plumbing yet; reserved for a
- *      future plugin attribute). Used when the plugin exports it.
+ *      future plugin attribute). Used when the plugin exports it
+ *      and also admits immediately.
  *   3. RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL -- the adaptive-conformal
- *      estimator's published budget, whether the estimator is in
- *      BOOTSTRAP (using the configured bootstrap floor) or in
- *      VALID / SHIFT (using the score-ring quantile + EWMA). When
- *      the conformal estimator has not yet been instantiated for
- *      this follower (the very first sample has not arrived) the
- *      predicate reports the same kind with a peak-hold value as
- *      a degenerate floor; the operator can read samples_used = 0
- *      in the conformal sub-object to identify this state.
+ *      estimator's published budget, ONLY when the estimator has
+ *      cleared bootstrap (state == VALID or SHIFT). While the
+ *      conformal is in INSUFFICIENT_DATA or BOOTSTRAP this branch
+ *      returns value_ns = 0, signalling "not admitted yet": the
+ *      caller leaves the follower at whatever module-rt gave it
+ *      (SCHED_FIFO at the audio priority) and the worker filters
+ *      the node out of the DAG analysis upstream. See the
+ *      function-level comment for the rationale.
  *
  * The operator can constrain the hierarchy via deadline.budget.source:
- * BUDGET_SOURCE_BOOTSTRAP returns the peak-hold floor under the
- * conformal kind; the manual / deterministic / adaptive_conformal
- * values skip the kinds above the requested one. BUDGET_SOURCE_AUTO
- * (the default) walks the full hierarchy.
+ * BUDGET_SOURCE_BOOTSTRAP is an "opt out of admission" knob (the
+ * follower stays on SCHED_FIFO regardless of estimator state);
+ * the manual / deterministic / adaptive_conformal values skip the
+ * kinds above the requested one. BUDGET_SOURCE_AUTO (the default)
+ * walks the full hierarchy.
  *
  * Pure function: no PipeWire side effects, no global state mutation.
- * sample_ref is the reference-CPU-normalised most-recent sample;
- * peak_hold is the running maximum observed so far in the same
- * normalisation. Both are uint64 ns. period_ns is forwarded so a
- * future deterministic-bound source can refuse a budget > period.
+ * sample_ref and peak_hold are legacy parameters that are no longer
+ * consulted (the peak-hold floor was removed when the admission
+ * predicate landed); both are kept in the signature for call-site
+ * stability and marked SPA_UNUSED below. period_ns is forwarded to
+ * the conformal layer as the upper clamp on the published budget.
  */
 struct runtime_select_result {
 	enum rt_diag_budget_kind kind;
@@ -1801,24 +1814,50 @@ static inline uint8_t node_target_mode_class(const struct impl *impl,
 static struct runtime_select_result runtime_select_for_node(
 		const struct impl *impl,
 		struct node *n,
-		uint64_t sample_ref,
-		uint64_t peak_hold,
+		uint64_t sample_ref SPA_UNUSED,
+		uint64_t peak_hold SPA_UNUSED,
 		uint64_t period_ns,
 		uint32_t sample_rate_hz,
 		uint32_t quantum_frames)
 {
+	/*
+	 * Admission discipline. A follower is "admitted" once the
+	 * adaptive-conformal estimator (or the mode-keyed table for
+	 * the follower's target class) has cleared bootstrap and can
+	 * publish a budget derived from real per-cycle statistics.
+	 * Until then this function returns value_ns = 0, which the
+	 * caller treats as "not admitted yet": the follower is left at
+	 * whatever module-rt gave it (SCHED_FIFO at the audio priority)
+	 * and is filtered out of the DAG analysis upstream of any
+	 * sched_setattr emission. The conformal state machine
+	 * (INSUFFICIENT_DATA / BOOTSTRAP / VALID / SHIFT / DISABLED)
+	 * decides the gate via rt_conformal_state.
+	 *
+	 * The previous peak-hold floor (n->wcet = monotonic running
+	 * max of historical samples during bootstrap) was the source of
+	 * the cold-start HDL-W030 storms: one inflated first-touch
+	 * sample (a Pulse client connect, a soundfont stream loading on
+	 * cycle 1) pinned the follower's WCET high enough that the
+	 * chain critical path exceeded the period for the remainder of
+	 * the bootstrap window. Holding the follower at SCHED_FIFO
+	 * until the estimator can speak with statistics removes both
+	 * the pin and the DAG inflation it caused.
+	 *
+	 * sample_ref and peak_hold are retained in the signature for
+	 * call-site stability; both are now unused.
+	 */
+	enum rt_budget_source pref = impl->budget_source;
 	struct runtime_select_result r = {
 		.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL,
-		.value_ns = SPA_MAX(peak_hold, sample_ref),
+		.value_ns = 0,
 		.sample_count = 0,
 	};
-	enum rt_budget_source pref = impl->budget_source;
 
 	/*
 	 * Per-node manual override hook. No plugin property is wired
 	 * to it yet; once a per-node deadline.manual_override.runtime_ns
 	 * property exists this branch picks it up. Manual override
-	 * always wins.
+	 * always wins and admits the follower immediately.
 	 */
 	if (false /* placeholder until per-node property lands */) {
 		r.kind = RT_DIAG_BUDGET_MANUAL_OVERRIDE;
@@ -1830,7 +1869,8 @@ static struct runtime_select_result runtime_select_for_node(
 	/*
 	 * Per-node deterministic WCET hook. No plugin attribute is
 	 * wired to it yet; reserved for a future PW_KEY_NODE_WCET_NS
-	 * or equivalent.
+	 * or equivalent. A deterministic bound, when supplied, admits
+	 * the follower immediately.
 	 */
 	if (false /* placeholder until plugin attribute lands */) {
 		r.kind = RT_DIAG_BUDGET_DETERMINISTIC_WCET;
@@ -1840,36 +1880,42 @@ static struct runtime_select_result runtime_select_for_node(
 		return r;
 
 	/*
+	 * BUDGET_SOURCE_BOOTSTRAP is now an "opt out of admission"
+	 * knob: the operator has explicitly asked to never promote the
+	 * follower to SCHED_DEADLINE, so we return 0 without consulting
+	 * any estimator. Useful for benchmarking against the
+	 * pure-SCHED_FIFO baseline without rebuilding the daemon.
+	 */
+	if (pref == BUDGET_SOURCE_BOOTSTRAP)
+		return r;
+
+	/*
 	 * Class-aware adaptive-conformal upper budget. When the
-	 * mode-keyed table is populated and the operator has not
-	 * pinned the budget to BOOTSTRAP, query the entry that matches
-	 * the follower's currently-assigned CPU class. The query also
-	 * honours the LITTLE -> BIG bootstrap fallback inside the
-	 * library: a BIG request with no BIG entry yet ready borrows
-	 * the LITTLE entry's budget and flags `used_bootstrap`. The
-	 * bootstrap state surfaces through HDL-W011 in apply_sample so
-	 * the operator can correlate degraded reservations with the
-	 * warm-up phase. */
+	 * mode-keyed table has cleared bootstrap for the follower's
+	 * target class, its budget is the kernel-side runtime. The
+	 * LITTLE -> BIG bootstrap fallback inside the library still
+	 * lets a fresh BIG placement borrow the LITTLE window so a
+	 * new node on a BIG core gets admitted as soon as either class
+	 * window is warm; HDL-W011 in the caller surfaces that case.
+	 *
+	 * The period_ns argument is the upper clamp on the published
+	 * budget: a runaway prediction (a single outlier dominating
+	 * the empirical quantile, or a sustained-spike pile-up) cannot
+	 * publish a WCET above the kernel-side period, which would
+	 * otherwise make this single node "infeasible" before any
+	 * chain analysis runs.
+	 */
 	if (n->conformal_table != NULL && sample_rate_hz != 0 &&
-			quantum_frames != 0 &&
-			pref != BUDGET_SOURCE_BOOTSTRAP) {
+			quantum_frames != 0) {
 		uint8_t target_class = node_target_mode_class(impl, n);
 		bool used_bootstrap = false;
-		/* Pass the kernel-side period as the upper clamp so a
-		 * runaway prediction (a single outlier dominating the
-		 * empirical quantile, or a sustained-spike pile-up) cannot
-		 * publish a budget that the chain analysis below would then
-		 * declare infeasible at the per-node level. The HDL-W030
-		 * critical-path check still catches chain-level overflow;
-		 * this just prevents one node from being seen as already
-		 * unfeasible on its own. */
 		uint64_t c = rt_conformal_table_budget_for_class(
 				n->conformal_table,
 				sample_rate_hz, quantum_frames,
 				target_class, period_ns, &used_bootstrap);
 		if (c > 0) {
 			r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
-			r.value_ns = SPA_MAX(c, sample_ref);
+			r.value_ns = c;
 			/* Borrow the legacy estimator's sample-count
 			 * reading as a stand-in: the table holds many
 			 * sub-estimators and exposing a per-class total
@@ -1887,36 +1933,33 @@ static struct runtime_select_result runtime_select_for_node(
 	}
 
 	/*
-	 * Adaptive-conformal upper budget. Used when the estimator
-	 * has cleared bootstrap (state == VALID, SHIFT). SHIFT is
+	 * Legacy single-estimator adaptive-conformal budget. Only
+	 * VALID / SHIFT states publish; INSUFFICIENT_DATA / BOOTSTRAP
+	 * return 0 here so the caller leaves the follower on SCHED_FIFO
+	 * (see the function-level admission rationale above). SHIFT is
 	 * still publishable: the value remains a valid one-sided
 	 * bound; the drift flag rides in the diagnostic surface.
 	 */
-	if (n->conformal != NULL &&
-	    pref != BUDGET_SOURCE_BOOTSTRAP) {
+	if (n->conformal != NULL) {
 		enum rt_conformal_state cs = rt_conformal_state(n->conformal);
 		if (cs == RT_CONF_VALID || cs == RT_CONF_SHIFT) {
-			/* See the per-class branch above for the rationale on
-			 * passing period_ns as the upper clamp. */
 			uint64_t c = rt_conformal_budget(n->conformal, period_ns);
 			if (c > 0) {
 				r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
-				r.value_ns = SPA_MAX(c, sample_ref);
+				r.value_ns = c;
 				r.sample_count = rt_conformal_samples_used(n->conformal);
 				return r;
 			}
 		}
 	}
-	/* If the operator requested adaptive_conformal explicitly and
-	 * the estimator is not yet ready, the predicate falls through
-	 * to the peak-hold floor rather than holding the budget back. */
 
-	/* Bootstrap fallback: peak-hold value (default of r). The
-	 * conformal estimator owns its own bootstrap-with-immediate-
-	 * start path, so a freshly-created follower lands here only
-	 * for the very first activation; subsequent activations either
-	 * stay on this path until the conformal estimator clears
-	 * bootstrap, or switch to RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL. */
+	/*
+	 * Not yet admitted. r.value_ns is still 0; the follower stays
+	 * on whatever module-rt gave it. apply_sched_groups will not
+	 * issue sched_setattr for a node whose wcet is 0, and the
+	 * worker filters wcet=0 nodes out of the DAG before reconcile
+	 * sees them.
+	 */
 	return r;
 }
 
@@ -2129,24 +2172,60 @@ static void apply_sample(struct impl *impl, struct node *n,
 				(uint64_t)sample_ref);
 	}
 
-	/* Peak-hold floor: an outlier the estimators have not yet
-	 * incorporated still raises the budget for the next cycle.
-	 * Track the running max in n->wcet so the selection predicate
-	 * can fall back on it. */
+	/* Refresh the per-node WCET from the admission predicate. While
+	 * the conformal estimator has not cleared bootstrap, value_ns
+	 * stays at 0 and the follower is left on whatever module-rt
+	 * gave it (SCHED_FIFO at the audio priority). Once the
+	 * estimator publishes a real budget the WCET flips positive
+	 * and the upstream DAG / sched_setattr path admits the node to
+	 * SCHED_DEADLINE on the next worker pass.
+	 *
+	 * The previous design fed the predicate a "peak-hold" floor
+	 * (max of historical samples) so a fresh follower had a budget
+	 * from cycle 1. That pinned the WCET to the worst cold-start
+	 * sample for the entire bootstrap window and produced the
+	 * HDL-W030 critical-path storms during startup; the new
+	 * contract is "no budget until statistics are good". */
 	{
-		uint64_t sample_ref_u64 = sample_ref > 0.0
-			? (uint64_t)sample_ref : 0;
-		uint64_t peak_hold = SPA_MAX(n->wcet, sample_ref_u64);
+		uint64_t prev_wcet = n->wcet;
 		bool prev_used_bootstrap = n->budget_used_bootstrap;
 		n->budget_used_bootstrap = false;
 		struct runtime_select_result sel = runtime_select_for_node(
-				impl, n, sample_ref_u64, peak_hold, period,
+				impl, n, 0, 0, period,
 				sample_rate_hz, quantum_frames);
 		n->wcet = sel.value_ns;
 		n->budget_kind = sel.kind;
 
-		uint32_t fid = n->node ? n->node->info.id : n->node_id;
+		uint32_t fid = n->node_id;
 
+		/* Admission transition diagnostics. The handoff from
+		 * BOOTSTRAP (wcet = 0, follower on SCHED_FIFO) to
+		 * VALID / SHIFT (wcet > 0, follower about to be admitted
+		 * to SCHED_DEADLINE on the next worker pass) is the
+		 * moment the kernel-side policy changes; surface it once
+		 * per transition so the operator can correlate the
+		 * scheduling change with the conformal state. A subsequent
+		 * invalidation (period change, fusion-group reshape) that
+		 * drops wcet back to 0 is reported as a demotion. */
+		if (prev_wcet == 0 && n->wcet > 0) {
+			pw_log_info("HDL-I010-NODE-ADMITTED: node %u: "
+					"conformal cleared bootstrap "
+					"(budget %" PRIu64 " ns, period "
+					"%" PRIu64 " ns); follower will "
+					"be promoted to SCHED_DEADLINE on "
+					"the next reconcile pass",
+					fid, n->wcet, period);
+		} else if (prev_wcet > 0 && n->wcet == 0) {
+			pw_log_info("HDL-I011-NODE-DEMOTED: node %u: "
+					"conformal returned to bootstrap "
+					"(was %" PRIu64 " ns); follower "
+					"will be left on SCHED_FIFO until "
+					"statistics warm up again",
+					fid, prev_wcet);
+		}
+
+		uint64_t sample_ref_u64 = sample_ref > 0.0
+			? (uint64_t)sample_ref : 0;
 		struct budget_warning_inputs win = {
 			.sel_kind         = sel.kind,
 			.sel_value_ns     = sel.value_ns,
@@ -2184,8 +2263,10 @@ static void apply_sample(struct impl *impl, struct node *n,
 		if (ev.fire_w010) {
 			pw_log_warn("HDL-W010-MISSING-CLASS-STATS: node %u: "
 					"no per-class conformal statistics "
-					"ready yet; falling back to peak-hold "
-					"floor %lu ns until the window fills.",
+					"ready yet; follower remains on "
+					"SCHED_FIFO (admission predicate "
+					"reports value_ns=%lu) until the "
+					"window fills.",
 					fid, sel.value_ns);
 			n->warned_no_class_stats = true;
 		} else if (ev.clear_w010) {
@@ -3829,33 +3910,71 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 		return;
 	}
 
-	{
-		for (i = 0; i < t->n_nodes; i++) {
-			/* find_node_any_by_id (not find_node_by_id):
-			 * when driver.schedule is true, t->nodes[i].id
-			 * may be the driver's own id and the follower
-			 * variant deliberately filters drivers out.
-			 * Driver and follower struct nodes share the
-			 * same id-index and the same wcet/conformal
-			 * slots, so the any-variant returns the right
-			 * entry whichever it is. */
-			struct node *n = find_node_any_by_id(impl,
-					t->nodes[i].id);
-
-			followers[i].id = t->nodes[i].id;
-			followers[i].tid = t->nodes[i].tid;
-			followers[i].wcet = n ? n->wcet : 0;
-		}
+	/* Admission filter. A follower whose conformal estimator has
+	 * not yet cleared bootstrap publishes wcet = 0 through
+	 * runtime_select_for_node, signalling "leave this thread on
+	 * whatever module-rt gave it; do not synthesize a budget".
+	 * Drop those nodes and any edge touching them before reconcile
+	 * sees the topology, so:
+	 *   - the chain critical path is computed only over admitted
+	 *     followers (no bootstrap-time outliers inflate it);
+	 *   - sched_cb is never invoked for a wcet=0 node, so
+	 *     apply_sched_groups never tries to emit an invalid
+	 *     SCHED_DEADLINE tuple for a follower that is not ready;
+	 *   - the kernel-side scheduling policy for an unadmitted
+	 *     follower is whatever module-rt installed
+	 *     (SCHED_FIFO at the audio priority by default), so the
+	 *     graph still runs at low latency while statistics warm.
+	 * Once the follower's conformal flips to VALID/SHIFT, the next
+	 * apply_sample pass writes a non-zero wcet, the follower
+	 * re-enters the filter as admitted on the next reconcile, and
+	 * the standard sched_setattr emission path takes over (the
+	 * one-shot HDL-I010 info line marks the handoff). */
+	uint32_t admitted_count = 0;
+	for (i = 0; i < t->n_nodes; i++) {
+		/* find_node_any_by_id (not find_node_by_id):
+		 * when driver.schedule is true, t->nodes[i].id
+		 * may be the driver's own id and the follower
+		 * variant deliberately filters drivers out.
+		 * Driver and follower struct nodes share the
+		 * same id-index and the same wcet/conformal
+		 * slots, so the any-variant returns the right
+		 * entry whichever it is. */
+		struct node *n = find_node_any_by_id(impl,
+				t->nodes[i].id);
+		uint64_t w = n ? n->wcet : 0;
+		if (w == 0)
+			continue;
+		followers[admitted_count].id = t->nodes[i].id;
+		followers[admitted_count].tid = t->nodes[i].tid;
+		followers[admitted_count].wcet = w;
+		admitted_count++;
 	}
+	uint32_t admitted_edges = 0;
 	for (i = 0; i < t->n_edges; i++) {
-		edges[i].src = t->edges[i].src;
-		edges[i].dst = t->edges[i].dst;
+		uint32_t src = t->edges[i].src;
+		uint32_t dst = t->edges[i].dst;
+		bool src_admitted = false, dst_admitted = false;
+		uint32_t j;
+		for (j = 0; j < admitted_count; j++) {
+			if (followers[j].id == src)
+				src_admitted = true;
+			if (followers[j].id == dst)
+				dst_admitted = true;
+			if (src_admitted && dst_admitted)
+				break;
+		}
+		if (!(src_admitted && dst_admitted))
+			continue;
+		edges[admitted_edges].src = src;
+		edges[admitted_edges].dst = dst;
+		admitted_edges++;
 	}
 
 	rtopo.followers = followers;
-	rtopo.n_followers = t->n_nodes;
+	rtopo.n_followers = admitted_count;
 	rtopo.edges = edges;
-	rtopo.n_edges = t->n_edges;
+	rtopo.n_edges = admitted_edges;
 	rtopo.period = t->period;
 	rtopo.generation = SPA_ATOMIC_LOAD(t->generation);
 

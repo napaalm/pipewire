@@ -756,6 +756,52 @@ PWTEST(conformal_state_transitions_bootstrap_to_valid)
 	return PWTEST_PASS;
 }
 
+/* Admission contract pinned by the conformal budget reader. While the
+ * estimator is in INSUFFICIENT_DATA or BOOTSTRAP the published budget
+ * is independent of the magnitude of the samples already accumulated
+ * (it is always the configured bootstrap floor, clamped to the
+ * period). This is what lets module-deadline.c gate SCHED_DEADLINE
+ * admission on "the estimator can speak with statistics": until the
+ * state flips to VALID / SHIFT the budget reader cannot leak a
+ * one-off cold-start sample into the kernel-side reservation.
+ *
+ * Regression for the audio-loop / pw-play startup pathology where the
+ * previous peak-hold mechanism (n->wcet = monotonic running max of
+ * historical samples) admitted a 40 ms first-touch sample into the
+ * DAG critical-path analysis and pinned it there for the entire
+ * bootstrap window. */
+PWTEST(conformal_bootstrap_budget_independent_of_sample_magnitude)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_t *e;
+	uint64_t budget;
+	uint32_t i;
+
+	/* Bootstrap floor well below any plausible cold-start sample. */
+	cfg.bootstrap_runtime_ns = 10000;
+	cfg.runtime_floor_ns     = 1000;
+
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	/* Feed half the bootstrap_min_samples with extreme magnitudes;
+	 * the estimator is still in BOOTSTRAP throughout this loop. */
+	for (i = 0; i < cfg.bootstrap_min_samples / 2u; i++)
+		rt_conformal_observe(e, 40000000); /* 40 ms */
+
+	pwtest_int_eq((int)rt_conformal_state(e), (int)RT_CONF_BOOTSTRAP);
+	budget = rt_conformal_budget(e, 50000000);
+	pwtest_int_eq((int)budget, (int)cfg.bootstrap_runtime_ns);
+
+	/* Same invariant: period clamp bounds the budget even if the
+	 * bootstrap floor were configured large. */
+	budget = rt_conformal_budget(e, 5000);
+	pwtest_int_eq((int)budget, 5000);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
 /* ---------------------------------------------------------------- */
 /* Section H: adaptive alpha update and drift detection.             */
 /* ---------------------------------------------------------------- */
@@ -1606,6 +1652,8 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_observe_clamps_below_floor, PWTEST_NOARG);
 	pwtest_add(conformal_budget_handles_disabled_state, PWTEST_NOARG);
 
+	pwtest_add(conformal_bootstrap_budget_independent_of_sample_magnitude,
+			PWTEST_NOARG);
 	pwtest_add(conformal_fresh_estimator_publishes_bootstrap_floor,
 			PWTEST_NOARG);
 	pwtest_add(conformal_state_transitions_bootstrap_to_valid,
