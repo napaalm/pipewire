@@ -1721,6 +1721,36 @@ static void apply_sample(struct impl *impl, struct node *n,
 	if (sample_ref <= 0.0)
 		sample_ref = wcet_sample_to_reference(impl, runtime, sample_cpu);
 
+	/* Outlier guard: a sustainable audio follower must complete its
+	 * process() invocation within one period. A sample larger than a
+	 * small multiple of the period is almost always an initialisation
+	 * spike (a plugin allocating its first scratch buffer; Surge XT
+	 * priming its wavetables on the first cycle; a soundfont stream
+	 * loading; a JIT first-touch) or an unbounded kernel-side
+	 * preemption that the CPU-time counter accumulated under an
+	 * unrelated workload. If we let such a value into either the
+	 * peak-hold floor or the conformal score ring it dominates the
+	 * estimator until enough normal samples flush it out -- meanwhile
+	 * the soft-redistribute heuristic, which proportions deadlines by
+	 * WCET, hands the misbehaving follower almost the entire period
+	 * and starves the well-behaved peers with sub-microsecond
+	 * reservations.  Discard the sample and let the existing budget
+	 * stand. The drop is logged at debug so the operator can correlate
+	 * an observed transient with the actual measurement.
+	 *
+	 * Threshold: 2 * period_ns. A single-period overshoot is plausible
+	 * on a preempted activation; sustained breaches accumulate over
+	 * several recalc passes and surface through HDL-W030 instead. */
+	if (period > 0 && sample_ref > 2.0 * (double)period) {
+		pw_log_debug("node %u: discarding outlier sample %.0f ns "
+				"(period=%" PRIu64 " ns, threshold=2x); "
+				"runtime_ns=%" PRIu64 " cycles=%" PRIu64,
+				n->node ? n->node->info.id : (uint32_t)-1,
+				sample_ref, period, runtime, cycles);
+		n->period = period;
+		return;
+	}
+
 	/* Feed the conformal estimator the same sample. The observation
 	 * flow obeys the prequential discipline internally (score
 	 * computed against pre-observation EWMA state). */
