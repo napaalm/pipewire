@@ -145,6 +145,14 @@ test('test-cpu-topology',
                link_with: pwtest_lib)
 )
 
+test('test-module-deadline-budget-warnings',
+    executable('test-module-deadline-budget-warnings',
+               'test-module-deadline-budget-warnings.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, pipewire_dep ],
+               link_with: pwtest_lib)
+)
+
 test('test-fusion-cost',
     executable('test-fusion-cost',
                'test-fusion-cost.c',

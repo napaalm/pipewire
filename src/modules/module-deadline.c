@@ -42,6 +42,7 @@
 
 #include "config.h"
 
+#include "module-deadline/budget_warnings.h"
 #include "module-deadline/conformal.h"
 #include "module-deadline/cpu_topology.h"
 #include "module-deadline/dag.h"
@@ -2004,7 +2005,26 @@ static void apply_sample(struct impl *impl, struct node *n,
 
 		uint32_t fid = n->node ? n->node->info.id : n->node_id;
 
-		if (n->budget_used_bootstrap && !prev_used_bootstrap) {
+		struct budget_warning_inputs win = {
+			.sel_kind         = sel.kind,
+			.sel_value_ns     = sel.value_ns,
+			.sel_sample_count = sel.sample_count,
+			.sample_ref       = sample_ref_u64,
+			.runtime          = runtime,
+			.conformal_table_present = (n->conformal_table != NULL),
+			.current_used_bootstrap  = n->budget_used_bootstrap,
+			.prev_used_bootstrap     = prev_used_bootstrap,
+			.prior_warned_no_class_stats =
+					n->warned_no_class_stats,
+			.prior_warned_big_bootstrap =
+					n->warned_big_bootstrap_from_little,
+			.prior_warned_predicted_below_cputime =
+					n->warned_predicted_below_cputime,
+		};
+		struct budget_warning_events ev =
+				compute_budget_warning_events(&win);
+
+		if (ev.fire_w011) {
 			pw_log_warn("HDL-W011-BIG-BOOTSTRAP-FROM-LITTLE: "
 					"node %u: BIG core_class has no ready "
 					"conformal statistics yet; reservation "
@@ -2012,35 +2032,27 @@ static void apply_sample(struct impl *impl, struct node *n,
 					"window. Stops once BIG window warms up.",
 					fid, sel.value_ns);
 			n->warned_big_bootstrap_from_little = true;
-		} else if (!n->budget_used_bootstrap && prev_used_bootstrap) {
+		} else if (ev.clear_w011) {
 			pw_log_info("node %u: BIG core_class statistics "
 					"ready; bootstrap from LITTLE no longer "
 					"in use (HDL-W011 cleared)", fid);
 			n->warned_big_bootstrap_from_little = false;
 		}
 
-		bool class_stats_missing = (sel.kind ==
-				RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL) &&
-				sel.sample_count == 0 &&
-				sample_ref_u64 > 0 && n->conformal_table != NULL;
-		if (class_stats_missing && !n->warned_no_class_stats) {
+		if (ev.fire_w010) {
 			pw_log_warn("HDL-W010-MISSING-CLASS-STATS: node %u: "
 					"no per-class conformal statistics "
 					"ready yet; falling back to peak-hold "
 					"floor %lu ns until the window fills.",
 					fid, sel.value_ns);
 			n->warned_no_class_stats = true;
-		} else if (!class_stats_missing && n->warned_no_class_stats) {
+		} else if (ev.clear_w010) {
 			pw_log_info("node %u: per-class conformal statistics "
 					"now ready (HDL-W010 cleared)", fid);
 			n->warned_no_class_stats = false;
 		}
 
-		bool predicted_below_cputime = runtime > 0 &&
-				sel.value_ns > 0 &&
-				sel.value_ns < runtime;
-		if (predicted_below_cputime &&
-				!n->warned_predicted_below_cputime) {
+		if (ev.fire_w020) {
 			pw_log_warn("HDL-W020-PREDICTED-BELOW-LAST-CPUTIME: "
 					"node %u: predicted budget %lu ns is "
 					"below measured runtime %lu ns on at "
