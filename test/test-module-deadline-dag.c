@@ -3331,6 +3331,89 @@ PWTEST(hetero_iter_convergence_breaks_loop)
 	return PWTEST_PASS;
 }
 
+PWTEST(predicted_and_scheduled_runtime_populated_after_recalc)
+{
+	/* Hard-mode happy path: every real node must publish a
+	 * positive predicted_runtime_ns and scheduled_runtime_ns, and
+	 * with no clamping in play they must be equal. Fictitious
+	 * endpoints stay at zero. */
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 200, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 150, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	for (uint32_t id = 1; id <= 3; id++) {
+		dag_node_t *n = find_node_by_id(g, id);
+		pwtest_int_lt(0, (int)n->predicted_runtime_ns);
+		pwtest_int_eq((int)n->predicted_runtime_ns,
+				(int)n->scheduled_runtime_ns);
+		pwtest_int_eq((int)n->predicted_runtime_ns, (int)n->wcet);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(predicted_and_scheduled_cleared_on_dirty)
+{
+	/* Mutating wcet must reset both runtime fields back to zero
+	 * (the invalidate-schedule contract). They are repopulated on
+	 * the next successful recalc. */
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_lt(0, (int)find_node_by_id(g, 1)->predicted_runtime_ns);
+
+	pwtest_int_eq(dag_set_node_wcet(g, 1, 200), 0);
+	pwtest_int_eq((int)find_node_by_id(g, 1)->predicted_runtime_ns, 0);
+	pwtest_int_eq((int)find_node_by_id(g, 1)->scheduled_runtime_ns, 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
+	pwtest_int_eq((int)find_node_by_id(g, 1)->predicted_runtime_ns, 200);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(predicted_and_scheduled_diverge_under_soft_clamp)
+{
+	/* Build an over-budget chain so the soft fallback clips at
+	 * least one node, then verify scheduled < predicted on that
+	 * node while equal elsewhere. */
+	dag_t *g = dag_create(100, 100, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 80, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 80, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+
+	/* Hard mode rejects this with EAGAIN -- critical path 160 ns
+	 * > deadline 100 ns -- so the soft fallback runs. */
+	pwtest_int_eq(dag_recalculate(g), -1);
+	pwtest_int_eq(dag_recalculate_soft(g), 0);
+
+	uint32_t clipped = 0;
+	for (uint32_t id = 1; id <= 2; id++) {
+		dag_node_t *n = find_node_by_id(g, id);
+		pwtest_int_lt(0, (int)n->predicted_runtime_ns);
+		pwtest_int_lt(0, (int)n->scheduled_runtime_ns);
+		/* Either equal (uncipped) or scheduled < predicted
+		 * (clipped). The soft path may apply the clip to one
+		 * or both of these nodes; at least one must be
+		 * clipped for the test workload. */
+		if (n->scheduled_runtime_ns < n->predicted_runtime_ns)
+			clipped++;
+	}
+	pwtest_int_lt(0, (int)clipped);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST(hetero_iter_fusion_group_stays_co_located)
 {
 	/* Three nodes stamped into the same fusion group must land on a
@@ -4137,6 +4220,11 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(hetero_iter_single_iteration_short_circuits, PWTEST_NOARG);
 	pwtest_add(hetero_iter_chain_overlay_stretches_paths, PWTEST_NOARG);
 	pwtest_add(hetero_iter_convergence_breaks_loop, PWTEST_NOARG);
+	pwtest_add(predicted_and_scheduled_runtime_populated_after_recalc,
+			PWTEST_NOARG);
+	pwtest_add(predicted_and_scheduled_cleared_on_dirty, PWTEST_NOARG);
+	pwtest_add(predicted_and_scheduled_diverge_under_soft_clamp,
+			PWTEST_NOARG);
 	pwtest_add(hetero_iter_fusion_group_stays_co_located, PWTEST_NOARG);
 	pwtest_add(hetero_iter_preserves_unrelated_set_cache, PWTEST_NOARG);
 	pwtest_add(critical_path_runtime_chain_homogeneous, PWTEST_NOARG);

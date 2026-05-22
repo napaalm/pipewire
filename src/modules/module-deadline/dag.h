@@ -123,6 +123,32 @@ struct dag_node {
 	 * that finds the graph hard-feasible again returns false here).
 	 */
 	bool budget_clipped;
+
+	/*
+	 * Predicted vs scheduled runtime split.
+	 *
+	 * `predicted_runtime_ns` is the runtime estimate the analysis
+	 * layer has reasoned with: the conformal estimator's budget
+	 * (in reference-CPU units), or its placement-stretched value
+	 * during the iterative recalc. Feasibility checks, deadline
+	 * splitting, and the operator-facing "this is what we expect
+	 * the node to need" diagnostic all read this field.
+	 *
+	 * `scheduled_runtime_ns` is the runtime the kernel actually
+	 * received via sched_setattr (or would receive on the next
+	 * apply pass): the predicted value after any soft-fallback
+	 * clamping or per-CPU overutilisation rescaling. When no
+	 * degradation happens the two fields are equal; when they
+	 * diverge the operator can see by how much the applied
+	 * reservation falls short of the predicted workload.
+	 *
+	 * Both fields are populated by dag_recalculate (and its
+	 * heterogeneous / soft variants) for every real node on a
+	 * successful pass; they are zero outside an active recalc and
+	 * reset by dag_invalidate_schedule.
+	 */
+	uint64_t predicted_runtime_ns;
+	uint64_t scheduled_runtime_ns;
 };
 
 struct dag_edge {

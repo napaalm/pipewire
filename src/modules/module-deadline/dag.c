@@ -61,6 +61,8 @@ static void dag_invalidate_schedule(dag_t *g)
 		n->remaining_deadline = 0;
 		n->cpu = DAG_CPU_INVALID;
 		n->budget_clipped = false;
+		n->predicted_runtime_ns = 0;
+		n->scheduled_runtime_ns = 0;
 	}
 }
 
@@ -3122,6 +3124,23 @@ int dag_recalculate(dag_t *g)
 		return -1;
 	}
 
+	/* Publish the named predicted / scheduled runtimes for every
+	 * real node. On the hard-mode path both fields take the same
+	 * value (no clamping has happened yet); the soft fallback
+	 * rewrites `scheduled_runtime_ns` for any node it had to clip
+	 * against its assigned local deadline. The predicted value
+	 * honours the iterative recalc's runtime overlay (when set),
+	 * so the operator-facing surface sees the placement-stretched
+	 * estimate that drove the converged split. */
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		if (n == NULL || n->fictitious)
+			continue;
+		uint64_t r = node_runtime_value(g, n);
+		n->predicted_runtime_ns = r;
+		n->scheduled_runtime_ns = r;
+	}
+
 	struct timespec end_time;
 	clock_gettime(CLOCK_MONOTONIC, &end_time);
 	double duration = (end_time.tv_sec - start_time.tv_sec) +
@@ -3245,6 +3264,28 @@ int dag_recalculate_soft(dag_t *g)
 	if (assign_cpus_internal(g, true) < 0) {
 		dag_mark_dirty(g);
 		return -1;
+	}
+
+	/* Publish predicted vs scheduled runtimes for the soft path.
+	 * `predicted` is the analysis-layer estimate (wcet, or the
+	 * overlay value if one was installed for the iterative
+	 * recalc); `scheduled` is the kernel-facing value, which on a
+	 * budget-clipped node is the assigned local_deadline (the
+	 * clamp the soft path imposed) and otherwise equals predicted.
+	 * Operator diagnostics can compare the two to see how badly
+	 * the soft mode had to degrade the reservation. */
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		if (n == NULL || n->fictitious)
+			continue;
+		uint64_t r = node_runtime_value(g, n);
+		n->predicted_runtime_ns = r;
+		if (n->budget_clipped && n->local_deadline > 0 &&
+				n->local_deadline < r) {
+			n->scheduled_runtime_ns = n->local_deadline;
+		} else {
+			n->scheduled_runtime_ns = r;
+		}
 	}
 
 	g->dirty = false;
