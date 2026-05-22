@@ -1269,7 +1269,7 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 					(int)g->tid, g->sum_runtime,
 					kernel_deadline, g->period,
 					g->n_members, g->leader_id);
-			anchor = find_node_by_id(impl, g->leader_id);
+			anchor = find_node_any_by_id(impl, g->leader_id);
 			if (anchor != NULL)
 				anchor->last_applied = false;
 			any_failure = true;
@@ -1305,7 +1305,18 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			any_failure = true;
 		}
 
-		anchor = find_node_by_id(impl, g->leader_id);
+		/* Driver-aware lookup: a sched group whose leader_id resolves
+		 * to the driver (post-94b69ad24 the driver is a regular node
+		 * in the scheduling DAG) needs the driver entry as anchor so
+		 * the last_* bookkeeping below mirrors what sched_setattr
+		 * actually applied. find_node_by_id intentionally filters
+		 * drivers (its callers want follower-only iteration); the
+		 * dispatch loop wants both. Without this fix drv->last_applied
+		 * stays false even after a successful SCHED_DEADLINE call, the
+		 * idempotency short-circuit below never engages for the driver,
+		 * and the HDL-W091-DRIVER-BUDGET-BELOW-MEAN diagnostic at
+		 * `anchor->is_driver` is unreachable. */
+		anchor = find_node_any_by_id(impl, g->leader_id);
 		if (anchor != NULL && anchor->last_applied &&
 				anchor->last_runtime == g->sum_runtime &&
 				anchor->last_deadline == kernel_deadline &&
@@ -3192,12 +3203,20 @@ static int populate_params_snapshot(struct impl *impl,
 	snap->generation = SPA_ATOMIC_LOAD(drv->topo.generation);
 
 	spa_list_for_each(n_iter, &dnode->follower_list, follower_link) {
-		if (n_iter == dnode)
-			continue;
+		/* The driver landed in the scheduling DAG with 94b69ad24
+		 * and now goes through sched_groups_dispatch as a regular
+		 * SCHED_DEADLINE task; emit it alongside the followers so
+		 * the snapshot reflects every node the kernel actually
+		 * holds a reservation for. The driver-aware lookup below
+		 * resolves both follower and driver struct nodes; the
+		 * sched_dag_follower_in_set predicate already requires the
+		 * dynamic-loop + published-TID pair the driver carries when
+		 * context.dynamic-data-loops is on, so the driver is
+		 * naturally gated by the same condition followers are. */
 		if (!sched_dag_follower_in_set(n_iter))
 			continue;
 
-		struct node *mn = find_node_by_id(impl, n_iter->info.id);
+		struct node *mn = find_node_any_by_id(impl, n_iter->info.id);
 		struct rt_diag_param_node pn = { 0 };
 		pn.id = n_iter->info.id;
 		pn.tid = pw_properties_get_int32(n_iter->properties,
