@@ -734,7 +734,10 @@ PWTEST(diag_json_full_golden)
 		"\"last_budget_ns\":0,"
 		"\"last_invalidation_reason\":\"none\"},"
 		"\"budget_clipped\":false,"
-		"\"risk_objective_value\":0.000000}]},"
+		"\"risk_objective_value\":0.000000,"
+		"\"predicted_runtime_ns\":92000,"
+		"\"scheduled_runtime_ns\":85494,"
+		"\"budget_used_bootstrap\":true}]},"
 		"\"peer_dispatch\":{\"inline_armed\":5,\"eventfd_path\":2}}\n";
 
 	rt_diag_raw_snapshot_init(&raw);
@@ -777,6 +780,14 @@ PWTEST(diag_json_full_golden)
 	pn.cumulative_deadline_ns = 21333333; pn.period_ns = 21333333;
 	pn.cpu = 4; pn.applied = true;
 	pn.budget_kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
+	/* Predicted-vs-scheduled split + bootstrap flag exercise the
+	 * tail of the per-node JSON object: a recalc estimated 92us of
+	 * runtime, soft-fallback clipped the kernel reservation to
+	 * 85.494us, and the published budget was satisfied via the
+	 * LITTLE->BIG bootstrap fallback. */
+	pn.predicted_runtime_ns = 92000;
+	pn.scheduled_runtime_ns = 85494;
+	pn.budget_used_bootstrap = true;
 	pwtest_int_eq(rt_diag_params_snapshot_add_node(&params, &pn), 0);
 
 	c.driver_id = 63;

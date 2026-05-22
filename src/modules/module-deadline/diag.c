@@ -871,6 +871,27 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 					n->conformal_last_invalidation_reason),
 				n->budget_clipped ? "true" : "false");
 			diag_fprintf_double(out, 6, n->risk_objective_value);
+			/*
+			 * Predicted vs scheduled runtime split (commit
+			 * ce117a0d2 added the struct fields; this is the
+			 * JSON surface a dashboard consumes). Both report
+			 * zero on driver sentinels and on followers that
+			 * have not yet completed a recalc pass, which is
+			 * the documented "not yet populated" state.
+			 *
+			 * `budget_used_bootstrap` lifts the per-follower
+			 * LITTLE->BIG bootstrap flag (same condition that
+			 * drives HDL-W011 in the daemon log) so dashboards
+			 * can colour-code bootstrap-affected nodes without
+			 * scraping log output.
+			 */
+			fprintf(out,
+				",\"predicted_runtime_ns\":%llu,"
+				"\"scheduled_runtime_ns\":%llu,"
+				"\"budget_used_bootstrap\":%s",
+				(unsigned long long)n->predicted_runtime_ns,
+				(unsigned long long)n->scheduled_runtime_ns,
+				n->budget_used_bootstrap ? "true" : "false");
 			fputc('}', out);
 		}
 	}
