@@ -136,6 +136,24 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 		double recalc_threshold,
 		bool persistent);
 
+/* Configure the bounded iterative recalc bound. After
+ * reconcile_init, an additional knob controls whether the
+ * dispatcher takes the single-shot recalc path or the iterative
+ * heterogeneous-host path, and how many rounds the latter is
+ * allowed to run before forcing convergence.
+ *
+ * `max_iterations` must be in [1, 8]; out-of-range values are
+ * clamped to 1 (single-shot equivalent) with a warning. A value of
+ * 1 -- and the absence of this call entirely -- both keep the
+ * dispatcher on the legacy dag_recalculate path.
+ *
+ * Safe to call after reconcile_init and before the first
+ * reconcile_apply; also safe to call later to retune at runtime
+ * (the next reconcile_apply picks up the new bound). The function
+ * is a no-op on a NULL state. */
+void reconcile_state_set_heterogeneous_iterations(
+		reconcile_state_t *state, uint32_t max_iterations);
+
 /* Has the state carried over a persistent DAG since the last
  * reconcile_apply? Used by tests / instrumentation to distinguish
  * the persistent path from the legacy rebuild path. Always false

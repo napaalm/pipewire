@@ -70,6 +70,15 @@ struct reconcile_state {
 	uint32_t *clipped_followers;
 	uint32_t  n_clipped_followers;
 	uint32_t  cap_clipped_followers;
+
+	/* Iterative-recalc bound. 0 or 1 means "use the legacy single-
+	 * shot dag_recalculate path"; >= 2 means "use
+	 * dag_recalculate_heterogeneous with this round cap". The cap
+	 * is clamped to [1, 8] at set time. Defaults to 0 (legacy)
+	 * after reconcile_init so existing callers see no behaviour
+	 * change until they opt in via
+	 * reconcile_state_set_heterogeneous_iterations. */
+	uint32_t  heterogeneous_iterations;
 };
 
 #define RECONCILE_FAILURE_BACKOFF 16u
@@ -243,6 +252,21 @@ void reconcile_drop(reconcile_state_t *state)
 	}
 	state->dag_period = 0;
 	state->topo_gen_applied = 0;
+}
+
+void reconcile_state_set_heterogeneous_iterations(reconcile_state_t *state,
+		uint32_t max_iterations)
+{
+	if (state == NULL)
+		return;
+	if (max_iterations == 0 || max_iterations > 8) {
+		pw_log_warn("reconcile: heterogeneous_iterations %u out of "
+				"range [1, 8]; clamping to single-shot",
+				max_iterations);
+		state->heterogeneous_iterations = 0;
+		return;
+	}
+	state->heterogeneous_iterations = max_iterations;
 }
 
 void reconcile_fini(reconcile_state_t *state)
@@ -808,7 +832,20 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		return -1;
 	}
 
-	if (dag_recalculate(macro_dag) < 0) {
+	/* Pick the recalc entry point: when the operator has opted into
+	 * the bounded iterative path via deadline.heterogeneous /
+	 * deadline.iterations, use it; otherwise stay on the single-shot
+	 * dag_recalculate. The iterative entry already short-circuits to
+	 * single-shot on a homogeneous capacity vector, so opting in on
+	 * a uniform host costs nothing in steady state. */
+	int recalc_ret;
+	if (state->heterogeneous_iterations >= 2) {
+		recalc_ret = dag_recalculate_heterogeneous(macro_dag,
+				state->heterogeneous_iterations);
+	} else {
+		recalc_ret = dag_recalculate(macro_dag);
+	}
+	if (recalc_ret < 0) {
 		int e = errno;
 		/* The macro-dag analysis rejected the schedule -- the
 		 * most common cause is the worst-fit placer failing

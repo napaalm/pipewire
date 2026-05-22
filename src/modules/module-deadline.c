@@ -102,12 +102,12 @@
  *                       for diagnostic comparisons.
  * - `cpus.dvfs-policy`: Which cpufreq frequency to use when computing
  *                       per-CPU capacity. `conservative` (the default)
- *                       uses `cpuinfo_min_freq`: any budget that fits
+ *                       uses `scaling_min_freq`: any budget that fits
  *                       at analysis time is guaranteed to fit at
  *                       runtime regardless of governor behaviour, since
  *                       real throughput exceeds the min-freq assumption
  *                       whenever the governor parks the CPU higher.
- *                       `assume-max` uses `cpuinfo_max_freq`; admission
+ *                       `assume-max` uses `scaling_max_freq`; admission
  *                       is tighter but a governor that parks below
  *                       max_freq can cause deadline overruns.
  * - `cpus.topology-override`: Hidden test affordance. JSON string
@@ -628,6 +628,46 @@ struct impl {
 	 * dag_set_node_wcet (and therefore a recalc). Default 0.01;
 	 * 0.0 = always recalc. Must stay strictly below 1.0. */
 	double                wcet_recalc_threshold;
+
+	/* Heterogeneous-host iterative recalc.
+	 *
+	 * `heterogeneous` is the master gate: when false (the default),
+	 * the reconcile layer calls dag_recalculate exactly once per
+	 * dispatch and the system behaves bit-for-bit as before.
+	 *
+	 * When true, the reconcile layer calls dag_recalculate_heterogeneous
+	 * with `heterogeneous_iterations` as the upper bound on rounds.
+	 * The iteration short-circuits to the single-shot pass on a
+	 * single-CPU host or when relative_capacity is uniform, so even
+	 * a heterogeneous=true config on a uniform host pays no extra
+	 * cost in steady state.
+	 *
+	 * `heterogeneous_iterations` must be in the closed range
+	 * [1, DAG_HETEROGENEOUS_MAX_ITERATIONS]; out-of-range values
+	 * are clamped at parse time with a log warning. The default
+	 * of 2 is the smallest bound that lets a placement-stretched
+	 * split actually take effect (round 0 produces the seed,
+	 * round 1 refines it), and in practice converges on every
+	 * heterogeneous topology we have measured. */
+	bool                  heterogeneous;
+	uint32_t              heterogeneous_iterations;
+
+	/* Operator policy when the recalc reports a workload that
+	 * cannot be admitted under the strict feasibility gate. The
+	 * default ("keep-previous") leaves the last successfully
+	 * applied schedule in place and emits HDL-W030; "rt-fallback"
+	 * drops every node back to module-rt; "apply-degraded" applies
+	 * the soft fallback's clipped/rescaled schedule; "reject-new-graph"
+	 * refuses to admit the new follower set without affecting
+	 * already-admitted ones. The default is what the reconcile
+	 * layer's soft fallback already does; the other values are
+	 * placeholders for callers that want a stricter contract. */
+	enum {
+		DEADLINE_ON_INFEASIBLE_KEEP_PREVIOUS = 0,
+		DEADLINE_ON_INFEASIBLE_RT_FALLBACK,
+		DEADLINE_ON_INFEASIBLE_APPLY_DEGRADED,
+		DEADLINE_ON_INFEASIBLE_REJECT_NEW_GRAPH,
+	}                     on_infeasible;
 
 	/* Async worker. Created at init when deadline policy is available;
 	 * NULL when sync_mode is true. */
@@ -1546,7 +1586,7 @@ static inline double wcet_cycles_to_reference_ns(struct impl *impl,
  *
  * Identity (no scaling) on homogeneous hardware *only* when
  * max_freq == freq_for_policy, e.g. under cpus.dvfs-policy =
- * assume-max or on a host where cpuinfo_max_freq == cpuinfo_min_freq.
+ * assume-max or on a host where scaling_max_freq == scaling_min_freq.
  *
  * Falls back to the raw runtime when relative_capacity_nominal is
  * absent or sample_cpu is out of range / not yet known. */
@@ -1881,6 +1921,11 @@ static void recalc_params_sync(struct node *drv)
 		if (drv->reconcile == NULL) {
 			pw_log_warn("reconcile_init failed: %m");
 			return;
+		}
+		if (impl->heterogeneous) {
+			reconcile_state_set_heterogeneous_iterations(
+					drv->reconcile,
+					impl->heterogeneous_iterations);
 		}
 	}
 
@@ -3293,6 +3338,11 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 			pw_log_warn("reconcile_init failed: %m");
 			return;
 		}
+		if (impl->heterogeneous) {
+			reconcile_state_set_heterogeneous_iterations(
+					drv->reconcile,
+					impl->heterogeneous_iterations);
+		}
 	}
 
 	followers = calloc(t->n_nodes, sizeof(*followers));
@@ -4197,6 +4247,41 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->wcet_recalc_threshold = v;
 		else
 			pw_log_warn("wcet.recalc-threshold %s ignored", s);
+	}
+
+	impl->heterogeneous = pw_properties_get_bool(props,
+			"deadline.heterogeneous", false);
+	impl->heterogeneous_iterations = 2;
+	if ((s = pw_properties_get(props, "deadline.iterations")) != NULL) {
+		char *end;
+		unsigned long v = strtoul(s, &end, 10);
+		if (end != s && v >= 1 && v <= 8) {
+			impl->heterogeneous_iterations = (uint32_t)v;
+		} else {
+			pw_log_warn("deadline.iterations %s ignored "
+					"(must be in [1, 8])", s);
+		}
+	}
+	pw_log_info("deadline.heterogeneous = %s, iterations = %u",
+			impl->heterogeneous ? "true" : "false",
+			impl->heterogeneous_iterations);
+
+	impl->on_infeasible = DEADLINE_ON_INFEASIBLE_KEEP_PREVIOUS;
+	if ((s = pw_properties_get(props, "deadline.on-infeasible")) != NULL) {
+		if (spa_streq(s, "keep-previous")) {
+			impl->on_infeasible = DEADLINE_ON_INFEASIBLE_KEEP_PREVIOUS;
+		} else if (spa_streq(s, "rt-fallback")) {
+			impl->on_infeasible = DEADLINE_ON_INFEASIBLE_RT_FALLBACK;
+		} else if (spa_streq(s, "apply-degraded")) {
+			impl->on_infeasible = DEADLINE_ON_INFEASIBLE_APPLY_DEGRADED;
+		} else if (spa_streq(s, "reject-new-graph")) {
+			impl->on_infeasible = DEADLINE_ON_INFEASIBLE_REJECT_NEW_GRAPH;
+		} else {
+			pw_log_warn("deadline.on-infeasible %s ignored "
+					"(must be one of keep-previous, "
+					"rt-fallback, apply-degraded, "
+					"reject-new-graph)", s);
+		}
 	}
 
 	impl->driver_schedule = pw_properties_get_bool(props,
