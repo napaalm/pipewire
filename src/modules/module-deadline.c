@@ -3095,7 +3095,18 @@ static int populate_params_snapshot(struct impl *impl,
 				!= 0 ? mn->last_cumulative_deadline
 				     : mn->last_deadline;
 			pn.period_ns = mn->last_period;
-			pn.cpu = mn->last_cpu;
+			/* Translate the internal CPU index (the offset
+			 * into impl->cpus[]) to the physical CPU number
+			 * the kernel actually sees -- the same value
+			 * sched_groups dispatch hands to sched_setaffinity
+			 * at line ~1310. Storing the index in last_cpu is
+			 * intentional (the LITTLE/BIG mode-class lookup at
+			 * sample_cpu_to_mode_class indexes impl->topology
+			 * with the same offset), but a dashboard reader
+			 * expects the value to match `taskset -pc`. */
+			pn.cpu = (mn->last_cpu < (uint32_t)impl->n_cpus)
+				? (uint32_t)impl->cpus[mn->last_cpu]
+				: mn->last_cpu;
 			pn.applied = true;
 		} else {
 			pn.applied = false;
