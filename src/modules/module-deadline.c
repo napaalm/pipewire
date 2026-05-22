@@ -2031,11 +2031,14 @@ static void apply_sample(struct impl *impl, struct node *n,
 			n->warned_no_class_stats = false;
 		}
 
-		/* HDL-W020 edge-triggered: published budget below the
-		 * last measured CPU-time runtime. Indicates the
-		 * estimator's score-ring has not yet caught up with a
-		 * recent jump in the workload's cost; the reservation
-		 * is at risk of an overrun. */
+		/* HDL-W020 one-shot per node: published budget below the
+		 * last measured CPU-time runtime. The condition is
+		 * sample-volatile (a single noisy cycle can flap it on
+		 * and off), so the flag is set on the first occurrence
+		 * and never cleared for the lifetime of the follower
+		 * struct; a single line per follower is enough to
+		 * surface the under-estimation pattern without flooding
+		 * the log. */
 		bool predicted_below_cputime = runtime > 0 &&
 				sel.value_ns > 0 &&
 				sel.value_ns < runtime;
@@ -2043,14 +2046,14 @@ static void apply_sample(struct impl *impl, struct node *n,
 				!n->warned_predicted_below_cputime) {
 			pw_log_warn("HDL-W020-PREDICTED-BELOW-LAST-CPUTIME: "
 					"node %u: predicted budget %lu ns is "
-					"below last measured runtime %lu ns. "
-					"Workload may have spiked; estimator "
-					"will catch up over the next samples.",
+					"below measured runtime %lu ns on at "
+					"least one sample. The estimator's "
+					"score ring publishes a one-sided "
+					"upper bound; a sample above the bound "
+					"can occur transiently while the ring "
+					"catches up.",
 					fid, sel.value_ns, runtime);
 			n->warned_predicted_below_cputime = true;
-		} else if (!predicted_below_cputime &&
-				n->warned_predicted_below_cputime) {
-			n->warned_predicted_below_cputime = false;
 		}
 	}
 
