@@ -3084,8 +3084,50 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 			continue;
 		pid_t tid = pw_properties_get_int32(follower->properties,
 						    PW_KEY_NODE_LOOP_TID, -1);
-		if (tid == -1)
+		if (tid == -1) {
+			/* The follower opted into a dynamic data loop but
+			 * its PW_KEY_NODE_LOOP_TID property is absent.  On
+			 * a locally-owned node this means the do_gettid
+			 * invoke at pw_impl_node_new has not yet returned,
+			 * which is a momentary startup race; on a remote
+			 * proxy (audio-dsp-filter, pw-jack clients) it
+			 * means the client has not yet emitted the info
+			 * update that publishes its data-loop TID back to
+			 * the server -- typically after a set_loop_group
+			 * relocation.
+			 *
+			 * Either way the follower is silently excluded from
+			 * the scheduling DAG and cannot receive a
+			 * SCHED_DEADLINE tuple, even though every other
+			 * eligibility check passed. If the missing-TID
+			 * window persists across multiple topology
+			 * generations the node ends up running at whatever
+			 * default policy its loop was created with (the
+			 * libpipewire default is SCHED_FIFO) and never
+			 * recovers, because module-deadline only applies
+			 * SCHED_DEADLINE -- it never lowers a thread back
+			 * to a different policy that would be visible to
+			 * the scheduler-state classifier.
+			 *
+			 * Surface the eligibility gap so the operator can
+			 * correlate a stuck SCHED_FIFO follower with the
+			 * missing TID. The warning is bounded by the
+			 * topology generation: it fires only when the
+			 * follower list is walked, which happens on
+			 * topo.generation changes. */
+			pw_log_warn("HDL-W080-FOLLOWER-TID-MISSING: "
+					"follower id=%u name=\"%s\" remote=%d "
+					"exported=%d has node.loop.dynamic=true "
+					"but node.loop.tid is unpublished; "
+					"excluded from scheduling DAG (will run "
+					"at its loop's default policy until the "
+					"client/proxy publishes its TID)",
+					follower->info.id,
+					follower->name ? follower->name : "",
+					follower->remote ? 1 : 0,
+					follower->exported ? 1 : 0);
 			continue;
+		}
 
 		if (t->n_nodes >= t->nodes_cap) {
 			uint32_t newcap = t->nodes_cap ? t->nodes_cap * 2 : TOPO_INITIAL_NODES;
