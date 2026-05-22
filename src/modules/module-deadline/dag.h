@@ -220,6 +220,28 @@ struct dag {
 	dag_node_t **ws_path;       /* path buffer, length <= indexed_count */
 	bool        *ws_excluded;   /* excluded-from-discount flags */
 	uint32_t     ws_capacity;   /* allocated length of both above */
+
+	/* Optional per-node runtime overlay used by the path-analysis
+	 * pass (longest paths, critical-path WCET, proportional
+	 * deadline split). When non-NULL, every wcet read in those
+	 * functions is replaced by `runtime_overlay[node->index]` for
+	 * real (non-fictitious) nodes; fictitious nodes always retain
+	 * a zero runtime. NULL is the legacy path: reads of
+	 * `node->wcet` proceed unchanged, preserving the homogeneous
+	 * single-pass behaviour.
+	 *
+	 * The worst-fit placer does NOT honour the overlay: its
+	 * utilisation arithmetic must operate on the reference-CPU
+	 * WCET so the per-candidate `u / relative_capacity[c]`
+	 * adjustment evaluates the candidate-CPU runtime exactly
+	 * once. Applying the overlay there would double-scale by
+	 * the previous mapping's capacity.
+	 *
+	 * Owned by the caller of dag_recalculate_heterogeneous(); the
+	 * dag never frees or copies the array. Must point to at least
+	 * `indexed_count` entries when non-NULL. Cleared back to NULL
+	 * before dag_recalculate_heterogeneous() returns. */
+	const uint64_t *runtime_overlay;
 };
 
 /* Create and destroy a DAG.
@@ -285,6 +307,86 @@ int dag_recalculate(dag_t *g);
  * markers on nodes whose wcet exceeds their redistributed slice), at
  * the cost of dropping the hard-real-time guarantee. */
 int dag_recalculate_soft(dag_t *g);
+
+/*
+ * Bounded iterative recalculate for non-uniform per-CPU capacities.
+ *
+ * On a graph whose `relative_capacity` vector is not uniform, the
+ * runtime each follower observes depends on which CPU it lands on:
+ * the same node, placed on a slower CPU, stretches to
+ * `wcet / relative_capacity[cpu]`. A single split + worst-fit pass
+ * uses the reference-CPU runtime in the split step and discovers the
+ * placement-stretched value only after worst-fit commits -- the
+ * deadline distribution may then be a poor match for the picked
+ * partition. Iterating split + worst-fit feeds the previous round's
+ * mapping back into the split step as a per-node runtime overlay
+ * (`wcet / relative_capacity[prev_cpu]`), so the second round splits
+ * the deadline against the realistic per-CPU runtimes the previous
+ * placement implied.
+ *
+ * Behaviour:
+ *
+ *   - `max_iterations` is the hard upper bound on rounds; legal
+ *     range is 1..8. A value of 1 (or any value on a uniform
+ *     `relative_capacity` vector, or on a single-CPU dag) collapses
+ *     to a single dag_recalculate() call -- no overlay, no loop.
+ *   - On a heterogeneous vector with `max_iterations >= 2`, the
+ *     function runs at most `max_iterations` rounds and breaks
+ *     early as soon as the per-node CPU assignment matches the
+ *     previous round's mapping (the fixed-point criterion for
+ *     the iterative refinement to terminate).
+ *   - Round 0 runs with no overlay so the very first split sees
+ *     the reference-CPU runtime, exactly like dag_recalculate(). All
+ *     subsequent rounds overlay the previous mapping.
+ *   - The final round always restores `node->wcet` to its caller-
+ *     supplied value before returning, regardless of success or
+ *     failure: callers can rely on the invariant that the field is
+ *     never mutated across this entry point.
+ *
+ * Returns 0 on success with `g` clean; -1 on any failure that
+ * dag_recalculate() itself would have produced (errno preserved). A
+ * caller that gets -1 here will see the dag dirty and is free to
+ * fall back to dag_recalculate_soft() exactly as on a hard
+ * dag_recalculate failure.
+ */
+int dag_recalculate_heterogeneous(dag_t *g, uint32_t max_iterations);
+
+/* Drop-in variants of dag_compute_local_deadlines /
+ * dag_per_cpu_density / dag_density_feasible that accept an explicit
+ * per-node runtime vector. They forward to the legacy entry points
+ * when `runtime_by_node_index` is NULL (homogeneous path), and use
+ * the override otherwise. The override vector is indexed by
+ * `dag_node::index` (the dense topological index populated by
+ * dag_recalculate); the caller is responsible for sizing it to at
+ * least `g->indexed_count`. */
+bool dag_compute_local_deadlines_with_runtimes(dag_t *g,
+		const uint64_t *runtime_by_node_index);
+
+/* Compute the maximum end-to-end runtime of any source -> sink path
+ * using a caller-supplied per-node runtime vector. A thin wrapper
+ * over the existing longest-path machinery that lets the
+ * heterogeneous recalculation re-evaluate critical-path feasibility
+ * against a placement-stretched runtime vector without mutating
+ * `node->wcet`.
+ *
+ * `runtime_by_node_index` must be length >= `g->indexed_count` and
+ * is interpreted under the same indexing as `dag_node::index`. A
+ * NULL pointer is shorthand for "use node->wcet" (the reference-CPU
+ * runtime). `out_runtime_ns` receives the sum of runtimes along the
+ * weighted longest path; `out_node_ids` (optional) is filled with up
+ * to `out_node_ids_cap` ids in topological order along the path and
+ * `out_node_count` records how many were written.
+ *
+ * Returns 0 on success; -1 with errno set on EINVAL (null args /
+ * empty dag / unbuilt analysis cache). Does not modify the dirty
+ * flag and is safe to call after either dag_recalculate or
+ * dag_recalculate_heterogeneous has populated the analysis cache. */
+int dag_compute_critical_path_runtime(dag_t *g,
+		const uint64_t *runtime_by_node_index,
+		uint64_t *out_runtime_ns,
+		uint32_t *out_node_ids,
+		size_t out_node_ids_cap,
+		size_t *out_node_count);
 
 /*
  * Per-CPU EDF density. For every real node assigned to `cpu`, sum

@@ -983,6 +983,26 @@ static int dag_add_fictitious_endpoints(dag_t *g, dag_node_t **sources, uint32_t
 	return 0;
 }
 
+/* Runtime value the path-analysis pass should attribute to `n`.
+ * Returns the dag's runtime overlay entry (indexed by node->index)
+ * when it is set and applicable; otherwise the legacy `n->wcet`. A
+ * fictitious node never contributes runtime to any path, so it
+ * short-circuits to zero regardless of overlay. The overlay is
+ * always non-NULL only between dag_recalculate_heterogeneous's
+ * iterations -- every other entry into the analysis pipeline sees
+ * runtime_overlay == NULL and the homogeneous behaviour is
+ * preserved bit-for-bit. */
+static inline uint64_t node_runtime_value(const dag_t *g, const dag_node_t *n)
+{
+	if (!n)
+		return 0;
+	if (n->fictitious)
+		return 0;
+	if (g != NULL && g->runtime_overlay != NULL && n->index < g->indexed_count)
+		return g->runtime_overlay[n->index];
+	return n->wcet;
+}
+
 static void dag_populate_longest_paths(dag_t *g)
 {
 	for (uint32_t i = g->indexed_count; i > 0; i--) {
@@ -990,8 +1010,9 @@ static void dag_populate_longest_paths(dag_t *g)
 		dag_edge_t *e;
 		uint64_t best_len = 0;
 		int best_next = -1;
+		uint64_t self = node_runtime_value(g, node);
 
-		node->longest_len = node->wcet;
+		node->longest_len = self;
 		node->longest_next = -1;
 
 		spa_list_for_each(e, &node->outgoing, src_link) {
@@ -1003,7 +1024,7 @@ static void dag_populate_longest_paths(dag_t *g)
 		}
 
 		if (best_next >= 0) {
-			node->longest_len = node->wcet + best_len;
+			node->longest_len = self + best_len;
 			node->longest_next = best_next;
 		}
 	}
@@ -1034,7 +1055,7 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	if (src == dst) {
 		path_out[0] = src;
 		*path_len_out = 1;
-		return src->wcet;
+		return node_runtime_value(g, src);
 	}
 
 	node = src;
@@ -1055,7 +1076,7 @@ static uint64_t compute_longest_path(dag_t *g, dag_node_t *src, dag_node_t *dst,
 	node = src;
 	for (uint32_t i = 0; i < count; i++) {
 		path_out[i] = node;
-		total += node->wcet;
+		total += node_runtime_value(g, node);
 		if (node == dst)
 			break;
 		node = g->indexed_nodes[node->longest_next];
@@ -1737,7 +1758,7 @@ static inline void assign_or_tighten_deadline(dag_node_t *node, uint64_t deadlin
  * needs (path_len entries) at entry. The caller does not free it;
  * the workspace owns the buffer.
  */
-static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D, uint64_t L,
+static int assign_path_head_deadline(dag_t *g, dag_node_t **path, int path_len, uint64_t D, uint64_t L,
 		bool *excluded_buf, uint64_t *assigned_head)
 {
 	dag_node_t *n_src;
@@ -1775,19 +1796,21 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 		for (int i = 0; i < path_len; i++) {
 			dag_node_t *ni;
 			uint64_t d_prime;
+			uint64_t ni_runtime;
 
 			if (excluded_buf[i])
 				continue;
 
 			ni = path[i];
+			ni_runtime = node_runtime_value(g, ni);
 			d_prime = proportional_deadline(residual_deadline,
-					ni->wcet, residual_wcet);
+					ni_runtime, residual_wcet);
 
 			if (ni->deadline_assigned && ni->deadline < d_prime) {
 				residual_deadline = saturating_sub_u64(
 						residual_deadline, ni->deadline);
 				residual_wcet = saturating_sub_u64(
-						residual_wcet, ni->wcet);
+						residual_wcet, ni_runtime);
 				excluded_buf[i] = true;
 				changed = true;
 				break;
@@ -1805,7 +1828,7 @@ static int assign_path_head_deadline(dag_node_t **path, int path_len, uint64_t D
 	/* Phase C: assign/tighten the path head. */
 	assign_or_tighten_deadline(n_src,
 			proportional_deadline(residual_deadline,
-				n_src->wcet, residual_wcet));
+				node_runtime_value(g, n_src), residual_wcet));
 
 	if (assigned_head)
 		*assigned_head = n_src->deadline;
@@ -2011,7 +2034,7 @@ static int assign_deadlines_iterative(dag_t *g)
 			return -1;
 		}
 
-		if (assign_path_head_deadline(g->ws_path, path_nodes,
+		if (assign_path_head_deadline(g, g->ws_path, path_nodes,
 					available_deadline, path_len,
 					g->ws_excluded, &assigned_deadline) < 0) {
 			return -1;
@@ -3262,6 +3285,325 @@ int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 	}
 
 	return 0;
+}
+
+/* Maximum permitted value of `max_iterations` for the heterogeneous
+ * recalc entry point. The path-analysis pass is O(V + E) and the
+ * placer is O(V * (V + |CPU|)); the upper bound is a defensive cap
+ * against an operator setting `deadline.iterations` to a wildly
+ * large number and pinning the worker thread on a long-running
+ * fixed-point search that, in practice, would converge in two or
+ * three rounds even on heavily heterogeneous topologies. */
+#define DAG_HETEROGENEOUS_MAX_ITERATIONS 8u
+
+/* True iff every entry of `g->relative_capacity` equals every
+ * other entry. On a uniform vector the runtime overlay collapses to
+ * a no-op (the per-CPU divisor is constant), so the iterative
+ * recalc cannot diverge from the single-shot path: the function
+ * short-circuits straight to dag_recalculate() in that case. */
+static bool dag_relative_capacity_is_uniform(const dag_t *g)
+{
+	if (g == NULL || g->relative_capacity == NULL || g->num_cpus == 0)
+		return true;
+	double first = g->relative_capacity[0];
+	for (uint32_t i = 1; i < g->num_cpus; i++) {
+		if (g->relative_capacity[i] != first)
+			return false;
+	}
+	return true;
+}
+
+/* Build a per-node runtime overlay vector indexed by node->index.
+ * For every real (non-fictitious) indexed node, emit
+ *
+ *     ceil(node->wcet / relative_capacity[node->cpu])
+ *
+ * which is the placement-stretched runtime the node would observe
+ * on its currently-assigned CPU. A node whose previous round did not
+ * assign a valid CPU (DAG_CPU_INVALID or out of range) is taken to
+ * sit on the fastest CPU (relative_capacity 1.0), matching the
+ * single-shot path's behaviour. Fictitious nodes contribute 0 -- the
+ * accessor short-circuits them anyway.
+ *
+ * Returns NULL on allocation failure with errno=ENOMEM. Caller owns
+ * the buffer and must free() it. */
+static uint64_t *dag_build_runtime_overlay(const dag_t *g)
+{
+	if (g == NULL || g->indexed_count == 0 || g->indexed_nodes == NULL) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	uint64_t *out = calloc(g->indexed_count, sizeof(*out));
+	if (out == NULL) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		if (n == NULL || n->fictitious) {
+			out[i] = 0;
+			continue;
+		}
+
+		double rc = 1.0;
+		if (n->cpu < g->num_cpus && g->relative_capacity != NULL) {
+			double v = g->relative_capacity[n->cpu];
+			if (v > 0.0 && v <= 1.0)
+				rc = v;
+		}
+
+		if (rc >= 1.0) {
+			out[i] = n->wcet;
+			continue;
+		}
+
+		/* Stretched runtime ceil(wcet / rc). Round up so the
+		 * derived deadline split does not under-budget the
+		 * placement-stretched workload. Guard against the
+		 * pathological wcet == UINT64_MAX, but in practice the
+		 * conformal estimator caps below the period. */
+		double stretched = ceil((double)n->wcet / rc);
+		if (stretched <= 0.0) {
+			out[i] = n->wcet;
+		} else if (stretched >= (double)UINT64_MAX) {
+			out[i] = UINT64_MAX;
+		} else {
+			out[i] = (uint64_t)stretched;
+		}
+	}
+
+	return out;
+}
+
+/* Capture the current per-real-node CPU assignment into a freshly
+ * allocated array indexed by node->index. Fictitious nodes are
+ * recorded as DAG_CPU_INVALID so the comparison helper does not
+ * accidentally treat two undefined slots as equal. Caller frees. */
+static uint32_t *dag_snapshot_cpu_mapping(const dag_t *g)
+{
+	if (g == NULL || g->indexed_count == 0 || g->indexed_nodes == NULL)
+		return NULL;
+
+	uint32_t *out = calloc(g->indexed_count, sizeof(*out));
+	if (out == NULL)
+		return NULL;
+
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		out[i] = (n == NULL || n->fictitious) ? DAG_CPU_INVALID : n->cpu;
+	}
+	return out;
+}
+
+/* Element-wise equality test, treating DAG_CPU_INVALID entries
+ * (fictitious nodes) as matching only if both sides are
+ * DAG_CPU_INVALID. */
+static bool dag_cpu_mapping_equal(const uint32_t *a, const uint32_t *b, uint32_t n)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	for (uint32_t i = 0; i < n; i++) {
+		if (a[i] != b[i])
+			return false;
+	}
+	return true;
+}
+
+int dag_recalculate_heterogeneous(dag_t *g, uint32_t max_iterations)
+{
+	if (g == NULL || max_iterations == 0 ||
+			max_iterations > DAG_HETEROGENEOUS_MAX_ITERATIONS) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* Short-circuit: a single iteration, a single-CPU dag, or a
+	 * uniform relative_capacity vector all collapse to the
+	 * homogeneous single-shot path. Reusing dag_recalculate is
+	 * not just an optimisation: it preserves the exact byte-for-
+	 * byte semantics callers already test against and means
+	 * `deadline.heterogeneous = true` on a uniform host is a
+	 * no-op. */
+	if (max_iterations == 1 || g->num_cpus <= 1 ||
+			dag_relative_capacity_is_uniform(g)) {
+		return dag_recalculate(g);
+	}
+
+	/* Round 0 is the reference-CPU single-shot pass: no overlay.
+	 * It establishes the seed mapping the subsequent rounds will
+	 * refine. On failure fall straight through; dag_recalculate
+	 * has already cleared the cached schedule and marked the dag
+	 * dirty. */
+	g->runtime_overlay = NULL;
+	int ret = dag_recalculate(g);
+	if (ret < 0)
+		return -1;
+
+	uint32_t *prev_mapping = dag_snapshot_cpu_mapping(g);
+	if (prev_mapping == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	/* Iterate from round 1: each round builds the overlay from
+	 * the previous mapping, reruns the analysis pipeline with the
+	 * overlay set on the dag, then checks whether the mapping
+	 * settled. The legacy `dag_recalculate` reads the overlay
+	 * field through node_runtime_value(); no separate entry point
+	 * is needed. */
+	for (uint32_t r = 1; r < max_iterations; r++) {
+		uint64_t *overlay = dag_build_runtime_overlay(g);
+		if (overlay == NULL) {
+			free(prev_mapping);
+			return -1;
+		}
+
+		dag_mark_dirty(g);
+		g->runtime_overlay = overlay;
+		ret = dag_recalculate(g);
+		g->runtime_overlay = NULL;
+		free(overlay);
+
+		if (ret < 0) {
+			free(prev_mapping);
+			return -1;
+		}
+
+		uint32_t *new_mapping = dag_snapshot_cpu_mapping(g);
+		if (new_mapping == NULL) {
+			free(prev_mapping);
+			errno = ENOMEM;
+			return -1;
+		}
+
+		if (dag_cpu_mapping_equal(prev_mapping, new_mapping,
+				g->indexed_count)) {
+			free(new_mapping);
+			free(prev_mapping);
+			pw_log_debug("dag_recalculate_heterogeneous converged at iteration %u", r);
+			return 0;
+		}
+
+		free(prev_mapping);
+		prev_mapping = new_mapping;
+	}
+
+	free(prev_mapping);
+	pw_log_debug("dag_recalculate_heterogeneous reached iteration cap %u",
+			max_iterations);
+	return 0;
+}
+
+int dag_compute_critical_path_runtime(dag_t *g,
+		const uint64_t *runtime_by_node_index,
+		uint64_t *out_runtime_ns,
+		uint32_t *out_node_ids,
+		size_t out_node_ids_cap,
+		size_t *out_node_count)
+{
+	if (g == NULL || out_runtime_ns == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (g->indexed_nodes == NULL || g->indexed_count == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/* Locate the fictitious source: the longest path from there
+	 * to the fictitious sink is the DAG's critical-path runtime.
+	 * dag_find_fictitious_source already exists and walks the id
+	 * index; the call here is read-only. */
+	dag_node_t *src = dag_find_node(g, DAG_FICTITIOUS_SOURCE_ID);
+	dag_node_t *dst = dag_find_node(g, DAG_FICTITIOUS_SINK_ID);
+	if (src == NULL || dst == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	dag_node_t **path = calloc(g->indexed_count, sizeof(*path));
+	if (path == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	/* Temporarily install the caller's overlay so the existing
+	 * longest-path machinery picks it up. We snapshot/restore the
+	 * previous value to compose cleanly with the iterative entry
+	 * point in case a future caller invokes this from inside
+	 * dag_recalculate_heterogeneous. */
+	const uint64_t *prev_overlay = g->runtime_overlay;
+	bool need_repopulate = (runtime_by_node_index != prev_overlay);
+	if (need_repopulate) {
+		g->runtime_overlay = runtime_by_node_index;
+		dag_populate_longest_paths(g);
+	}
+
+	int path_len = 0;
+	uint64_t total = compute_longest_path(g, src, dst, path, &path_len);
+
+	/* Strip the fictitious endpoints from the path the caller sees;
+	 * they exist for analysis but downstream diagnostics expect
+	 * real nodes only. The fictitious source and sink each
+	 * contribute zero runtime so removing them does not change the
+	 * reported total. */
+	size_t written = 0;
+	if (out_node_ids != NULL && out_node_ids_cap > 0) {
+		for (int i = 0; i < path_len && written < out_node_ids_cap; i++) {
+			dag_node_t *n = path[i];
+			if (n == NULL || n->fictitious)
+				continue;
+			out_node_ids[written++] = n->id;
+		}
+	}
+	if (out_node_count != NULL)
+		*out_node_count = written;
+
+	/* Restore the prior overlay state. If we did not need to
+	 * repopulate, longest_len is already coherent with the caller's
+	 * dag and the field never changed; nothing to undo. Otherwise
+	 * the populate above used `runtime_by_node_index`, so the
+	 * cached longest_len now reflects that overlay -- restoring
+	 * `prev_overlay` and re-populating returns the cache to the
+	 * state the caller saw on entry. */
+	if (need_repopulate) {
+		g->runtime_overlay = prev_overlay;
+		dag_populate_longest_paths(g);
+	}
+
+	free(path);
+	*out_runtime_ns = total;
+	return 0;
+}
+
+bool dag_compute_local_deadlines_with_runtimes(dag_t *g,
+		const uint64_t *runtime_by_node_index)
+{
+	if (g == NULL)
+		return false;
+
+	/* The legacy entry point reads `node->cumulative_deadline` and
+	 * derives `node->local_deadline` from it -- no `wcet` read
+	 * along the way. The runtime vector is therefore only
+	 * informational at this layer; it does not change the
+	 * conversion. Honour the caller's intent by installing the
+	 * overlay around the call so any future inner adjustment that
+	 * does want to consult per-node runtime picks it up.
+	 *
+	 * The narrow purpose of accepting the vector here is to give
+	 * heterogeneous callers a single uniform entry point to invoke
+	 * after the iterative loop converges, instead of forcing them
+	 * to track which legacy helper to call when. */
+	const uint64_t *prev_overlay = g->runtime_overlay;
+	if (runtime_by_node_index != NULL)
+		g->runtime_overlay = runtime_by_node_index;
+
+	bool ok = dag_compute_local_deadlines(g);
+
+	g->runtime_overlay = prev_overlay;
+	return ok;
 }
 
 void dag_node_dump_unrelated(dag_t *g) {

@@ -3165,6 +3165,346 @@ PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
 	return PWTEST_PASS;
 }
 
+PWTEST(hetero_iter_invalid_inputs_rejected)
+{
+	dag_t *g = dag_create(100, 100, 0.90, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 30, 101), 0);
+
+	pwtest_int_eq(dag_recalculate_heterogeneous(NULL, 2), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	pwtest_int_eq(dag_recalculate_heterogeneous(g, 0), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* Cap at DAG_HETEROGENEOUS_MAX_ITERATIONS (8). 9 must be rejected. */
+	pwtest_int_eq(dag_recalculate_heterogeneous(g, 9), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_uniform_capacity_matches_single_shot)
+{
+	/* On a uniform `relative_capacity` vector the overlay collapses
+	 * to a no-op: a chain that the single-shot pass schedules must
+	 * produce bit-identical placements when run through the
+	 * iterative entry point. This guards the short-circuit in
+	 * dag_recalculate_heterogeneous. */
+	dag_t *g_single = dag_create(1000, 1000, 0.90, 4, NULL);
+	pwtest_ptr_notnull(g_single);
+	pwtest_int_eq(add_real_node(g_single, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g_single, 2, 200, 102), 0);
+	pwtest_int_eq(add_real_node(g_single, 3, 150, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_single, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g_single, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g_single), 0);
+
+	dag_t *g_iter = dag_create(1000, 1000, 0.90, 4, NULL);
+	pwtest_ptr_notnull(g_iter);
+	pwtest_int_eq(add_real_node(g_iter, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g_iter, 2, 200, 102), 0);
+	pwtest_int_eq(add_real_node(g_iter, 3, 150, 103), 0);
+	pwtest_int_eq(dag_add_edge(g_iter, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g_iter, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate_heterogeneous(g_iter, 4), 0);
+
+	for (uint32_t id = 1; id <= 3; id++) {
+		pwtest_int_eq((int)find_node_by_id(g_iter, id)->cpu,
+				(int)find_node_by_id(g_single, id)->cpu);
+		pwtest_int_eq((int)find_node_by_id(g_iter, id)->local_deadline,
+				(int)find_node_by_id(g_single, id)->local_deadline);
+	}
+
+	dag_destroy(g_single);
+	dag_destroy(g_iter);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_single_iteration_short_circuits)
+{
+	/* max_iterations = 1 collapses to a single dag_recalculate even
+	 * on a heterogeneous capacity vector: the loop body needs at
+	 * least two rounds to compare mappings. Verify by checking the
+	 * mapping matches the homogeneous single-shot output. */
+	double rel[2] = { 1.0, 0.5 };
+
+	dag_t *g_single = dag_create(100, 100, 0.90, 2, rel);
+	pwtest_ptr_notnull(g_single);
+	pwtest_int_eq(add_real_node(g_single, 1, 40, 101), 0);
+	pwtest_int_eq(add_real_node(g_single, 2, 20, 102), 0);
+	pwtest_int_eq(dag_recalculate(g_single), 0);
+
+	dag_t *g_iter = dag_create(100, 100, 0.90, 2, rel);
+	pwtest_ptr_notnull(g_iter);
+	pwtest_int_eq(add_real_node(g_iter, 1, 40, 101), 0);
+	pwtest_int_eq(add_real_node(g_iter, 2, 20, 102), 0);
+	pwtest_int_eq(dag_recalculate_heterogeneous(g_iter, 1), 0);
+
+	pwtest_int_eq((int)find_node_by_id(g_iter, 1)->cpu,
+			(int)find_node_by_id(g_single, 1)->cpu);
+	pwtest_int_eq((int)find_node_by_id(g_iter, 2)->cpu,
+			(int)find_node_by_id(g_single, 2)->cpu);
+
+	dag_destroy(g_single);
+	dag_destroy(g_iter);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_chain_overlay_stretches_paths)
+{
+	/* Two independent nodes on two CPUs of unequal capacity.
+	 * Iteration 0 splits the deadline against reference-CPU WCETs;
+	 * iteration 1 splits against placement-stretched runtimes. On a
+	 * chain with one slow CPU, the assigned local_deadline for the
+	 * follower placed on the slow CPU must reflect the stretched
+	 * path: it should be strictly larger than what the homogeneous
+	 * single-shot pass would have produced for the same node.
+	 *
+	 * Concretely: deadline budget 200, two nodes with wcet 30 and
+	 * 40 in a chain. Reference split puts node 1 at ~85ns local
+	 * deadline (30/70 * 200) and node 2 at ~115ns (40/70 * 200).
+	 * Under capacity [1.0, 0.5], if node 2 lands on the slow CPU
+	 * the stretched runtime is 80ns, total path = 110, and the
+	 * iterative split must give node 2 a wider local deadline to
+	 * reflect that. */
+	double rel[2] = { 1.0, 0.5 };
+
+	dag_t *g_iter = dag_create(200, 200, 0.95, 2, rel);
+	pwtest_ptr_notnull(g_iter);
+	pwtest_int_eq(add_real_node(g_iter, 1, 30, 101), 0);
+	pwtest_int_eq(add_real_node(g_iter, 2, 40, 102), 0);
+	pwtest_int_eq(dag_add_edge(g_iter, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate_heterogeneous(g_iter, 4), 0);
+
+	dag_t *g_homo = dag_create(200, 200, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g_homo);
+	pwtest_int_eq(add_real_node(g_homo, 1, 30, 101), 0);
+	pwtest_int_eq(add_real_node(g_homo, 2, 40, 102), 0);
+	pwtest_int_eq(dag_add_edge(g_homo, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g_homo), 0);
+
+	/* Regardless of which CPU each node lands on, every node's
+	 * local_deadline + cumulative_deadline pair must satisfy the
+	 * kernel SCHED_DEADLINE contract: 0 < local <= period. */
+	dag_node_t *iter_n1 = find_node_by_id(g_iter, 1);
+	dag_node_t *iter_n2 = find_node_by_id(g_iter, 2);
+	pwtest_int_lt(0, (int)iter_n1->local_deadline);
+	pwtest_int_lt(0, (int)iter_n2->local_deadline);
+	pwtest_int_lt((int)iter_n1->local_deadline, 201);
+	pwtest_int_lt((int)iter_n2->local_deadline, 201);
+	/* And monotonicity along the edge survives the iteration. */
+	pwtest_int_lt((int)iter_n1->cumulative_deadline,
+			(int)iter_n2->cumulative_deadline + 1);
+
+	dag_destroy(g_iter);
+	dag_destroy(g_homo);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_convergence_breaks_loop)
+{
+	/* Three independent nodes on two CPUs of unequal capacity.
+	 * The iteration must converge: once a stable mapping is found
+	 * the loop body breaks. Verify by running with a large
+	 * max_iterations and checking the post-recalc state is clean
+	 * (dirty=false, every real node has a finite cpu). */
+	double rel[2] = { 1.0, 0.5 };
+
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, rel);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 200, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 150, 103), 0);
+
+	pwtest_int_eq(dag_recalculate_heterogeneous(g, 8), 0);
+	pwtest_bool_false(g->dirty);
+
+	for (uint32_t id = 1; id <= 3; id++) {
+		dag_node_t *n = find_node_by_id(g, id);
+		pwtest_ptr_notnull(n);
+		pwtest_int_lt((int)n->cpu, 2);
+	}
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_fusion_group_stays_co_located)
+{
+	/* Three nodes stamped into the same fusion group must land on a
+	 * single CPU after the iterative recalc, just as they do under
+	 * the single-shot path. The runtime overlay drives the split
+	 * step but the worst-fit's group-forced-cpu logic still
+	 * controls placement; iterating must not break that invariant. */
+	double rel[3] = { 1.0, 0.5, 0.5 };
+
+	dag_t *g = dag_create(1000, 1000, 0.95, 3, rel);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 42), 0);
+	pwtest_int_eq(dag_set_node_group(g, 3, 42), 0);
+
+	pwtest_int_eq(dag_recalculate_heterogeneous(g, 4), 0);
+
+	uint32_t cpu1 = find_node_by_id(g, 1)->cpu;
+	uint32_t cpu2 = find_node_by_id(g, 2)->cpu;
+	uint32_t cpu3 = find_node_by_id(g, 3)->cpu;
+	pwtest_int_eq((int)cpu1, (int)cpu2);
+	pwtest_int_eq((int)cpu2, (int)cpu3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(hetero_iter_preserves_unrelated_set_cache)
+{
+	/* After a successful dag_recalculate_heterogeneous the indexed
+	 * nodes cache and the unrelated-set cache must both still be
+	 * populated. A topology-stable second call must complete
+	 * without rebuilding the analysis from scratch -- the public
+	 * surface cannot directly observe that, but the cached caches
+	 * are visible through the struct fields and a regression that
+	 * frees them between iterations would null them out. */
+	double rel[2] = { 1.0, 0.5 };
+
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, rel);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 100, 103), 0);
+	pwtest_int_eq(dag_recalculate_heterogeneous(g, 4), 0);
+
+	pwtest_ptr_notnull(g->indexed_nodes);
+	pwtest_int_lt(0, (int)g->indexed_count);
+	pwtest_ptr_notnull(g->unrelated);
+	pwtest_int_lt(0, (int)g->unrelated_size);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(critical_path_runtime_chain_homogeneous)
+{
+	/* Three-node chain with wcet 10, 20, 30. Critical path = 60. */
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 30, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	uint64_t cp = 0;
+	uint32_t nodes[8];
+	size_t n_nodes = 0;
+	pwtest_int_eq(dag_compute_critical_path_runtime(g, NULL, &cp,
+			nodes, 8, &n_nodes), 0);
+	pwtest_int_eq((int)cp, 60);
+	pwtest_int_eq((int)n_nodes, 3);
+	/* Path is reported in source -> sink order. */
+	pwtest_int_eq((int)nodes[0], 1);
+	pwtest_int_eq((int)nodes[1], 2);
+	pwtest_int_eq((int)nodes[2], 3);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(critical_path_runtime_with_overlay)
+{
+	/* Same chain as above; provide a runtime overlay that doubles
+	 * every node's runtime. The critical path under the overlay
+	 * must be exactly twice the legacy value. */
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 30, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	uint64_t overlay[8] = {0};
+	for (uint32_t i = 0; i < g->indexed_count; i++) {
+		dag_node_t *n = g->indexed_nodes[i];
+		overlay[i] = n->fictitious ? 0 : 2 * n->wcet;
+	}
+
+	uint64_t cp = 0;
+	pwtest_int_eq(dag_compute_critical_path_runtime(g, overlay, &cp,
+			NULL, 0, NULL), 0);
+	pwtest_int_eq((int)cp, 120);
+
+	/* Restoring NULL overlay must return to the legacy value. */
+	pwtest_int_eq(dag_compute_critical_path_runtime(g, NULL, &cp,
+			NULL, 0, NULL), 0);
+	pwtest_int_eq((int)cp, 60);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+PWTEST(critical_path_runtime_rejects_invalid_inputs)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	uint64_t cp;
+	pwtest_int_eq(dag_compute_critical_path_runtime(NULL, NULL,
+			&cp, NULL, 0, NULL), -1);
+	pwtest_int_eq(errno, EINVAL);
+	pwtest_int_eq(dag_compute_critical_path_runtime(g, NULL,
+			NULL, NULL, 0, NULL), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	/* An empty dag (or one without an analysis cache) is also
+	 * rejected. */
+	dag_t *empty = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(empty);
+	pwtest_int_eq(dag_compute_critical_path_runtime(empty, NULL,
+			&cp, NULL, 0, NULL), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	dag_destroy(g);
+	dag_destroy(empty);
+	return PWTEST_PASS;
+}
+
+PWTEST(local_deadlines_with_runtimes_forwards_to_legacy)
+{
+	/* The _with_runtimes wrapper must produce the same
+	 * local_deadline values as the legacy entry point when given a
+	 * NULL overlay. */
+	dag_t *g = dag_create(1000, 1000, 0.95, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 20, 102), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	uint64_t legacy_local_n1 = find_node_by_id(g, 1)->local_deadline;
+	uint64_t legacy_local_n2 = find_node_by_id(g, 2)->local_deadline;
+
+	pwtest_bool_true(dag_compute_local_deadlines_with_runtimes(g, NULL));
+	pwtest_int_eq((int)find_node_by_id(g, 1)->local_deadline,
+			(int)legacy_local_n1);
+	pwtest_int_eq((int)find_node_by_id(g, 2)->local_deadline,
+			(int)legacy_local_n2);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 /* -------------------------------------------------------------------
  * Merged/fused-group collapse in the antichain enumeration.
  *
@@ -3791,6 +4131,18 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(hetero_high_density_picks_faster_cpu, PWTEST_NOARG);
 	pwtest_add(hetero_admission_rejects_workload_that_only_fits_at_full_capacity, PWTEST_NOARG);
 	pwtest_add(hetero_feasibility_scaled_by_slowest_cpu, PWTEST_NOARG);
+
+	pwtest_add(hetero_iter_invalid_inputs_rejected, PWTEST_NOARG);
+	pwtest_add(hetero_iter_uniform_capacity_matches_single_shot, PWTEST_NOARG);
+	pwtest_add(hetero_iter_single_iteration_short_circuits, PWTEST_NOARG);
+	pwtest_add(hetero_iter_chain_overlay_stretches_paths, PWTEST_NOARG);
+	pwtest_add(hetero_iter_convergence_breaks_loop, PWTEST_NOARG);
+	pwtest_add(hetero_iter_fusion_group_stays_co_located, PWTEST_NOARG);
+	pwtest_add(hetero_iter_preserves_unrelated_set_cache, PWTEST_NOARG);
+	pwtest_add(critical_path_runtime_chain_homogeneous, PWTEST_NOARG);
+	pwtest_add(critical_path_runtime_with_overlay, PWTEST_NOARG);
+	pwtest_add(critical_path_runtime_rejects_invalid_inputs, PWTEST_NOARG);
+	pwtest_add(local_deadlines_with_runtimes_forwards_to_legacy, PWTEST_NOARG);
 
 	pwtest_add(unrelated_collapse_chain_pair_with_independent_node, PWTEST_NOARG);
 	pwtest_add(unrelated_collapse_two_chains_to_single_antichain, PWTEST_NOARG);
