@@ -1315,6 +1315,42 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			continue;
 		}
 
+		/* Driver-budget sanity diagnostic. When the soft-redistribute
+		 * heuristic clips a chain that contains the driver, the
+		 * driver thread can come out the other side with a runtime
+		 * reservation well below its empirical mean -- and the
+		 * driver is the timing root of the graph, so any kernel-side
+		 * throttle on its activation propagates into an ALSA buffer
+		 * underrun (which the DAC then replays, producing the
+		 * audible "looping" symptom the live test hit). The emission
+		 * is rate-limited to one line per leader id per apply pass
+		 * via the existing last_applied gate above, and only fires
+		 * when the conformal estimator has a non-zero EWMA location
+		 * to compare against (a pre-warm-up driver lands on the
+		 * peak-hold fallback and is unaffected here). The threshold
+		 * (sum_runtime < mu) is the smallest signal that still
+		 * surfaces in practice: any reservation below the average
+		 * cycle cost lets the kernel throttle on more than half of
+		 * the activations. */
+		if (anchor != NULL && anchor->is_driver &&
+				anchor->conformal != NULL) {
+			double mu = rt_conformal_mu_ns(anchor->conformal);
+			if (mu > 0.0 && (double)g->sum_runtime < mu) {
+				pw_log_warn("HDL-W091-DRIVER-BUDGET-BELOW-MEAN: "
+						"driver tid=%d (id=%u) about to "
+						"receive runtime=%" PRIu64
+						" ns below its empirical EWMA "
+						"location %.0f ns "
+						"(deadline=%" PRIu64
+						" period=%" PRIu64
+						"); ALSA buffer underruns are "
+						"likely on the next activation",
+						(int)g->tid, anchor->node_id,
+						g->sum_runtime, mu,
+						kernel_deadline, g->period);
+			}
+		}
+
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
 				kernel_deadline, g->period,
 				impl->sched_reclaim);
@@ -2010,6 +2046,38 @@ static void apply_sample(struct impl *impl, struct node *n,
 					sample_ref, left - 1);
 			n->period = period;
 			return;
+		}
+	}
+
+	/* Anomalous-sample diagnostic. The conformal estimator uses the
+	 * standardised score (sample - mu) / (scale + sigma_floor) as the
+	 * empirical-quantile rank input, and a single sample whose score
+	 * sits dozens of standard deviations above the current EWMA
+	 * location can dominate the (1 - alpha_eff)-quantile for the
+	 * lifetime of the score ring (~5 s at the 1.3 ms graph period).
+	 * The observation is still admitted (the operator-facing knobs
+	 * for outlier rejection live in the conformal config; this is a
+	 * diagnostic surface only), but emit one debug line per occurrence
+	 * so a post-mortem can correlate a budget explosion with the
+	 * actual sample that caused it. Threshold 20 sigma is well above
+	 * the score regime the estimator targets even under a sustained
+	 * spike. */
+	if (n->conformal != NULL && sample_ref > 0.0) {
+		double mu = rt_conformal_mu_ns(n->conformal);
+		double scale = rt_conformal_scale_ns(n->conformal);
+		if (mu > 0.0 && scale > 0.0) {
+			double denom = scale + 1.0;
+			double score = (sample_ref - mu) / denom;
+			if (score > 20.0) {
+				pw_log_warn("HDL-W090-SAMPLE-ANOMALOUS: "
+						"node %u: sample %.0f ns is "
+						"%.1f sigma above EWMA "
+						"location (mu=%.0f scale=%.0f); "
+						"kept in the conformal ring",
+						n->node ? n->node->info.id
+							: (uint32_t)-1,
+						sample_ref, score, mu, scale);
+			}
 		}
 	}
 
