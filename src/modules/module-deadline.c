@@ -440,6 +440,30 @@ struct node {
 	 * budget. NULL until the first sample arrives (lazy init). */
 	rt_conformal_t *conformal;
 
+	/* Mode-keyed adaptive-conformal table. Partitions the same
+	 * sample stream by `(sample_rate, quantum, core_class)` so each
+	 * combination owns its own estimator: switching driver rate or
+	 * quantum no longer resets the conformal state, and samples
+	 * collected on LITTLE vs. BIG cores accumulate in separate
+	 * windows that the class-aware budget query can read
+	 * independently.
+	 *
+	 * Sized the same as the legacy `conformal` field's lifecycle:
+	 * lazy-created on first apply_sample, destroyed alongside
+	 * conformal, invalidated alongside conformal. apply_sample
+	 * dual-writes -- the legacy single estimator continues to feed
+	 * the existing read sites (runtime_select_for_node, diagnostic
+	 * accessors) so the kernel-apply behaviour is bit-for-bit
+	 * unchanged; the table accumulates per-class statistics that a
+	 * later commit will consume through
+	 * rt_conformal_table_budget_for_class.
+	 *
+	 * Default cap (RT_CONFORMAL_TABLE_MAX_MODES) is generous for a
+	 * realistic audio workload (every (rate, quantum) the driver
+	 * ever runs at, times two classes); on overflow the LRU entry
+	 * is evicted. */
+	rt_conformal_table_t *conformal_table;
+
 	/* Per-follower budget kind chosen by runtime_select_for_node
 	 * on the most recent sample. Surfaced in the JSON snapshot so
 	 * an operator can audit which source drove this cycle's
@@ -860,6 +884,10 @@ static void module_destroy(void *data)
 			rt_conformal_destroy(n->conformal);
 			n->conformal = NULL;
 		}
+		if (n->conformal_table != NULL) {
+			rt_conformal_table_destroy(n->conformal_table);
+			n->conformal_table = NULL;
+		}
 		free(n->ring_slots);
 		free(n->topo.nodes);
 		free(n->topo.edges);
@@ -1110,6 +1138,10 @@ static void sched_cb(void *data, uint32_t id, pid_t tid, uint64_t runtime,
 		    mn->last_fusion_group_leader != fusion_group_leader_id) {
 			if (mn->conformal != NULL)
 				rt_conformal_invalidate(mn->conformal,
+						RT_CONF_INVALIDATED_FUSION_GROUP);
+			if (mn->conformal_table != NULL)
+				rt_conformal_table_invalidate_all(
+						mn->conformal_table,
 						RT_CONF_INVALIDATED_FUSION_GROUP);
 		}
 		mn->last_fusion_group_leader = fusion_group_leader_id;
@@ -1731,13 +1763,39 @@ static struct runtime_select_result runtime_select_for_node(
  * step in sched_cb divides uniformly by
  * relative_capacity[placement_cpu] without caring how the sample
  * got there. */
+/* Derive the conformal mode-key components from a placement CPU.
+ * Returns the core_class enum value (cast to uint8_t to match the
+ * mode_key field type) when the topology has been built and the
+ * cpu is in range; falls back to RT_CONF_CORE_LITTLE so a sample
+ * collected before the topology probe finishes routes deterministically
+ * into the LITTLE bucket. The fallback is conservative: misrouting a
+ * pre-topology sample into LITTLE means the per-class statistics
+ * accumulate one extra LITTLE observation while still being usable
+ * once the probe completes. */
+static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
+		uint32_t sample_cpu)
+{
+	if (impl == NULL || impl->topology.num_cpus == 0)
+		return (uint8_t)RT_CONF_CORE_LITTLE;
+	if (sample_cpu == SAMPLE_CPU_UNKNOWN ||
+			sample_cpu >= impl->topology.num_cpus)
+		return (uint8_t)RT_CONF_CORE_LITTLE;
+	enum rt_core_class c = impl->topology.cpus[sample_cpu].core_class;
+	return (c == RT_CORE_BIG) ? (uint8_t)RT_CONF_CORE_BIG
+				  : (uint8_t)RT_CONF_CORE_LITTLE;
+}
+
 static void apply_sample(struct impl *impl, struct node *n,
 		uint64_t runtime, uint64_t cycles,
-		uint32_t sample_cpu, uint64_t period)
+		uint32_t sample_cpu, uint64_t period,
+		uint32_t sample_rate_hz, uint32_t quantum_frames)
 {
 	if (n->period != period) {
 		if (n->conformal != NULL)
 			rt_conformal_invalidate(n->conformal,
+					RT_CONF_INVALIDATED_PERIOD);
+		if (n->conformal_table != NULL)
+			rt_conformal_table_invalidate_all(n->conformal_table,
 					RT_CONF_INVALIDATED_PERIOD);
 		n->wcet = 0;
 	}
@@ -1751,6 +1809,21 @@ static void apply_sample(struct impl *impl, struct node *n,
 		n->conformal = rt_conformal_create(&impl->conformal_cfg);
 		if (n->conformal == NULL)
 			pw_log_warn("node %d: conformal estimator init failed",
+				n->node ? n->node->info.id : (uint32_t)-1);
+	}
+
+	/* Lazy-init the mode-keyed table alongside the legacy single
+	 * estimator. Per-class statistics are accumulated through the
+	 * table; read sites continue to consult the legacy estimator
+	 * for now, so the dual-write keeps the kernel-apply path
+	 * bit-for-bit unchanged while exposing the per-class data
+	 * surface a class-aware budget query can read. */
+	if (n->conformal_table == NULL) {
+		n->conformal_table = rt_conformal_table_create(
+				&impl->conformal_cfg,
+				RT_CONFORMAL_TABLE_MAX_MODES);
+		if (n->conformal_table == NULL)
+			pw_log_warn("node %d: conformal table init failed",
 				n->node ? n->node->info.id : (uint32_t)-1);
 	}
 
@@ -1796,6 +1869,25 @@ static void apply_sample(struct impl *impl, struct node *n,
 	 * computed against pre-observation EWMA state). */
 	if (runtime > 0 && n->conformal != NULL && sample_ref > 0.0)
 		(void)rt_conformal_observe(n->conformal, (uint64_t)sample_ref);
+
+	/* Dual-write into the mode-keyed table. The mode key
+	 * partitions samples by (rate, quantum, core_class), so the
+	 * same value flows into a different per-mode estimator instance
+	 * than the legacy single one. This is what makes a node's
+	 * statistics survive a rate or quantum change without a reset,
+	 * and what gives the class-aware budget query (eventually
+	 * consumed by the heterogeneous worst-fit dispatch) a separate
+	 * window per LITTLE / BIG placement. */
+	if (runtime > 0 && n->conformal_table != NULL && sample_ref > 0.0) {
+		struct rt_conformal_mode_key key = {
+			.sample_rate_hz = sample_rate_hz,
+			.quantum_frames = quantum_frames,
+			.core_class     = sample_cpu_to_mode_class(impl,
+					sample_cpu),
+		};
+		(void)rt_conformal_table_observe(n->conformal_table, &key,
+				(uint64_t)sample_ref);
+	}
 
 	/* Peak-hold floor: an outlier the estimators have not yet
 	 * incorporated still raises the budget for the next cycle.
@@ -1994,7 +2086,8 @@ static void recalc_params_sync(struct node *drv)
 		apply_sample(impl, n, runtime,
 				SPA_ATOMIC_LOAD(na->prev_run_cycles),
 				n->last_applied ? n->last_cpu : SAMPLE_CPU_UNKNOWN,
-				period);
+				period, node->target_rate.denom,
+				node->target_quantum);
 
 		if (n_followers >= followers_cap) {
 			uint32_t new_cap = followers_cap * 2;
@@ -2214,9 +2307,25 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 				}
 			}
 		}
-		if (n)
+		if (n) {
+			/* Read the driver's current rate/quantum for the
+			 * mode key. A race with a concurrent rate/quantum
+			 * change is tolerated: the table just opens a new
+			 * entry under the post-change key and the previous
+			 * entry's samples remain valid for diagnostic
+			 * inspection. drv->node may be NULL on a worker-
+			 * created driver entry; the fall-back of (0, 0)
+			 * still creates a deterministic mode key for the
+			 * pre-binding interval. */
+			uint32_t rate_hz = 0;
+			uint32_t quantum = 0;
+			if (drv->node != NULL) {
+				rate_hz = drv->node->target_rate.denom;
+				quantum = drv->node->target_quantum;
+			}
 			apply_sample(impl, n, s->runtime_ns, s->cycles,
-					s->cpu, s->period_ns);
+					s->cpu, s->period_ns, rate_hz, quantum);
+		}
 
 		processed += sizeof(struct sample);
 	}
@@ -3377,6 +3486,10 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 			    n->last_topo_generation != this_gen) {
 				if (n->conformal != NULL)
 					rt_conformal_invalidate(n->conformal,
+						RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
+				if (n->conformal_table != NULL)
+					rt_conformal_table_invalidate_all(
+						n->conformal_table,
 						RT_CONF_INVALIDATED_TOPOLOGY_GENERATION);
 			}
 			n->last_topo_generation = this_gen;
