@@ -214,6 +214,27 @@ uint32_t reconcile_state_node_required_external_inputs(
 	return n;
 }
 
+void reconcile_state_node_runtime_split(const reconcile_state_t *state,
+		uint32_t follower_id,
+		uint64_t *out_predicted_ns, uint64_t *out_scheduled_ns)
+{
+	dag_node_t *dn;
+
+	if (out_predicted_ns != NULL)
+		*out_predicted_ns = 0;
+	if (out_scheduled_ns != NULL)
+		*out_scheduled_ns = 0;
+	if (state == NULL || state->dag == NULL)
+		return;
+	dn = dag_find_node((struct dag *)state->dag, follower_id);
+	if (dn == NULL)
+		return;
+	if (out_predicted_ns != NULL)
+		*out_predicted_ns = dn->predicted_runtime_ns;
+	if (out_scheduled_ns != NULL)
+		*out_scheduled_ns = dn->scheduled_runtime_ns;
+}
+
 void reconcile_state_feasibility(const reconcile_state_t *state,
 		struct reconcile_feasibility *out)
 {

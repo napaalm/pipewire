@@ -3104,8 +3104,27 @@ static int populate_params_snapshot(struct impl *impl,
 		 */
 		if (mn != NULL) {
 			pn.budget_kind = mn->budget_kind;
+			pn.budget_used_bootstrap = mn->budget_used_bootstrap;
 		} else {
 			pn.budget_kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
+			pn.budget_used_bootstrap = false;
+		}
+
+		/* Predicted vs scheduled runtime split. The dag layer
+		 * populates these fields on the dag_node during recalc;
+		 * surface them through the same lookup that already
+		 * resolved the macro-node leader so the JSON snapshot
+		 * exposes the divergence per follower. Driver sentinels
+		 * and pre-recalc followers report zero on both, which
+		 * is the documented "not yet populated" state. */
+		if (drv->reconcile != NULL) {
+			reconcile_state_node_runtime_split(drv->reconcile,
+					n_iter->info.id,
+					&pn.predicted_runtime_ns,
+					&pn.scheduled_runtime_ns);
+		} else {
+			pn.predicted_runtime_ns = 0;
+			pn.scheduled_runtime_ns = 0;
 		}
 		/* Release-barrier surfacing. required_external_inputs
 		 * comes from the contracted DAG (the post-contraction

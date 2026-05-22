@@ -500,6 +500,40 @@ struct rt_diag_param_node {
 	 */
 	bool     budget_clipped;
 	double   risk_objective_value;
+
+	/*
+	 * Predicted vs scheduled runtime split.
+	 *
+	 * `predicted_runtime_ns` is the runtime estimate the analysis
+	 * layer reasoned with on this follower's most recent recalc:
+	 * the conformal estimator's budget value (in reference-CPU
+	 * units), or its placement-stretched equivalent when the
+	 * heterogeneous iterative recalc supplied a runtime overlay.
+	 *
+	 * `scheduled_runtime_ns` is the kernel-facing value
+	 * (sched_setattr's runtime). It equals predicted on the
+	 * hard-mode path and falls below predicted on a follower whose
+	 * soft-fallback clipped its runtime against the assigned local
+	 * deadline. The divergence is the magnitude by which the
+	 * applied reservation falls short of the predicted workload.
+	 *
+	 * Both surfaces zero when the follower has not yet completed a
+	 * recalc pass that populates the dag_node fields. The
+	 * predicted - scheduled difference is the degradation magnitude
+	 * for this follower on the most recent apply pass. */
+	uint64_t predicted_runtime_ns;
+	uint64_t scheduled_runtime_ns;
+
+	/*
+	 * True iff the most recent budget query for this follower was
+	 * satisfied by the LITTLE->BIG bootstrap fallback: the BIG
+	 * mode-key entry was not yet ready and the published budget
+	 * was borrowed from the LITTLE entry. The same condition drives
+	 * HDL-W011 in the daemon log; this field exposes it as a
+	 * per-follower flag for dashboards that filter on it without
+	 * scraping log output.
+	 */
+	bool     budget_used_bootstrap;
 };
 
 struct rt_diag_params_snapshot {

@@ -178,6 +178,21 @@ bool reconcile_state_has_persistent_dag(const reconcile_state_t *state);
 uint32_t reconcile_state_node_required_external_inputs(
 		const reconcile_state_t *state, uint32_t follower_id);
 
+/* Lookup the persistent dag_node behind `follower_id` and copy its
+ * predicted_runtime_ns / scheduled_runtime_ns fields out. The
+ * predicted value is the analysis-layer estimate (conformal
+ * estimator output, or its placement-stretched equivalent when the
+ * heterogeneous iterative recalc supplied a runtime overlay); the
+ * scheduled value is the kernel-facing runtime (equal to predicted
+ * on the hard path, the clipped local_deadline on a soft-fallback
+ * node). Both outputs are set to 0 when the follower has not yet
+ * undergone a recalc that populated the dag_node fields, when the
+ * state has no persistent dag (legacy rebuild path), or on NULL
+ * inputs. Either out-pointer may be NULL to skip its copy. */
+void reconcile_state_node_runtime_split(const reconcile_state_t *state,
+		uint32_t follower_id,
+		uint64_t *out_predicted_ns, uint64_t *out_scheduled_ns);
+
 /*
  * Per-follower budget-clipped indicator. Returns true iff the
  * soft-mode risk-aware redistribution had to cap the follower's
