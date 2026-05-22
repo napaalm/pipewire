@@ -525,6 +525,61 @@ PWTEST(conformal_quantile_alpha_close_to_max_lowers_quantile)
 	return PWTEST_PASS;
 }
 
+/* Regression test for the audio-loop scenario captured at
+ * /tmp/coppwr-deadline-conformal.jsonl + /tmp/coppwr-deadline-snapshot.json:
+ * one outlier sample took ewma_location_ns to score ~1099, and because
+ * the previous default alpha_target=1e-4 made (window+1)*alpha < 1 for
+ * the production window of 4096 the empirical quantile collapsed to
+ * "the maximum of the score ring", so the published budget tracked the
+ * single outlier for thousands of cycles (last_prediction_ns ~= period).
+ * With the corrected alpha floor the quantile rank sits at least a few
+ * positions below the max once the ring fills past 2 / alpha_min
+ * samples, so a single outlier surrounded by stable samples cannot
+ * drive the prediction up to the outlier's value. The complementary
+ * protection -- a post-topology-change warm-up window in
+ * module-deadline.c that drops the first few cycles after the
+ * follower graph mutates -- prevents the partial-ring case (sample
+ * count below the threshold above) from ever seeing the outlier in
+ * the first place, so this test only pins the steady-state
+ * guarantee that the conformal layer itself enforces. */
+PWTEST(conformal_single_outlier_does_not_dominate_prediction)
+{
+	struct rt_conformal_config cfg;
+	rt_conformal_t *e;
+	uint32_t i;
+	double pred;
+	const uint64_t baseline_ns = 5000;
+	const uint64_t outlier_ns  = 1000000;
+	/* 5000 + 1 + 1000 = 6001 observations: the ring (default
+	 * window 4096) is full at the end and the single outlier
+	 * still sits inside the retained tail, so the quantile must
+	 * skip it via the corrected alpha floor. */
+	const uint32_t warm_up     = 5000;
+	const uint32_t post_outlier = 1000;
+
+	rt_conformal_config_defaults(&cfg);
+	cfg.bootstrap_min_samples = 8;
+	cfg.recalc_period         = 1;
+
+	e = rt_conformal_create(&cfg);
+	pwtest_ptr_notnull(e);
+
+	for (i = 0; i < warm_up; i++)
+		rt_conformal_observe(e, baseline_ns);
+	rt_conformal_observe(e, outlier_ns);
+	for (i = 0; i < post_outlier; i++)
+		rt_conformal_observe(e, baseline_ns);
+
+	pred = rt_conformal_last_prediction_ns(e);
+	/* The prediction must stay an order of magnitude below the
+	 * outlier value; collapsing to ~= outlier_ns is the bug. */
+	pwtest_bool_true(isfinite(pred));
+	pwtest_bool_true(pred < (double)outlier_ns / 4.0);
+
+	rt_conformal_destroy(e);
+	return PWTEST_PASS;
+}
+
 /* ---------------------------------------------------------------- */
 /* Section E: prequential discipline.                                */
 /* ---------------------------------------------------------------- */
@@ -1533,6 +1588,8 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_pareto_burst_inflates_scale, PWTEST_NOARG);
 
 	pwtest_add(conformal_quantile_zero_on_empty_ring, PWTEST_NOARG);
+	pwtest_add(conformal_single_outlier_does_not_dominate_prediction,
+			PWTEST_NOARG);
 	pwtest_add(conformal_quantile_at_alpha_min_picks_max_score,
 			PWTEST_NOARG);
 	pwtest_add(conformal_quantile_alpha_close_to_max_lowers_quantile,

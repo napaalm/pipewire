@@ -299,6 +299,23 @@
 #define TOPO_INITIAL_NODES		64u
 #define TOPO_INITIAL_EDGES		128u
 
+/* Per-follower warm-up window armed when the driver's topology
+ * fingerprint changes (a follower joined / left, a link was
+ * re-routed, the period changed). For the next N apply_sample
+ * invocations on each follower the sample is dropped before it
+ * reaches the conformal estimator, the mode-keyed table or the
+ * peak-hold floor: the first cycles after a topology mutation can
+ * carry plugin first-touch costs (scratch buffer allocations,
+ * convolution kernel priming, JIT warm-up) that the follower will
+ * never repeat in steady state, and admitting them inflates the
+ * empirical quantile (a single such sample dominates the ring
+ * until it ages out, ~5 s at the common 1.3 ms period) which then
+ * starves the soft-redistribute peers with sub-microsecond
+ * reservations. Eight cycles is a few graph periods at the small
+ * quanta the live tests use and a fraction of the bootstrap window
+ * so a freshly added follower still enters the DAG quickly. */
+#define TOPO_CHANGE_WARMUP_SAMPLES	8u
+
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
@@ -433,6 +450,21 @@ struct node {
 	 * the estimator is in its bootstrap window. */
 	uint64_t wcet;
 	uint64_t period;
+
+	/* Decremented in apply_sample; while > 0 the incoming sample is
+	 * dropped before it reaches the conformal estimator, the
+	 * mode-keyed table, and the peak-hold floor. Set by the main
+	 * thread to TOPO_CHANGE_WARMUP_SAMPLES when the driver's topology
+	 * fingerprint changes (a follower joined / left / a link was
+	 * re-routed), so the first few cycles after the change cannot
+	 * pollute the statistical model with set-up-time spikes the
+	 * follower would not see in steady state. uint32_t access is
+	 * naturally aligned and the producer / consumer threads only
+	 * read or write atomically through SPA_ATOMIC_*; no other
+	 * ordering is required because the counter is purely advisory --
+	 * a transient mis-observation just lets one extra sample
+	 * through. */
+	uint32_t warmup_samples_remaining;
 
 	/* Adaptive-conformal upper-runtime-budget estimator
 	 * (Romano, Patterson & Candes 2019; Gibbs & Candes 2021).
@@ -1724,7 +1756,7 @@ static struct runtime_select_result runtime_select_for_node(
 		struct node *n,
 		uint64_t sample_ref,
 		uint64_t peak_hold,
-		uint64_t period_ns SPA_UNUSED,
+		uint64_t period_ns,
 		uint32_t sample_rate_hz,
 		uint32_t quantum_frames)
 {
@@ -1776,10 +1808,18 @@ static struct runtime_select_result runtime_select_for_node(
 			pref != BUDGET_SOURCE_BOOTSTRAP) {
 		uint8_t target_class = node_target_mode_class(impl, n);
 		bool used_bootstrap = false;
+		/* Pass the kernel-side period as the upper clamp so a
+		 * runaway prediction (a single outlier dominating the
+		 * empirical quantile, or a sustained-spike pile-up) cannot
+		 * publish a budget that the chain analysis below would then
+		 * declare infeasible at the per-node level. The HDL-W030
+		 * critical-path check still catches chain-level overflow;
+		 * this just prevents one node from being seen as already
+		 * unfeasible on its own. */
 		uint64_t c = rt_conformal_table_budget_for_class(
 				n->conformal_table,
 				sample_rate_hz, quantum_frames,
-				target_class, 0, &used_bootstrap);
+				target_class, period_ns, &used_bootstrap);
 		if (c > 0) {
 			r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
 			r.value_ns = SPA_MAX(c, sample_ref);
@@ -1809,7 +1849,9 @@ static struct runtime_select_result runtime_select_for_node(
 	    pref != BUDGET_SOURCE_BOOTSTRAP) {
 		enum rt_conformal_state cs = rt_conformal_state(n->conformal);
 		if (cs == RT_CONF_VALID || cs == RT_CONF_SHIFT) {
-			uint64_t c = rt_conformal_budget(n->conformal, 0);
+			/* See the per-class branch above for the rationale on
+			 * passing period_ns as the upper clamp. */
+			uint64_t c = rt_conformal_budget(n->conformal, period_ns);
 			if (c > 0) {
 				r.kind = RT_DIAG_BUDGET_ADAPTIVE_CONFORMAL;
 				r.value_ns = SPA_MAX(c, sample_ref);
@@ -1946,6 +1988,29 @@ static void apply_sample(struct impl *impl, struct node *n,
 				sample_ref, period, runtime, cycles);
 		n->period = period;
 		return;
+	}
+
+	/* Post-topology-change warm-up: drop the first
+	 * TOPO_CHANGE_WARMUP_SAMPLES samples after a fingerprint bump so
+	 * the one-off cost of running through a freshly-built graph
+	 * (allocations, page-faults, JIT, prefetch warm-up) cannot enter
+	 * the empirical quantile or the peak-hold floor. The counter is
+	 * armed by the main thread on every fingerprint change in
+	 * snapshot_topology_main; here on the worker we just consume one
+	 * tick and return. n->period is still refreshed because the
+	 * legacy invalidation path keys on n->period == period to decide
+	 * whether a reset is needed. */
+	{
+		uint32_t left = SPA_ATOMIC_LOAD(n->warmup_samples_remaining);
+		if (left > 0) {
+			SPA_ATOMIC_STORE(n->warmup_samples_remaining, left - 1);
+			pw_log_debug("node %u: warm-up window dropping sample "
+					"(%.0f ns, %u tick(s) left)",
+					n->node ? n->node->info.id : (uint32_t)-1,
+					sample_ref, left - 1);
+			n->period = period;
+			return;
+		}
 	}
 
 	/* Feed the conformal estimator the same sample. The observation
@@ -3564,6 +3629,30 @@ static int snapshot_topology_main(struct spa_loop *loop SPA_UNUSED,
 			 * nodes/edges arrays) observes the freshly-written
 			 * topology atomically. */
 			SPA_ATOMIC_STORE(t->generation, t->generation + 1);
+			/* Arm the post-topology-change warm-up: for each
+			 * follower the apply_sample path drops the next
+			 * TOPO_CHANGE_WARMUP_SAMPLES samples so the
+			 * one-off plugin first-touch cost (scratch buffer
+			 * allocation, convolution priming, JIT warm-up)
+			 * that the very first cycle after a new edge or a
+			 * new node typically carries cannot enter the
+			 * conformal ring. Also clear the peak-hold so the
+			 * elevated value the previous topology installed
+			 * does not persist into the new graph. The counter
+			 * is advisory; missing one follower (a node added
+			 * after the fingerprint was hashed, a transient
+			 * lookup miss) just lets that follower's first
+			 * post-change sample land in the ring, which is
+			 * the legacy behaviour. */
+			for (i = 0; i < t->n_nodes; i++) {
+				struct node *fn = find_node_any_by_id(drv->impl,
+						t->nodes[i].id);
+				if (fn != NULL) {
+					SPA_ATOMIC_STORE(
+						fn->warmup_samples_remaining,
+						TOPO_CHANGE_WARMUP_SAMPLES);
+				}
+			}
 			if (drv->impl != NULL && drv->impl->debug_dump_raw_graph)
 				dump_raw_graph_main(drv->impl, drv);
 			if (drv->impl != NULL && drv->impl->debug_dump_sched_graph)

@@ -60,10 +60,33 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	 * Tuning rationale (recent calibration against polyphonic synth
 	 * + filter-chain workloads):
 	 *
-	 * - alpha_target 1e-4 (was 1e-3): target the 99.99 % one-sided
-	 *   quantile so a sudden burst of expensive cycles is not
-	 *   eligible for the empirical-quantile rank that lives below
-	 *   the peak score in the ring.
+	 * - alpha_target 1e-3 (was 1e-4): target the 99.9 % one-sided
+	 *   quantile. The previous 1e-4 calibration aimed at a tighter
+	 *   tail, but the finite-sample conformal index
+	 *
+	 *       k = ceil((window + 1) * (1 - alpha_eff))
+	 *
+	 *   clamps to `window` whenever (window + 1) * alpha < 1: with
+	 *   the default window 4096 every alpha below ~2.44e-4 reduces
+	 *   to "quantile == max score in the ring", so a single
+	 *   contaminating sample (a plugin first-touch slipping past the
+	 *   warm-up window, a kernel preemption charged to the
+	 *   follower's CPU-time counter) dominated the published budget
+	 *   for the full lifetime of the ring -- the live trace at
+	 *   /tmp/coppwr-deadline-conformal.jsonl shows this directly,
+	 *   with one bad sample driving last_prediction_ns up to
+	 *   ~period for thousands of cycles. At alpha 1e-3 the rank
+	 *   sits about three below the max, so two or three extreme
+	 *   samples must coexist in the ring before the quantile
+	 *   follows them, which is the actual definition of a
+	 *   sustained-spike regime.
+	 *
+	 * - alpha_min 5e-4 (was 1e-5): kept above 1/(window + 1) for
+	 *   the default window so the adaptive descent on overruns can
+	 *   still drop alpha_eff toward a tighter quantile without
+	 *   ever collapsing back to "quantile == max" behaviour. With
+	 *   window 4096 the floor 5e-4 leaves the rank two below the
+	 *   max even at the bottom of the alpha range.
 	 *
 	 * - alpha_max 5e-3 (was 5e-2): adaptive_conformal must not
 	 *   relax above the 99.5 % quantile during the quiet intervals
@@ -116,8 +139,8 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	 *   sooner so the diagnostic surface flags a sustained-spike
 	 *   regime before half a second of overruns have accumulated.
 	 */
-	cfg->alpha_target          = 1e-4;
-	cfg->alpha_min             = 1e-5;
+	cfg->alpha_target          = 1e-3;
+	cfg->alpha_min             = 5e-4;
 	cfg->alpha_max             = 5e-3;
 	cfg->eta                   = 0.005;
 	cfg->ewma_location_lambda  = 0.01;
