@@ -2068,26 +2068,38 @@ static void apply_sample(struct impl *impl, struct node *n,
 	 * lifetime of the score ring (~5 s at the 1.3 ms graph period).
 	 * The observation is still admitted (the operator-facing knobs
 	 * for outlier rejection live in the conformal config; this is a
-	 * diagnostic surface only), but emit one debug line per occurrence
+	 * diagnostic surface only), but emit one warn line per occurrence
 	 * so a post-mortem can correlate a budget explosion with the
-	 * actual sample that caused it. Threshold 20 sigma is well above
-	 * the score regime the estimator targets even under a sustained
-	 * spike. */
+	 * actual sample that caused it.
+	 *
+	 * Combined gate: the score test alone over-fires on
+	 * low-baseline followers (e.g. the ALSA driver thread with
+	 * mu approx 2-3 microseconds, scale approx 0.5 microsecond) where a
+	 * perfectly normal 10-20 microsecond cycle reads as 20-40 sigma
+	 * above mean even though the absolute deviation is harmless.
+	 * Require both score > 20 AND a non-trivial absolute deviation:
+	 * the sample must be at least 5x the EWMA location OR at least
+	 * 50 microseconds above it. Whole-period scores (the audio-loop
+	 * pathology, hundreds of sigma and tens of milliseconds of
+	 * deviation) still cross both gates. */
 	if (n->conformal != NULL && sample_ref > 0.0) {
 		double mu = rt_conformal_mu_ns(n->conformal);
 		double scale = rt_conformal_scale_ns(n->conformal);
 		if (mu > 0.0 && scale > 0.0) {
 			double denom = scale + 1.0;
 			double score = (sample_ref - mu) / denom;
-			if (score > 20.0) {
+			double deviation = sample_ref - mu;
+			bool abs_significant = deviation > 50000.0;
+			bool rel_significant = sample_ref > 5.0 * mu;
+			if (score > 20.0 &&
+			    (abs_significant || rel_significant)) {
 				pw_log_warn("HDL-W090-SAMPLE-ANOMALOUS: "
 						"node %u: sample %.0f ns is "
 						"%.1f sigma above EWMA "
 						"location (mu=%.0f scale=%.0f); "
 						"kept in the conformal ring",
-						n->node ? n->node->info.id
-							: (uint32_t)-1,
-						sample_ref, score, mu, scale);
+						n->node_id, sample_ref, score,
+						mu, scale);
 			}
 		}
 	}
