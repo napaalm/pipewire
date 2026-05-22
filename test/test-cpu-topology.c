@@ -474,6 +474,67 @@ PWTEST(cpu_topo_resolve_frequencies_preserves_user_override)
 	return PWTEST_PASS;
 }
 
+PWTEST(cpu_topo_refresh_relative_from_sched_freq_yields_ratio)
+{
+	/* Two CPUs with identical raw_capacity but user-set
+	 * sched_frequency_hz at a 2:1 ratio. After the refresh, the
+	 * relative_capacity vector must reflect that ratio: the faster
+	 * CPU lands at 1.0, the slower at 0.5. */
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_CONSERVATIVE, &t), 0);
+	/* Probe-time pass produces a uniform vector. */
+	pwtest_double_eq(find_cpu(&t, 0)->relative_capacity,
+			find_cpu(&t, 1)->relative_capacity);
+
+	/* User-declare a fake big.LITTLE: cpu0 at 3 GHz, cpu1 at 1.5 GHz. */
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 0, 3000000000ULL), 0);
+	pwtest_int_eq(cpu_topology_set_freq_override(&t, 1, 1500000000ULL), 0);
+
+	pwtest_int_eq(cpu_topology_refresh_relative_from_sched_freq(&t), 0);
+	pwtest_double_eq(find_cpu(&t, 0)->relative_capacity, 1.0);
+	pwtest_double_eq(find_cpu(&t, 1)->relative_capacity, 0.5);
+	pwtest_double_eq(find_cpu(&t, 0)->relative_capacity_nominal, 1.0);
+	pwtest_double_eq(find_cpu(&t, 1)->relative_capacity_nominal, 0.5);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_refresh_relative_from_sched_freq_uniform_is_noop)
+{
+	/* On a uniform sched_frequency vector the refresh must leave
+	 * every entry at 1.0 -- the function must not introduce
+	 * spurious heterogeneity. */
+	const char *json =
+		"{ cpus = ["
+		"  { cpu_id = 0, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 },"
+		"  { cpu_id = 1, raw_capacity = 1024,"
+		"    min_freq_khz = 3000000, max_freq_khz = 3000000 }"
+		"] }";
+	struct cpu_topology t = { 0 };
+	pwtest_int_eq(cpu_topology_from_json(json, CPU_DVFS_ASSUME_MAX, &t), 0);
+	pwtest_int_eq(cpu_topology_resolve_frequencies(&t, CPU_FREQ_SCALING_MAX), 0);
+	pwtest_int_eq(cpu_topology_refresh_relative_from_sched_freq(&t), 0);
+	pwtest_double_eq(find_cpu(&t, 0)->relative_capacity, 1.0);
+	pwtest_double_eq(find_cpu(&t, 1)->relative_capacity, 1.0);
+	cpu_topology_destroy(&t);
+	return PWTEST_PASS;
+}
+
+PWTEST(cpu_topo_refresh_relative_null_safe)
+{
+	pwtest_int_eq(cpu_topology_refresh_relative_from_sched_freq(NULL), -1);
+	pwtest_int_eq(errno, EINVAL);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(cpu_topology)
 {
 	pwtest_add(cpu_topo_homogeneous_json_all_ones, PWTEST_NOARG);
@@ -499,6 +560,11 @@ PWTEST_SUITE(cpu_topology)
 			PWTEST_NOARG);
 	pwtest_add(cpu_topo_resolve_frequencies_preserves_user_override,
 			PWTEST_NOARG);
+	pwtest_add(cpu_topo_refresh_relative_from_sched_freq_yields_ratio,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_refresh_relative_from_sched_freq_uniform_is_noop,
+			PWTEST_NOARG);
+	pwtest_add(cpu_topo_refresh_relative_null_safe, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }

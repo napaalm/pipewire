@@ -214,6 +214,28 @@ int cpu_topology_set_freq_override(struct cpu_topology *t, uint32_t cpu_id,
 int cpu_topology_resolve_frequencies(struct cpu_topology *t,
 		enum cpu_freq_source default_source);
 
+/* Recompute relative_capacity / relative_capacity_nominal from the
+ * already-resolved sched_frequency_hz on every CPU. The default
+ * probe-time recompute uses min_freq_khz / max_freq_khz from cpufreq
+ * sysfs, which collapses to a uniform 1.0 vector on a host whose
+ * cpufreq sysfs reports the same frequency for every CPU even when
+ * `cpus.classes` and `cpus.freq.<id>.user-hz` have declared a fake
+ * big.LITTLE split for the scheduler. After applying user
+ * frequency overrides the caller should invoke this function so the
+ * dag's capacity vector reflects the heterogeneity the operator
+ * declared: every per-CPU entry becomes
+ *
+ *     raw_capacity[i] * sched_frequency_hz[i] /
+ *         max_j(raw_capacity[j] * sched_frequency_hz[j])
+ *
+ * which mirrors the probe-time formula but substitutes the resolved
+ * scheduling frequency for the cpufreq sysfs value. On a uniform
+ * sched_frequency_hz vector the result is identical to the probe-time
+ * value (every entry 1.0), so calling this function is safe even when
+ * no user overrides are in effect. Returns 0 on success, -1/EINVAL on
+ * a null topology. */
+int cpu_topology_refresh_relative_from_sched_freq(struct cpu_topology *t);
+
 /*
  * Test affordance: build a cpu_topology directly from a JSON string,
  * skipping the sysfs probe. JSON shape:

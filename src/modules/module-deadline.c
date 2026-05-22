@@ -4011,6 +4011,25 @@ static int build_cpu_topology(struct impl *impl, struct pw_properties *props)
 				impl->topology.cpus[i].cpu_id, (uint64_t)uhz);
 	}
 
+	/* Re-derive relative_capacity from the now-final
+	 * sched_frequency_hz so a fake big.LITTLE config (uniform
+	 * cpufreq sysfs, heterogeneous user-hz overrides) produces a
+	 * non-uniform capacity vector for the dag library. On a host
+	 * whose sched_frequency_hz happens to be uniform the
+	 * recomputation is a no-op (every entry stays at 1.0). After
+	 * the refresh, mirror the updated topology vector back into
+	 * impl->relative_capacity / impl->relative_capacity_nominal --
+	 * those copies are what reconcile_init eventually forwards to
+	 * dag_create, so without the mirror the dag library would
+	 * still see the probe-time uniform values. */
+	cpu_topology_refresh_relative_from_sched_freq(&impl->topology);
+	for (i = 0; i < impl->topology.num_cpus; i++) {
+		impl->relative_capacity[i] =
+			impl->topology.cpus[i].relative_capacity;
+		impl->relative_capacity_nominal[i] =
+			impl->topology.cpus[i].relative_capacity_nominal;
+	}
+
 	pw_log_info("cpu-topology: smt-policy=%s dvfs-policy=%s num_cpus=%u",
 			impl->smt_policy == CPU_SMT_STRICT ? "strict" :
 			impl->smt_policy == CPU_SMT_DEDUPE ? "dedupe" : "ignore",

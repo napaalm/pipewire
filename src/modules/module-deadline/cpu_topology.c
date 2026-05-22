@@ -43,7 +43,7 @@ const char *cpu_freq_source_name(enum cpu_freq_source s)
 	return "unknown";
 }
 
-/* Neutral frequency default when /sys/.../cpufreq/cpuinfo_{min,max}_freq
+/* Neutral frequency default when /sys/.../cpufreq/scaling_{min,max}_freq
  * are missing. The value cancels through C_max so it never affects
  * relative_capacity; using 1 (kHz) keeps the arithmetic in finite-range
  * 64-bit space without overflow risk. */
@@ -307,6 +307,59 @@ int cpu_topology_resolve_frequencies(struct cpu_topology *t,
 	return 0;
 }
 
+int cpu_topology_refresh_relative_from_sched_freq(struct cpu_topology *t)
+{
+	if (t == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (t->num_cpus == 0)
+		return 0;
+
+	double *eff = calloc(t->num_cpus, sizeof(*eff));
+	if (eff == NULL)
+		return -1;
+
+	double max_eff = 0.0;
+	for (uint32_t i = 0; i < t->num_cpus; i++) {
+		double cap = (double)t->cpus[i].raw_capacity;
+		double freq = (double)t->cpus[i].sched_frequency_hz;
+		/* A missing raw_capacity or sched_frequency falls back to
+		 * 1.0 so the entry never zeroes out the row; the
+		 * post-loop clamp keeps the final value strictly in
+		 * (0, 1]. The probe-time pass has already filled both
+		 * fields for every present cpu, so the fallback is only
+		 * exercised on a JSON-supplied test topology that omits
+		 * the field. */
+		if (cap <= 0.0)
+			cap = 1.0;
+		if (freq <= 0.0)
+			freq = 1.0;
+		eff[i] = cap * freq;
+		if (eff[i] > max_eff)
+			max_eff = eff[i];
+	}
+	if (max_eff <= 0.0)
+		max_eff = 1.0;
+
+	uint32_t ref = 0;
+	for (uint32_t i = 0; i < t->num_cpus; i++) {
+		double rel = eff[i] / max_eff;
+		if (!(rel > 0.0))
+			rel = 1.0 / max_eff;
+		if (rel > 1.0)
+			rel = 1.0;
+		t->cpus[i].relative_capacity = rel;
+		t->cpus[i].relative_capacity_nominal = rel;
+		if (rel >= 1.0 && ref == 0)
+			ref = i;
+	}
+	t->reference_cpu_index = ref;
+
+	free(eff);
+	return 0;
+}
+
 /* Pass over `t` filling each cpu_info::smt_siblings/num_siblings with
  * the indices of the same core_id, restricted to the CPUs that are
  * actually present in this topology (the caller-provided set may be a
@@ -370,12 +423,12 @@ int cpu_topology_probe(const uint32_t *cpus, uint32_t num,
 			ci->raw_capacity = v;
 
 		snprintf(path, sizeof(path),
-				"/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_min_freq", cpu);
+				"/sys/devices/system/cpu/cpu%u/cpufreq/scaling_min_freq", cpu);
 		if (read_uint64_file(path, &v) == 0 && v > 0)
 			ci->min_freq_khz = v;
 
 		snprintf(path, sizeof(path),
-				"/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", cpu);
+				"/sys/devices/system/cpu/cpu%u/cpufreq/scaling_max_freq", cpu);
 		if (read_uint64_file(path, &v) == 0 && v > 0)
 			ci->max_freq_khz = v;
 
