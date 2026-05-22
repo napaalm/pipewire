@@ -455,6 +455,45 @@ uint64_t rt_conformal_table_budget(rt_conformal_table_t *t,
 rt_conformal_t *rt_conformal_table_get(rt_conformal_table_t *t,
 		const struct rt_conformal_mode_key *key);
 
+/* "Is the (sample_rate, quantum, core_class) entry ready to publish
+ * a budget?" Returns true iff the entry exists and its estimator is
+ * in RT_CONF_VALID or RT_CONF_SHIFT (the two states the publish path
+ * already accepts). Returns false for a missing entry, an entry
+ * still in RT_CONF_BOOTSTRAP, or any null input. Does not touch the
+ * entry's LRU tick. */
+bool rt_conformal_table_ready_for_class(const rt_conformal_table_t *t,
+		uint32_t sample_rate_hz,
+		uint32_t quantum_frames,
+		uint8_t  core_class);
+
+/* Per-class budget with LITTLE -> BIG bootstrap fallback.
+ *
+ * If the (sample_rate, quantum, target_class) entry is ready,
+ * publish its budget. When target_class is RT_CONF_CORE_BIG and the
+ * BIG entry is missing or still in BOOTSTRAP, fall back to the
+ * LITTLE entry's budget if LITTLE is ready and emit
+ * `out_used_bootstrap = true`. Otherwise return 0 with
+ * `out_used_bootstrap = false`; the caller is then responsible for
+ * the higher-level warm-up policy (e.g. keep the node on a LITTLE
+ * core under module-rt until LITTLE statistics accumulate).
+ *
+ * The bootstrap fallback is one-directional by design: a BIG entry
+ * is never used as bootstrap for LITTLE because the spec's
+ * conservative invariant is that LITTLE-derived cycles, evaluated at
+ * a BIG core's scheduling frequency, over-estimate the BIG runtime
+ * (cycles are platform-side; freq is scheduling-side) -- a safe
+ * over-reservation. The reverse direction would under-reserve and
+ * is therefore refused.
+ *
+ * `out_used_bootstrap` may be NULL when the caller does not need to
+ * surface the bootstrap state. */
+uint64_t rt_conformal_table_budget_for_class(rt_conformal_table_t *t,
+		uint32_t sample_rate_hz,
+		uint32_t quantum_frames,
+		uint8_t  target_class,
+		uint64_t period_ns,
+		bool    *out_used_bootstrap);
+
 /* Number of modes currently held in the table (0..max_modes). */
 uint32_t rt_conformal_table_mode_count(const rt_conformal_table_t *t);
 

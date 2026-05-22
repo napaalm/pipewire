@@ -941,6 +941,85 @@ rt_conformal_t *rt_conformal_table_get(rt_conformal_table_t *t,
 	return idx < 0 ? NULL : t->entries[idx].estimator;
 }
 
+/* "Is the (sample_rate, quantum, class) estimator in a publish-ready
+ * state?" Looks the entry up without touching the LRU tick so a
+ * pure-readiness probe cannot influence eviction. The publish-ready
+ * states are RT_CONF_VALID and RT_CONF_SHIFT -- the same two the
+ * single-estimator path's runtime_select_for_node treats as
+ * publishable in module-deadline.c. */
+bool rt_conformal_table_ready_for_class(const rt_conformal_table_t *t,
+		uint32_t sample_rate_hz, uint32_t quantum_frames,
+		uint8_t core_class)
+{
+	if (t == NULL)
+		return false;
+	struct rt_conformal_mode_key key = {
+		.sample_rate_hz = sample_rate_hz,
+		.quantum_frames = quantum_frames,
+		.core_class     = core_class,
+	};
+	for (uint32_t i = 0; i < t->max_modes; i++) {
+		if (!t->entries[i].occupied)
+			continue;
+		if (!rt_conformal_mode_key_equal(&t->entries[i].key, &key))
+			continue;
+		enum rt_conformal_state s =
+				rt_conformal_state(t->entries[i].estimator);
+		return s == RT_CONF_VALID || s == RT_CONF_SHIFT;
+	}
+	return false;
+}
+
+uint64_t rt_conformal_table_budget_for_class(rt_conformal_table_t *t,
+		uint32_t sample_rate_hz, uint32_t quantum_frames,
+		uint8_t target_class, uint64_t period_ns,
+		bool *out_used_bootstrap)
+{
+	if (out_used_bootstrap != NULL)
+		*out_used_bootstrap = false;
+	if (t == NULL)
+		return 0;
+
+	/* Preferred path: the target class has a ready entry. The
+	 * lookup goes through the standard table_budget so the LRU
+	 * tick advances and the entry counts as touched. */
+	if (rt_conformal_table_ready_for_class(t, sample_rate_hz,
+			quantum_frames, target_class)) {
+		struct rt_conformal_mode_key key = {
+			.sample_rate_hz = sample_rate_hz,
+			.quantum_frames = quantum_frames,
+			.core_class     = target_class,
+		};
+		return rt_conformal_table_budget(t, &key, period_ns);
+	}
+
+	/* BIG bootstrap fallback: when the target is BIG but no BIG
+	 * entry is ready yet, borrow the LITTLE entry's budget. The
+	 * directionality is intentional -- borrowing in the reverse
+	 * direction (BIG -> LITTLE) would under-reserve at the slower
+	 * core and is therefore not supported here. */
+	if (target_class == RT_CONF_CORE_BIG &&
+			rt_conformal_table_ready_for_class(t, sample_rate_hz,
+				quantum_frames, RT_CONF_CORE_LITTLE)) {
+		struct rt_conformal_mode_key little_key = {
+			.sample_rate_hz = sample_rate_hz,
+			.quantum_frames = quantum_frames,
+			.core_class     = RT_CONF_CORE_LITTLE,
+		};
+		uint64_t bootstrap = rt_conformal_table_budget(t, &little_key,
+				period_ns);
+		if (bootstrap > 0 && out_used_bootstrap != NULL)
+			*out_used_bootstrap = true;
+		return bootstrap;
+	}
+
+	/* Neither the target class nor (if applicable) the LITTLE
+	 * bootstrap is ready. Caller falls back to its warm-up policy
+	 * -- typically pinning the node to a LITTLE core under
+	 * module-rt until statistics accumulate. */
+	return 0;
+}
+
 uint32_t rt_conformal_table_mode_count(const rt_conformal_table_t *t)
 {
 	if (t == NULL)

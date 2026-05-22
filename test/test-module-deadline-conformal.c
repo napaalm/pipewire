@@ -1318,6 +1318,220 @@ PWTEST(conformal_table_collect_keys_iterates_every_populated_entry)
 	return PWTEST_PASS;
 }
 
+/* Drive every entry of the table referenced by `keys` through enough
+ * samples that each lands in RT_CONF_VALID. cfg must be the same one
+ * used to create the table. */
+static void table_drive_keys_to_valid(rt_conformal_table_t *t,
+		const struct rt_conformal_config *cfg,
+		const struct rt_conformal_mode_key *keys, uint32_t n_keys,
+		uint64_t runtime_ns)
+{
+	for (uint32_t i = 0; i < n_keys; i++) {
+		for (uint32_t j = 0; j < cfg->bootstrap_min_samples + 8u; j++)
+			(void)rt_conformal_table_observe(t, &keys[i], runtime_ns);
+	}
+}
+
+PWTEST(conformal_table_ready_for_class_distinguishes_states)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	/* No entry yet: ready returns false. */
+	pwtest_bool_false(rt_conformal_table_ready_for_class(t,
+			48000, 1024, RT_CONF_CORE_LITTLE));
+	pwtest_bool_false(rt_conformal_table_ready_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG));
+
+	struct rt_conformal_mode_key little_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_LITTLE,
+	};
+
+	/* One observation: BOOTSTRAP state, still not publish-ready. */
+	(void)rt_conformal_table_observe(t, &little_key, 50000);
+	pwtest_bool_false(rt_conformal_table_ready_for_class(t,
+			48000, 1024, RT_CONF_CORE_LITTLE));
+
+	/* Drive past bootstrap into VALID. */
+	for (uint32_t i = 0; i < cfg.bootstrap_min_samples + 8u; i++)
+		(void)rt_conformal_table_observe(t, &little_key, 50000);
+	pwtest_bool_true(rt_conformal_table_ready_for_class(t,
+			48000, 1024, RT_CONF_CORE_LITTLE));
+
+	/* A different class on the same (rate, quantum) is independent. */
+	pwtest_bool_false(rt_conformal_table_ready_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG));
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_returns_target_when_ready)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	struct rt_conformal_mode_key big_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG,
+	};
+	table_drive_keys_to_valid(t, &cfg, &big_key, 1, 50000);
+
+	bool used_bootstrap = true;
+	uint64_t budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap);
+	pwtest_int_lt(0, (int)budget);
+	pwtest_bool_false(used_bootstrap);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_bootstraps_big_from_little)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	/* LITTLE is ready, BIG is not. A budget request for BIG must
+	 * borrow LITTLE's budget and flag the bootstrap. */
+	struct rt_conformal_mode_key little_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_LITTLE,
+	};
+	table_drive_keys_to_valid(t, &cfg, &little_key, 1, 50000);
+
+	bool used_bootstrap = false;
+	uint64_t budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap);
+	pwtest_int_lt(0, (int)budget);
+	pwtest_bool_true(used_bootstrap);
+
+	/* The bootstrap value must equal the LITTLE entry's own
+	 * publishable budget at the same period. */
+	uint64_t little_budget = rt_conformal_table_budget(t, &little_key,
+			100000);
+	pwtest_int_eq((int)budget, (int)little_budget);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_does_not_bootstrap_little_from_big)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	/* Only BIG is ready. The reverse direction (LITTLE bootstrap
+	 * from BIG) is intentionally refused: borrowing the faster
+	 * core's cycle estimate to schedule the slower one would
+	 * under-reserve. */
+	struct rt_conformal_mode_key big_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG,
+	};
+	table_drive_keys_to_valid(t, &cfg, &big_key, 1, 50000);
+
+	bool used_bootstrap = true;
+	uint64_t budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_LITTLE, 100000,
+			&used_bootstrap);
+	pwtest_int_eq((int)budget, 0);
+	pwtest_bool_false(used_bootstrap);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_returns_zero_when_neither_ready)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	bool used_bootstrap = true;
+	uint64_t budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap);
+	pwtest_int_eq((int)budget, 0);
+	pwtest_bool_false(used_bootstrap);
+
+	/* Insert a BOOTSTRAP-state BIG entry: still not ready, still no
+	 * bootstrap available. */
+	struct rt_conformal_mode_key big_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG,
+	};
+	(void)rt_conformal_table_observe(t, &big_key, 50000);
+
+	budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap);
+	pwtest_int_eq((int)budget, 0);
+	pwtest_bool_false(used_bootstrap);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_null_safe)
+{
+	bool used_bootstrap = true;
+	pwtest_int_eq((int)rt_conformal_table_budget_for_class(NULL,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap), 0);
+	pwtest_bool_false(used_bootstrap);
+
+	/* out_used_bootstrap may be NULL. */
+	pwtest_int_eq((int)rt_conformal_table_budget_for_class(NULL,
+			48000, 1024, RT_CONF_CORE_BIG, 100000, NULL), 0);
+
+	pwtest_bool_false(rt_conformal_table_ready_for_class(NULL,
+			48000, 1024, RT_CONF_CORE_BIG));
+	return PWTEST_PASS;
+}
+
+PWTEST(conformal_table_budget_for_class_prefers_target_over_bootstrap)
+{
+	struct rt_conformal_config cfg = cfg_small();
+	rt_conformal_table_t *t = rt_conformal_table_create(&cfg, 4);
+	pwtest_ptr_notnull(t);
+
+	/* Both classes ready; the BIG request must publish the BIG
+	 * estimator's budget, not the LITTLE one. Drive them with
+	 * distinct runtime distributions so the budgets are
+	 * distinguishable. */
+	struct rt_conformal_mode_key little_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_LITTLE,
+	};
+	struct rt_conformal_mode_key big_key = {
+		.sample_rate_hz = 48000, .quantum_frames = 1024,
+		.core_class = RT_CONF_CORE_BIG,
+	};
+	table_drive_keys_to_valid(t, &cfg, &little_key, 1, 80000);
+	table_drive_keys_to_valid(t, &cfg, &big_key, 1, 30000);
+
+	bool used_bootstrap = true;
+	uint64_t big_budget = rt_conformal_table_budget_for_class(t,
+			48000, 1024, RT_CONF_CORE_BIG, 100000,
+			&used_bootstrap);
+	pwtest_bool_false(used_bootstrap);
+
+	uint64_t little_budget = rt_conformal_table_budget(t, &little_key,
+			100000);
+	pwtest_bool_true(big_budget != little_budget);
+
+	rt_conformal_table_destroy(t);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_conformal)
 {
 	pwtest_add(conformal_state_name_stable, PWTEST_NOARG);
@@ -1395,6 +1609,19 @@ PWTEST_SUITE(module_deadline_conformal)
 	pwtest_add(conformal_table_budget_returns_zero_on_unobserved_key,
 			PWTEST_NOARG);
 	pwtest_add(conformal_table_invalidate_all_resets_every_entry,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_ready_for_class_distinguishes_states,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_returns_target_when_ready,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_bootstraps_big_from_little,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_does_not_bootstrap_little_from_big,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_returns_zero_when_neither_ready,
+			PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_null_safe, PWTEST_NOARG);
+	pwtest_add(conformal_table_budget_for_class_prefers_target_over_bootstrap,
 			PWTEST_NOARG);
 	pwtest_add(conformal_table_collect_keys_iterates_every_populated_entry,
 			PWTEST_NOARG);
