@@ -4549,6 +4549,36 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			impl->heterogeneous ? "true" : "false",
 			impl->heterogeneous_iterations);
 
+	/* HDL-W001 surfaces the configuration error where the
+	 * operator asked for heterogeneous behaviour but every
+	 * available CPU has been classified as BIG. Without a LITTLE
+	 * core present, the bootstrap fallback in
+	 * rt_conformal_table_budget_for_class can never satisfy a
+	 * cold-start BIG request, and the warm-up policy that the
+	 * conformal table assumes (LITTLE samples accumulate first,
+	 * BIG bootstraps from them) cannot fire. Emit once at init so
+	 * the operator sees the misconfiguration before any sample
+	 * lands and reroutes traffic through the unsuitable fallback. */
+	if (impl->heterogeneous) {
+		uint32_t little_cpus = 0;
+		for (uint32_t k = 0; k < impl->topology.num_cpus; k++) {
+			if (impl->topology.cpus[k].core_class == RT_CORE_LITTLE)
+				little_cpus++;
+		}
+		if (little_cpus == 0) {
+			pw_log_warn("HDL-W001-NO-LITTLE-CPU: "
+					"deadline.heterogeneous=true but no "
+					"available CPU is classified as LITTLE. "
+					"The per-class warm-up and the LITTLE-"
+					"bootstrap fallback that a fresh BIG "
+					"placement relies on are unreachable; "
+					"either lower the dvfs-policy / "
+					"freq-source threshold, set cpus.classes "
+					"explicitly, or run with "
+					"deadline.heterogeneous=false.");
+		}
+	}
+
 	impl->on_infeasible = DEADLINE_ON_INFEASIBLE_KEEP_PREVIOUS;
 	if ((s = pw_properties_get(props, "deadline.on-infeasible")) != NULL) {
 		if (spa_streq(s, "keep-previous")) {
