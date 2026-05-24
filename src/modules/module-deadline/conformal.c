@@ -13,9 +13,9 @@
  *     exponentially-weighted moving average primitive),
  *   - a fixed-size score ring with capacity = cfg.window holding
  *     per-activation normalised nonconformity scores,
- *   - a fixed-size scratch buffer used to compute the rolling
- *     empirical quantile of the score ring by O(W log W) sort
- *     outside the realtime path,
+ *   - a dual indexed heap (max-heap + min-heap) that maintains the
+ *     rolling empirical quantile incrementally in O(log W) per
+ *     observation,
  *   - the adaptive alpha_eff (initialised to alpha_target; the
  *     online update lands in a subsequent commit),
  *   - overrun / burst counters and per-activation diagnostic
@@ -26,18 +26,15 @@
  * existed BEFORE the call (mu_pred, scale_pred). s_t is inserted
  * into the ring. The EWMA pair is updated by x_t. Only after that
  * does the budget for the NEXT activation become computable via
- * rt_conformal_budget(); the empirical quantile is recomputed lazily
- * every recalc_period observations (a unit test pins the
+ * rt_conformal_budget(); the empirical quantile is maintained
+ * incrementally at every insertion (a unit test pins the
  * no-look-ahead property by inspecting the ring contents around the
  * observe / budget interleaving).
  *
- * Realtime safety: rt_conformal_observe() walks O(1) in the steady
- * state -- one ring insert, one EWMA update, one comparison for the
- * overrun counter. The quantile recompute is gated behind
- * recalc_period and consumes a per-instance scratch buffer
- * allocated once at create() time; the recompute itself is O(W log W)
- * but only fires every recalc_period observations and runs on the
- * audio recalc worker, never on the RT process() thread.
+ * Realtime safety: rt_conformal_observe() runs in O(log W) per call
+ * -- one ring insert, one heap expire + insert + rebalance, one EWMA
+ * update, one comparison for the overrun counter. No sorting, no
+ * scratch buffer; the quantile is always fresh after each insert.
  *
  * Copyright (C) 2026 Antonio Napolitano and Francesco Barcherini
  */
@@ -270,6 +267,13 @@ const char *rt_conformal_risk_allocation_name(
 	return "unknown";
 }
 
+/* Indexed heap used for O(log n) incremental quantile maintenance. */
+struct indexed_heap {
+	double   *vals;    /* heap-ordered values */
+	uint32_t *slots;   /* vals[i] came from ring slot slots[i] */
+	uint32_t  size;
+};
+
 struct rt_conformal {
 	struct rt_conformal_config cfg;
 	enum rt_conformal_state    state;
@@ -306,25 +310,17 @@ struct rt_conformal {
 	uint32_t ring_head;
 	uint32_t ring_count;
 
-	/* Scratch for the O(W log W) quantile recompute. Pre-allocated
-	 * at create() so the steady-state observe path never touches
-	 * malloc. */
-	double  *sort_scratch;
+	/* Dual indexed heap for O(log n) incremental quantile.
+	 * lower is a max-heap of the k smallest scores (quantile = top).
+	 * upper is a min-heap of the (n - k) largest scores.
+	 * heap_loc[ring_slot] encodes which heap + position. */
+	struct indexed_heap lower;
+	struct indexed_heap upper;
+	int32_t *heap_loc;
 
-	/* Cached quantile result and recompute throttle. */
-	uint32_t samples_since_recalc;
 	double   cached_score_quantile;
 	bool     quantile_valid;
 };
-
-static int cmp_double_asc(const void *a, const void *b)
-{
-	double x = *(const double *)a;
-	double y = *(const double *)b;
-	if (x < y) return -1;
-	if (x > y) return 1;
-	return 0;
-}
 
 static uint64_t clamp_u64(uint64_t v, uint64_t lo, uint64_t hi)
 {
@@ -333,42 +329,118 @@ static uint64_t clamp_u64(uint64_t v, uint64_t lo, uint64_t hi)
 	return v;
 }
 
-/*
- * Recompute the empirical (1 - alpha_eff) quantile of the score ring
- * using the finite-sample conformal index convention. With n entries
- * and probability level p = 1 - alpha_eff, the sorted-index is
- *
- *     k = ceil((n + 1) * p)   clamped to [1, n]
- *
- * (Romano, Patterson & Candes 2019 §3 cites this convention as the
- * exchangeability-preserving choice; for finite n it is the
- * conservative empirical quantile.) The function sorts a scratch
- * copy of the ring into ascending order and returns score_sorted[k-1].
- *
- * The empty-ring case returns 0.0; the caller treats that as "no
- * score adjustment" and falls back on the bootstrap branch.
- */
-static double compute_score_quantile(rt_conformal_t *e)
+/* ------------------------------------------------------------------ */
+/* Indexed heap helpers for O(log n) incremental quantile.            */
+/* ------------------------------------------------------------------ */
+
+#define HEAP_LOC_SENTINEL INT32_MIN
+#define HEAP_LOC_UPPER_BIT (1 << 30)
+
+static inline int32_t heap_loc_encode(bool is_upper, uint32_t pos)
 {
-	uint32_t n = e->ring_count;
-	uint32_t i;
-	double   p;
-	double   q_idx;
+	return (int32_t)(is_upper ? HEAP_LOC_UPPER_BIT : 0) | (int32_t)pos;
+}
+
+static inline bool heap_loc_is_upper(int32_t loc)
+{
+	return (loc & HEAP_LOC_UPPER_BIT) != 0;
+}
+
+static inline uint32_t heap_loc_pos(int32_t loc)
+{
+	return (uint32_t)(loc & ~HEAP_LOC_UPPER_BIT);
+}
+
+static inline void heap_swap(struct indexed_heap *h, uint32_t i, uint32_t j,
+		int32_t *heap_loc, bool is_upper)
+{
+	double tv;
+	uint32_t ts;
+	tv = h->vals[i]; h->vals[i] = h->vals[j]; h->vals[j] = tv;
+	ts = h->slots[i]; h->slots[i] = h->slots[j]; h->slots[j] = ts;
+	heap_loc[h->slots[i]] = heap_loc_encode(is_upper, i);
+	heap_loc[h->slots[j]] = heap_loc_encode(is_upper, j);
+}
+
+static inline bool heap_cmp(double a, double b, bool is_max)
+{
+	return is_max ? (a > b) : (a < b);
+}
+
+static void heap_sift_up(struct indexed_heap *h, uint32_t i,
+		int32_t *heap_loc, bool is_max, bool is_upper)
+{
+	while (i > 0) {
+		uint32_t parent = (i - 1) / 2;
+		if (heap_cmp(h->vals[i], h->vals[parent], is_max))
+			heap_swap(h, i, parent, heap_loc, is_upper);
+		else
+			break;
+		i = parent;
+	}
+}
+
+static void heap_sift_down(struct indexed_heap *h, uint32_t i,
+		int32_t *heap_loc, bool is_max, bool is_upper)
+{
+	for (;;) {
+		uint32_t best = i;
+		uint32_t l = 2 * i + 1;
+		uint32_t r = 2 * i + 2;
+		if (l < h->size && heap_cmp(h->vals[l], h->vals[best], is_max))
+			best = l;
+		if (r < h->size && heap_cmp(h->vals[r], h->vals[best], is_max))
+			best = r;
+		if (best == i)
+			break;
+		heap_swap(h, i, best, heap_loc, is_upper);
+		i = best;
+	}
+}
+
+static void heap_insert(struct indexed_heap *h, double val, uint32_t ring_slot,
+		int32_t *heap_loc, bool is_max, bool is_upper)
+{
+	uint32_t pos = h->size;
+	h->vals[pos] = val;
+	h->slots[pos] = ring_slot;
+	h->size++;
+	heap_loc[ring_slot] = heap_loc_encode(is_upper, pos);
+	heap_sift_up(h, pos, heap_loc, is_max, is_upper);
+}
+
+static void heap_remove_at(struct indexed_heap *h, uint32_t pos,
+		int32_t *heap_loc, bool is_max, bool is_upper)
+{
+	uint32_t last = h->size - 1;
+	if (pos != last) {
+		heap_swap(h, pos, last, heap_loc, is_upper);
+		h->size--;
+		heap_loc[h->slots[last]] = HEAP_LOC_SENTINEL;
+		heap_sift_down(h, pos, heap_loc, is_max, is_upper);
+		heap_sift_up(h, pos, heap_loc, is_max, is_upper);
+	} else {
+		heap_loc[h->slots[pos]] = HEAP_LOC_SENTINEL;
+		h->size--;
+	}
+}
+
+static inline double heap_peek(const struct indexed_heap *h)
+{
+	return h->vals[0];
+}
+
+static uint32_t quantile_target_k(uint32_t n, double alpha_eff)
+{
+	double p = 1.0 - alpha_eff;
+	double q_idx;
 	uint32_t k;
-
 	if (n == 0)
-		return 0.0;
-
-	for (i = 0; i < n; i++)
-		e->sort_scratch[i] = e->score_ring[i];
-	qsort(e->sort_scratch, n, sizeof(double), cmp_double_asc);
-
-	p = 1.0 - e->alpha_eff;
+		return 0;
 	if (!(p > 0.0))
-		return e->sort_scratch[0];
+		return 1;
 	if (p >= 1.0)
-		return e->sort_scratch[n - 1];
-
+		return n;
 	q_idx = ceil((double)(n + 1u) * p);
 	if (q_idx < 1.0)
 		k = 1;
@@ -376,22 +448,86 @@ static double compute_score_quantile(rt_conformal_t *e)
 		k = n;
 	else
 		k = (uint32_t)q_idx;
-	return e->sort_scratch[k - 1u];
+	return k;
+}
+
+static void heaps_rebalance(rt_conformal_t *e)
+{
+	uint32_t target_k = quantile_target_k(e->ring_count, e->alpha_eff);
+	if (target_k == 0)
+		return;
+
+	while (e->lower.size > target_k) {
+		uint32_t slot = e->lower.slots[0];
+		double val = e->lower.vals[0];
+		heap_remove_at(&e->lower, 0, e->heap_loc, true, false);
+		heap_insert(&e->upper, val, slot, e->heap_loc, false, true);
+	}
+	while (e->lower.size < target_k && e->upper.size > 0) {
+		uint32_t slot = e->upper.slots[0];
+		double val = e->upper.vals[0];
+		heap_remove_at(&e->upper, 0, e->heap_loc, false, true);
+		heap_insert(&e->lower, val, slot, e->heap_loc, true, false);
+	}
+}
+
+static void heaps_expire_slot(rt_conformal_t *e, uint32_t ring_slot)
+{
+	int32_t loc = e->heap_loc[ring_slot];
+	if (loc == HEAP_LOC_SENTINEL)
+		return;
+	if (heap_loc_is_upper(loc)) {
+		heap_remove_at(&e->upper, heap_loc_pos(loc),
+				e->heap_loc, false, true);
+	} else {
+		heap_remove_at(&e->lower, heap_loc_pos(loc),
+				e->heap_loc, true, false);
+	}
+}
+
+static void heaps_insert_score(rt_conformal_t *e, double val, uint32_t ring_slot)
+{
+	if (e->lower.size == 0 || val <= heap_peek(&e->lower)) {
+		heap_insert(&e->lower, val, ring_slot, e->heap_loc, true, false);
+	} else {
+		heap_insert(&e->upper, val, ring_slot, e->heap_loc, false, true);
+	}
+}
+
+static void heaps_update_quantile(rt_conformal_t *e)
+{
+	heaps_rebalance(e);
+	if (e->lower.size > 0) {
+		e->cached_score_quantile = heap_peek(&e->lower);
+		e->quantile_valid = true;
+	} else {
+		e->cached_score_quantile = 0.0;
+		e->quantile_valid = false;
+	}
 }
 
 static void ring_insert(rt_conformal_t *e, double score, uint64_t runtime)
 {
 	uint32_t cap = e->cfg.window;
-	e->score_ring[e->ring_head] = score;
-	e->runtime_ring[e->ring_head] = runtime;
-	e->ring_head = (e->ring_head + 1u) % cap;
+	uint32_t slot = e->ring_head;
+
+	if (e->ring_count == cap)
+		heaps_expire_slot(e, slot);
+
+	e->score_ring[slot] = score;
+	e->runtime_ring[slot] = runtime;
+	e->ring_head = (slot + 1u) % cap;
 	if (e->ring_count < cap)
 		e->ring_count++;
+
+	heaps_insert_score(e, score, slot);
+	heaps_update_quantile(e);
 }
 
 rt_conformal_t *rt_conformal_create(const struct rt_conformal_config *cfg)
 {
 	rt_conformal_t *e;
+	uint32_t w;
 
 	if (rt_conformal_config_validate(cfg) != 0)
 		return NULL;
@@ -405,17 +541,31 @@ rt_conformal_t *rt_conformal_create(const struct rt_conformal_config *cfg)
 	e->last_invalidation_reason = RT_CONF_INVALIDATED_NONE;
 	e->alpha_eff = cfg->alpha_target;
 
-	e->score_ring   = calloc(cfg->window, sizeof(double));
-	e->runtime_ring = calloc(cfg->window, sizeof(uint64_t));
-	e->sort_scratch = calloc(cfg->window, sizeof(double));
+	w = cfg->window;
+	e->score_ring   = calloc(w, sizeof(double));
+	e->runtime_ring = calloc(w, sizeof(uint64_t));
+	e->lower.vals   = calloc(w, sizeof(double));
+	e->lower.slots  = calloc(w, sizeof(uint32_t));
+	e->upper.vals   = calloc(w, sizeof(double));
+	e->upper.slots  = calloc(w, sizeof(uint32_t));
+	e->heap_loc     = malloc(w * sizeof(int32_t));
 	if (e->score_ring == NULL || e->runtime_ring == NULL ||
-	    e->sort_scratch == NULL) {
+	    e->lower.vals == NULL || e->lower.slots == NULL ||
+	    e->upper.vals == NULL || e->upper.slots == NULL ||
+	    e->heap_loc == NULL) {
 		free(e->score_ring);
 		free(e->runtime_ring);
-		free(e->sort_scratch);
+		free(e->lower.vals);
+		free(e->lower.slots);
+		free(e->upper.vals);
+		free(e->upper.slots);
+		free(e->heap_loc);
 		free(e);
 		return NULL;
 	}
+
+	for (uint32_t i = 0; i < w; i++)
+		e->heap_loc[i] = HEAP_LOC_SENTINEL;
 
 	return e;
 }
@@ -426,13 +576,18 @@ void rt_conformal_destroy(rt_conformal_t *e)
 		return;
 	free(e->score_ring);
 	free(e->runtime_ring);
-	free(e->sort_scratch);
+	free(e->lower.vals);
+	free(e->lower.slots);
+	free(e->upper.vals);
+	free(e->upper.slots);
+	free(e->heap_loc);
 	free(e);
 }
 
 void rt_conformal_invalidate(rt_conformal_t *e,
 		enum rt_conformal_invalidation_reason reason)
 {
+	uint32_t i;
 	if (e == NULL)
 		return;
 	e->state = RT_CONF_INSUFFICIENT_DATA;
@@ -451,11 +606,14 @@ void rt_conformal_invalidate(rt_conformal_t *e,
 	e->last_runtime_ns = 0;
 	e->ring_head = 0;
 	e->ring_count = 0;
-	e->samples_since_recalc = 0;
 	e->cached_score_quantile = 0.0;
 	e->quantile_valid = false;
 	memset(e->score_ring, 0, sizeof(double) * e->cfg.window);
 	memset(e->runtime_ring, 0, sizeof(uint64_t) * e->cfg.window);
+	e->lower.size = 0;
+	e->upper.size = 0;
+	for (i = 0; i < e->cfg.window; i++)
+		e->heap_loc[i] = HEAP_LOC_SENTINEL;
 	e->alpha_eff = e->cfg.alpha_target;
 }
 
@@ -660,13 +818,7 @@ bool rt_conformal_observe(rt_conformal_t *e, uint64_t runtime_ns)
 	if (!isfinite(e->last_prediction_ns))
 		e->last_prediction_ns = 0.0;
 
-	e->samples_since_recalc++;
-	if (e->samples_since_recalc >= e->cfg.recalc_period) {
-		e->cached_score_quantile = compute_score_quantile(e);
-		e->samples_since_recalc = 0;
-		e->quantile_valid = true;
-		triggered_recalc = true;
-	}
+	triggered_recalc = true;
 
 	recompute_state(e);
 
