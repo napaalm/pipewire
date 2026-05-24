@@ -57,40 +57,62 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	 * Tuning rationale (recent calibration against polyphonic synth
 	 * + filter-chain workloads):
 	 *
-	 * - alpha_target 1e-3 (was 1e-4): target the 99.9 % one-sided
-	 *   quantile. The previous 1e-4 calibration aimed at a tighter
-	 *   tail, but the finite-sample conformal index
+	 * - alpha_target 5e-4 (was 1e-3): target the 99.95 % one-sided
+	 *   quantile. The previous 1e-3 calibration aimed at the 99.9 %
+	 *   tail but in practice alpha_eff drifted up to alpha_max
+	 *   between bursts and the operating point ended up at the
+	 *   loosest allowed quantile rather than the intended one;
+	 *   tightening alpha_target moves the steady-state operating
+	 *   point deeper into the tail by design, which gives
+	 *   high-variance followers the extra margin they need to keep
+	 *   the kernel-side overrun rate below the target rate they were
+	 *   supposed to honour. The finite-sample conformal index
 	 *
 	 *       k = ceil((window + 1) * (1 - alpha_eff))
 	 *
-	 *   clamps to `window` whenever (window + 1) * alpha < 1: with
-	 *   the default window 4096 every alpha below ~2.44e-4 reduces
-	 *   to "quantile == max score in the ring", so a single
-	 *   contaminating sample (a plugin first-touch slipping past the
-	 *   warm-up window, a kernel preemption charged to the
-	 *   follower's CPU-time counter) dominated the published budget
-	 *   for the full lifetime of the ring -- the live trace at
-	 *   /tmp/coppwr-deadline-conformal.jsonl shows this directly,
-	 *   with one bad sample driving last_prediction_ns up to
-	 *   ~period for thousands of cycles. At alpha 1e-3 the rank
-	 *   sits about three below the max, so two or three extreme
-	 *   samples must coexist in the ring before the quantile
-	 *   follows them, which is the actual definition of a
-	 *   sustained-spike regime.
+	 *   clamps to `window` whenever (window + 1) * alpha < 1, so
+	 *   alpha must stay above 1 / (window + 1); with window 4096
+	 *   every alpha at or above ~2.44e-4 places the rank strictly
+	 *   below the maximum of the ring, which is what the
+	 *   sustained-spike regime requires (two or three extreme
+	 *   samples must coexist for the quantile to follow them).
 	 *
-	 * - alpha_min 5e-4 (was 1e-5): kept above 1/(window + 1) for
-	 *   the default window so the adaptive descent on overruns can
-	 *   still drop alpha_eff toward a tighter quantile without
-	 *   ever collapsing back to "quantile == max" behaviour. With
-	 *   window 4096 the floor 5e-4 leaves the rank two below the
-	 *   max even at the bottom of the alpha range.
+	 * - alpha_min 1e-4 (was 1e-5): below alpha_target so the
+	 *   adaptive descent on a burst tightens the quantile further
+	 *   than the steady-state aim, briefly placing the empirical
+	 *   rank at the maximum of the score ring (most conservative
+	 *   the estimator can publish) until the up-drift returns
+	 *   alpha_eff to alpha_target over a few hundred samples. This
+	 *   is what gives an actual burst extra margin without making
+	 *   the steady-state operating point any tighter. The
+	 *   sigma_floor_ns bound below keeps the "max-of-ring"
+	 *   excursion bounded: the per-sample score is capped at
+	 *   roughly 2 * period / sigma_floor (about 270 at the
+	 *   small-quantum case, a few thousand at the default), so the
+	 *   transient over-shoot stays within the C-side period_ns
+	 *   clamp at the read site.
 	 *
-	 * - alpha_max 5e-3 (was 5e-2): adaptive_conformal must not
-	 *   relax above the 99.5 % quantile during the quiet intervals
-	 *   between bursts. The previous 5e-2 ceiling let alpha_eff
-	 *   drift into the 95 % regime, which dropped the published
-	 *   budget below the peak score in the ring and made the next
-	 *   burst overrun the reservation.
+	 * - alpha_max 1e-3 (was 5e-3): only twice the target, not ten
+	 *   times. The previous 5e-3 ceiling let alpha_eff drift up to
+	 *   the 99.5 % quantile in quiet stretches, which produced two
+	 *   bad symptoms simultaneously: the operating point sat 5x
+	 *   looser than the alpha_target promise, and the budget could
+	 *   swing by an order of magnitude between a burst (alpha at
+	 *   alpha_min) and a quiet stretch (alpha at alpha_max). The
+	 *   new ceiling caps the steady-state relaxation at 99.9 %
+	 *   quantile, keeps the alpha_eff range to 2x rather than 10x,
+	 *   and removes most of the cycle-to-cycle variance in the
+	 *   published budget.
+	 *
+	 * - eta 0.002 (was 0.005): slower adaptation so a single
+	 *   overrun moves alpha_eff by 0.002 instead of 0.005, and the
+	 *   recovery from alpha_min back toward alpha_max takes longer
+	 *   too. Combined with the narrower alpha range above, this is
+	 *   the smoothing knob: the predictor's response to a single
+	 *   sample is gentler, the steady-state budget varies less, and
+	 *   reactivity is still adequate (one burst still tightens the
+	 *   quantile within a few hundred milliseconds at the common
+	 *   graph periods).
 	 *
 	 * - window 4096 (was 1024): at the common 42 ms graph period
 	 *   the score ring now retains observed peaks for ~170 s
@@ -168,10 +190,10 @@ void rt_conformal_config_defaults(struct rt_conformal_config *cfg)
 	 *   a third without measurably inflating the steady-state
 	 *   budget overhead.
 	 */
-	cfg->alpha_target          = 1e-3;
-	cfg->alpha_min             = 5e-4;
-	cfg->alpha_max             = 5e-3;
-	cfg->eta                   = 0.005;
+	cfg->alpha_target          = 5e-4;
+	cfg->alpha_min             = 1e-4;
+	cfg->alpha_max             = 1e-3;
+	cfg->eta                   = 0.002;
 	cfg->ewma_location_lambda  = 0.01;
 	cfg->ewma_scale_lambda     = 0.01;
 	cfg->window                = 4096;
