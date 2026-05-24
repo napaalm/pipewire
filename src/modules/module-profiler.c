@@ -116,6 +116,9 @@ struct node {
 
 	uint64_t last_profile_time;
 
+	uint32_t xrun_count;
+	uint32_t full_count;
+
 	unsigned enabled:1;
 };
 
@@ -163,6 +166,14 @@ static void do_flush_event(void *data, uint64_t count)
 	spa_list_for_each(n, &impl->node_list, link) {
 		int32_t avail;
 		uint32_t idx;
+		uint32_t xruns, fulls;
+
+		xruns = SPA_ATOMIC_XCHG(n->xrun_count, 0);
+		fulls = SPA_ATOMIC_XCHG(n->full_count, 0);
+		if (xruns > 0)
+			pw_log_warn("%p: queue xrun (%u dropped)", impl, xruns);
+		if (fulls > 0)
+			pw_log_warn("%p: queue full (%u dropped)", impl, fulls);
 
 		avail = spa_ringbuffer_get_read_index(&n->buffer, &idx);
 
@@ -343,12 +354,12 @@ static void context_do_profile(void *data)
 
 	filled = spa_ringbuffer_get_write_index(&n->buffer, &idx);
 	if (filled < 0 || filled > DATA_BUFFER) {
-		pw_log_warn("%p: queue xrun %d", impl, filled);
+		SPA_ATOMIC_INC(n->xrun_count);
 		goto done;
 	}
 	avail = DATA_BUFFER - filled;
 	if (avail < b.state.offset) {
-		pw_log_warn("%p: queue full %d < %d", impl, avail, b.state.offset);
+		SPA_ATOMIC_INC(n->full_count);
 		goto done;
 	}
 	spa_ringbuffer_write_data(&n->buffer,
