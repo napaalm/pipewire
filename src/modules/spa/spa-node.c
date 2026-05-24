@@ -178,24 +178,84 @@ struct pw_impl_node *pw_spa_node_load(struct pw_context *context,
 	pw_context_conf_section_match_rules(context, "node.rules",
 			&properties->dict, execute_match, &match);
 
-	loop =  pw_context_acquire_loop(context, &properties->dict);
+	/* Acquire the loop the node will actually run on.  This must be
+	 * the same loop we pass to the SPA handle as DataLoop support,
+	 * because the SPA plugin (ALSA, AVB, Bluetooth, audiotestsrc, ...)
+	 * registers its own timer/hardware fd sources on that loop.  If
+	 * the node's eventfd ends up on a different loop, process_node
+	 * becomes reachable from two threads -- a data race that deadlocks
+	 * the daemon.
+	 *
+	 * pw_context_acquire_node_loop returns a dynamic-pool loop when
+	 * context.dynamic-data-loops is active, or a static-pool loop
+	 * otherwise.  We stamp a private co-location group so that the
+	 * second acquire inside pw_context_create_node finds the SAME loop
+	 * instance (ref++) rather than creating another one. */
+	if (pw_properties_get(properties, PW_KEY_NODE_LOOP_GROUP) == NULL) {
+		char group_buf[48];
+		snprintf(group_buf, sizeof(group_buf), "_spa_node.%p",
+				(void *)properties);
+		pw_properties_set(properties, PW_KEY_NODE_LOOP_GROUP,
+				group_buf);
+	}
+
+	loop = pw_context_acquire_node_loop(context, properties, false);
 	if (loop == NULL) {
 		res = -errno;
 		goto error_exit;
 	}
 
 	pw_properties_set(properties, PW_KEY_NODE_LOOP_NAME, loop->name);
-	pw_context_release_loop(context, loop);
 
-	handle = pw_context_load_spa_handle(context, factory_name, &properties->dict);
+	{
+		const char *lib;
+		const struct spa_support *base_support;
+		struct spa_support support[18];
+		uint32_t n_support;
+
+		lib = pw_context_find_spa_lib(context, factory_name);
+		if (lib == NULL)
+			lib = spa_dict_lookup(&properties->dict,
+					SPA_KEY_LIBRARY_NAME);
+		if (lib == NULL) {
+			pw_context_release_node_loop(context, loop);
+			res = -ENOENT;
+			pw_log_warn("no library for %s: %m", factory_name);
+			goto error_exit;
+		}
+
+		base_support = pw_context_get_support(context, &n_support);
+		if (n_support > 18)
+			n_support = 18;
+		memcpy(support, base_support, n_support * sizeof(*support));
+
+		/* pw_context_get_support appends DataSystem + DataLoop
+		 * from the static pool as the last two entries.  Replace
+		 * them with the node's actual loop so the SPA plugin's
+		 * sources land on the same thread as the node's eventfd. */
+		if (n_support >= 2) {
+			support[n_support - 2] = SPA_SUPPORT_INIT(
+					SPA_TYPE_INTERFACE_DataSystem,
+					loop->system);
+			support[n_support - 1] = SPA_SUPPORT_INIT(
+					SPA_TYPE_INTERFACE_DataLoop,
+					loop->loop);
+		}
+
+		handle = pw_load_spa_handle(lib, factory_name,
+				&properties->dict, n_support, support);
+	}
 	if (handle == NULL) {
+		pw_context_release_node_loop(context, loop);
 		res = -errno;
 		goto error_exit;
 	}
 
 	if ((res = spa_handle_get_interface(handle, SPA_TYPE_INTERFACE_Node, &iface)) < 0) {
 		pw_log_error("can't get node interface %d", res);
-		goto error_exit_unload;
+		pw_unload_spa_handle(handle);
+		pw_context_release_node_loop(context, loop);
+		goto error_exit;
 	}
 	if (SPA_RESULT_IS_ASYNC(res))
 		flags |= PW_SPA_NODE_FLAG_ASYNC;
@@ -206,14 +266,19 @@ struct pw_impl_node *pw_spa_node_load(struct pw_context *context,
 			       spa_node, handle, spa_steal_ptr(properties), user_data_size);
 	if (this == NULL) {
 		res = -errno;
-		goto error_exit_unload;
+		pw_unload_spa_handle(handle);
+		pw_context_release_node_loop(context, loop);
+		goto error_exit;
 	}
+
+	/* pw_context_create_node acquired the same loop via the group we
+	 * stamped (ref++).  Drop our ref -- the node owns it now. */
+	pw_context_release_node_loop(context, loop);
 	return this;
 
-error_exit_unload:
-	pw_unload_spa_handle(handle);
 error_exit:
 	pw_properties_free(properties);
 	errno = -res;
 	return NULL;
+
 }
