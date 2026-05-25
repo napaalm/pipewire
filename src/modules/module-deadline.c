@@ -1327,7 +1327,7 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		if (anchor != NULL && anchor->last_applied &&
 				anchor->last_runtime == g->sum_runtime &&
 				anchor->last_deadline == kernel_deadline &&
-				anchor->last_period == g->period &&
+				anchor->last_period == kernel_deadline &&
 				anchor->last_cpu == g->cpu) {
 			impl->sched_calls_skipped++;
 			continue;
@@ -1369,8 +1369,34 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			}
 		}
 
+		/* Pass deadline as the kernel period so the task is
+		 * implicit-deadline (dl_deadline == dl_period) from the
+		 * CBS perspective.  Constrained-deadline tasks (D < P)
+		 * are systematically throttled by dl_check_constrained_dl
+		 * on every wakeup where the absolute deadline expired
+		 * before the CBS period boundary — which, for an
+		 * event-driven audio node that sleeps for nearly one
+		 * graph period while its CBS deadline expires after a
+		 * few hundred microseconds, is most cycles (any cycle
+		 * where ALSA-timer jitter puts the wakeup a few
+		 * nanoseconds before dl_next_period).  The throttle arms
+		 * an hrtimer that fires at dl_next_period; the resulting
+		 * 200–800 us delay is the gap between the ALSA wakeup
+		 * and the CBS period boundary.
+		 *
+		 * With period == deadline the kernel's dl_is_implicit()
+		 * returns true, the constrained check is skipped, and
+		 * the normal CBS wakeup rule applies: the task receives
+		 * a fresh budget and an absolute deadline of now +
+		 * dl_deadline on every wakeup.  The split deadline still
+		 * governs EDF priority (shorter deadline → earlier
+		 * absolute deadline → higher priority), so the
+		 * processing-chain order the DAG analysis computed is
+		 * preserved.  The actual graph period is enforced by the
+		 * event-driven signaling topology, not by the kernel
+		 * CBS. */
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
-				kernel_deadline, g->period,
+				kernel_deadline, kernel_deadline,
 				impl->sched_reclaim);
 		/* If the deadline syscall already reports the TID is gone
 		 * (ESRCH), don't bother with the affinity syscall on the
@@ -1387,7 +1413,7 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		if (rc_sched == 0 && rc_aff == 0) {
 			anchor->last_runtime  = g->sum_runtime;
 			anchor->last_deadline = kernel_deadline;
-			anchor->last_period   = g->period;
+			anchor->last_period   = kernel_deadline;
 			anchor->last_cpu      = g->cpu;
 			anchor->last_applied  = true;
 		} else if (rc_sched == -ESRCH || rc_aff == -ESRCH) {
