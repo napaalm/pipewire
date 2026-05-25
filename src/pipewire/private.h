@@ -681,6 +681,14 @@ struct pw_node_activation {
 	uint64_t awake_cycles;
 	uint64_t finish_cycles;
 	uint64_t prev_run_cycles;
+
+	/* Set by node_ready at entry on driving nodes only.  Used by
+	 * process_node when this->driving so awake_cputime/awake_cycles
+	 * span the whole period from node_ready entry instead of from
+	 * the eventfd-triggered re-entry.  Zero on non-driving nodes. */
+	uint64_t driver_start_time;
+	uint64_t driver_start_cputime;
+	uint64_t driver_start_cycles;
 };
 
 static inline uint64_t get_time_ns(struct spa_system *system)

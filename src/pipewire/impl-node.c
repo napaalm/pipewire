@@ -1645,12 +1645,21 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 	was_awake = SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_AWAKE,
 				PW_NODE_ACTIVATION_FINISHED);
-	a->awake_time = awake_nsec;
-	a->awake_cputime = awake_cpu_nsec;
-	a->finish_time = nsec;
+	if (this->driving && a->driver_start_cputime != 0) {
+		a->awake_time    = a->driver_start_time;
+		a->awake_cputime = a->driver_start_cputime;
+	} else {
+		a->awake_time    = awake_nsec;
+		a->awake_cputime = awake_cpu_nsec;
+	}
+	a->finish_time    = nsec;
 	a->finish_cputime = cpu_nsec;
+
 	if (!this->remote) {
-		a->awake_cycles = awake_cycles_local;
+		if (this->driving && a->driver_start_cycles != 0)
+			a->awake_cycles = a->driver_start_cycles;
+		else
+			a->awake_cycles = awake_cycles_local;
 		a->finish_cycles = finish_cycles_local;
 	}
 
@@ -2617,6 +2626,25 @@ static int node_ready(void *data, int status)
 
 	nsec = get_time_ns(data_system);
 	cpu_nsec = get_cputime_ns(data_system);
+
+	a->driver_start_time    = nsec;
+	a->driver_start_cputime = cpu_nsec;
+
+	if (!node->remote) {
+		int cur_tid = (int)gettid();
+		if (SPA_UNLIKELY(node->cycle_fd < 0 ||
+				 node->cycle_tid != cur_tid)) {
+			if (node->cycle_fd >= 0)
+				close(node->cycle_fd);
+			node->cycle_fd = pw_cycle_counter_open();
+			node->cycle_tid = cur_tid;
+			if (node->cycle_fd < 0)
+				node->cycle_fd = -2;
+		}
+		a->driver_start_cycles = pw_cycle_counter_read(node->cycle_fd);
+	} else {
+		a->driver_start_cycles = 0;
+	}
 
 	while (true) {
 		old_status = SPA_ATOMIC_LOAD(a->status);
