@@ -4111,6 +4111,386 @@ PWTEST(driver_only_node)
 	return PWTEST_PASS;
 }
 
+/* --- Timing-root (driver deadline splitting) tests --- */
+
+/* Playback chain: A -> driver (sink, timing root).
+ * The timing root's cumulative deadline is its own proportional
+ * slice, not stacked after A. local == cumulative (treated as
+ * source in the deadline model). */
+PWTEST(timing_root_sink_chain_cumulative_is_own_slice)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 300, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+
+	/* Timing root: local == cumulative (no predecessor in the
+	 * execution model). */
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	/* The proportional slice is wcet-proportional on the critical
+	 * path. Critical path WCET = 100 + 300 = 400. Driver share =
+	 * 1000 * 300/400 = 750. */
+	uint64_t expected_driver_slice = (uint64_t)((double)1000 * 300.0 / 400.0);
+	pwtest_int_eq((int)d->cumulative_deadline, (int)expected_driver_slice);
+
+	/* Follower A is still a DAG source: its local == cumulative.
+	 * A's cumulative must be stacked after the timing root's
+	 * (or standalone if A is an independent source). Since A→D
+	 * and A has no incoming edges, A remains a DAG source.
+	 * A.cumulative should be A's own proportional slice. */
+	pwtest_bool_true(a->cumulative_deadline > 0);
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Playback chain: A -> B -> driver (sink, timing root).
+ * The driver's proportional slice uses the full critical path
+ * as denominator. */
+PWTEST(timing_root_sink_long_chain)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 50, 1002), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 100, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+
+	/* Critical path = 50+50+100 = 200. Driver slice = 1000*100/200 = 500. */
+	uint64_t expected_driver = (uint64_t)((double)1000 * 100.0 / 200.0);
+	pwtest_int_eq((int)d->cumulative_deadline, (int)expected_driver);
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+
+	/* A and B are sources/interior in the DAG; their cumulative
+	 * deadlines must be positive and their locals strictly
+	 * positive. */
+	pwtest_bool_true(a->cumulative_deadline > 0);
+	pwtest_bool_true(b->cumulative_deadline > a->cumulative_deadline);
+	pwtest_bool_true(a->local_deadline > 0);
+	pwtest_bool_true(b->local_deadline > 0);
+
+	/* All cumulative deadlines within the period. */
+	pwtest_bool_true(a->cumulative_deadline <= 1000);
+	pwtest_bool_true(b->cumulative_deadline <= 1000);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Capture chain: driver (source, timing root) -> A.
+ * The timing root is already a DAG source, so the flag is a
+ * no-op: cumulative/local should be identical with and without
+ * the flag. */
+PWTEST(timing_root_source_capture_is_noop)
+{
+	const uint32_t driver_id = 10000;
+
+	/* Run without timing root flag. */
+	dag_t *g1 = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g1);
+	pwtest_int_eq(add_real_node(g1, driver_id, 150, 9999), 0);
+	pwtest_int_eq(add_real_node(g1, 1, 250, 1001), 0);
+	pwtest_int_eq(dag_add_edge(g1, driver_id, 1), 0);
+	pwtest_int_eq(dag_recalculate(g1), 0);
+	dag_node_t *d1 = find_node_by_id(g1, driver_id);
+	dag_node_t *a1 = find_node_by_id(g1, 1);
+	uint64_t d1_cum = d1->cumulative_deadline;
+	uint64_t d1_loc = d1->local_deadline;
+	uint64_t a1_cum = a1->cumulative_deadline;
+	uint64_t a1_loc = a1->local_deadline;
+
+	/* Run with timing root flag. */
+	dag_t *g2 = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g2);
+	pwtest_int_eq(add_real_node(g2, driver_id, 150, 9999), 0);
+	pwtest_int_eq(add_real_node(g2, 1, 250, 1001), 0);
+	pwtest_int_eq(dag_add_edge(g2, driver_id, 1), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g2, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g2), 0);
+	dag_node_t *d2 = find_node_by_id(g2, driver_id);
+	dag_node_t *a2 = find_node_by_id(g2, 1);
+
+	pwtest_int_eq((int)d1_cum, (int)d2->cumulative_deadline);
+	pwtest_int_eq((int)d1_loc, (int)d2->local_deadline);
+	pwtest_int_eq((int)a1_cum, (int)a2->cumulative_deadline);
+	pwtest_int_eq((int)a1_loc, (int)a2->local_deadline);
+
+	dag_destroy(g1);
+	dag_destroy(g2);
+	return PWTEST_PASS;
+}
+
+/* Fan-in: A -> driver, B -> driver (timing root as sink).
+ * The timing root's cumulative must be strictly positive and its
+ * local == cumulative. Predecessors' cumulative may exceed the
+ * timing root's (cross-cycle edges are not monotonic). */
+PWTEST(timing_root_fan_in_sink)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 200, 1002), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 50, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *a = find_node_by_id(g, 1);
+	dag_node_t *b = find_node_by_id(g, 2);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+
+	/* A and B are DAG sources: local == cumulative. */
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+	pwtest_int_eq((int)b->local_deadline, (int)b->cumulative_deadline);
+
+	/* All must be strictly positive and within the period. */
+	pwtest_bool_true(a->local_deadline > 0);
+	pwtest_bool_true(b->local_deadline > 0);
+	pwtest_bool_true(d->local_deadline > 0);
+	pwtest_bool_true(a->cumulative_deadline <= 1000);
+	pwtest_bool_true(b->cumulative_deadline <= 1000);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	/* Small-WCET timing root gets a small deadline slice. */
+	pwtest_bool_true(d->local_deadline < b->local_deadline);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Timing root as the only node in the DAG. */
+PWTEST(timing_root_only_node)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, driver_id, 400, 9999), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Setting a second timing root clears the first. */
+PWTEST(timing_root_at_most_one)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, 1, true), 0);
+
+	dag_node_t *n1 = find_node_by_id(g, 1);
+	dag_node_t *n2 = find_node_by_id(g, 2);
+	pwtest_bool_true(n1->is_timing_root);
+	pwtest_bool_false(n2->is_timing_root);
+
+	pwtest_int_eq(dag_set_node_timing_root(g, 2, true), 0);
+	pwtest_bool_false(n1->is_timing_root);
+	pwtest_bool_true(n2->is_timing_root);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Clearing the timing root flag restores normal DAG-sink behavior. */
+PWTEST(timing_root_clear_restores_normal)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 300, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+
+	/* With timing root. */
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	uint64_t tr_cum = d->cumulative_deadline;
+
+	/* Clear and recalculate. */
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, false), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	dag_node_t *a = find_node_by_id(g, 1);
+	d = find_node_by_id(g, driver_id);
+
+	/* Without timing root, D is a normal sink: cumulative > A's. */
+	pwtest_bool_true(d->cumulative_deadline > a->cumulative_deadline);
+	/* The cumulative should differ from the timing-root case. */
+	pwtest_bool_true(d->cumulative_deadline != tr_cum);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* dag_set_node_timing_root rejects unknown ids and null dags. */
+PWTEST(timing_root_invalid_inputs)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+
+	pwtest_int_eq(dag_set_node_timing_root(g, 999, true), -1);
+	pwtest_int_eq(errno, ENOENT);
+
+	pwtest_int_eq(dag_set_node_timing_root(NULL, 1, true), -1);
+	pwtest_int_eq(errno, EINVAL);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Timing root combined with co-location groups: the timing root
+ * can be part of a co-location group without conflict. */
+PWTEST(timing_root_with_group)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(add_real_node(g, 2, 100, 1001), 0); /* same tid as 1 */
+	pwtest_int_eq(add_real_node(g, driver_id, 200, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_set_node_group(g, 1, 1), 0);
+	pwtest_int_eq(dag_set_node_group(g, 2, 1), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	dag_node_t *n1 = find_node_by_id(g, 1);
+	dag_node_t *n2 = find_node_by_id(g, 2);
+
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	/* Co-located nodes on the same CPU. */
+	pwtest_int_eq((int)n1->cpu, (int)n2->cpu);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Same-value set is a no-op for the dirty flag. */
+PWTEST(timing_root_same_value_noop)
+{
+	dag_t *g = dag_create(1000, 1000, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 100, 1001), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, 1, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	pwtest_bool_false(g->dirty);
+
+	/* Setting the same value should not mark dirty. */
+	pwtest_int_eq(dag_set_node_timing_root(g, 1, true), 0);
+	pwtest_bool_false(g->dirty);
+
+	/* Changing the value should mark dirty. */
+	pwtest_int_eq(dag_set_node_timing_root(g, 1, false), 0);
+	pwtest_bool_true(g->dirty);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Soft redistribute with timing root: the redistribution should
+ * handle the timing root without crashing, and the timing root
+ * should have local == cumulative in the redistributed schedule. */
+PWTEST(timing_root_soft_redistribute)
+{
+	const uint32_t driver_id = 10000;
+	/* Period 500 with total WCET 600 → infeasible, triggers soft. */
+	dag_t *g = dag_create(500, 500, 0.95f, 1, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 200, 1001), 0);
+	pwtest_int_eq(add_real_node(g, driver_id, 400, 9999), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+
+	/* dag_recalculate should fail (critical path 600 > deadline 500). */
+	int rc = dag_recalculate(g);
+	pwtest_int_eq(rc, -1);
+
+	/* Soft fallback. */
+	pwtest_int_eq(dag_recalculate_soft(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->local_deadline <= 500);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
+/* Playback diamond: A -> B, A -> C, B -> D, C -> D, where D is the
+ * timing root. Multiple paths converge on D; the timing root's
+ * cumulative is its own slice regardless of which predecessor path
+ * is heaviest. */
+PWTEST(timing_root_diamond_sink)
+{
+	const uint32_t driver_id = 10000;
+	dag_t *g = dag_create(1000, 1000, 0.95f, 2, NULL);
+	pwtest_ptr_notnull(g);
+	pwtest_int_eq(add_real_node(g, 1, 50, 1001), 0);  /* A */
+	pwtest_int_eq(add_real_node(g, 2, 100, 1002), 0); /* B */
+	pwtest_int_eq(add_real_node(g, 3, 150, 1003), 0); /* C */
+	pwtest_int_eq(add_real_node(g, driver_id, 100, 9999), 0); /* D */
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, driver_id), 0);
+	pwtest_int_eq(dag_add_edge(g, 3, driver_id), 0);
+	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
+
+	dag_node_t *d = find_node_by_id(g, driver_id);
+	dag_node_t *a = find_node_by_id(g, 1);
+
+	/* Timing root: local == cumulative. */
+	pwtest_int_eq((int)d->local_deadline, (int)d->cumulative_deadline);
+	pwtest_bool_true(d->cumulative_deadline > 0);
+
+	/* A is a source: local == cumulative. */
+	pwtest_int_eq((int)a->local_deadline, (int)a->cumulative_deadline);
+
+	/* All within the period. */
+	pwtest_bool_true(d->cumulative_deadline <= 1000);
+
+	dag_destroy(g);
+	return PWTEST_PASS;
+}
+
 PWTEST_SUITE(module_deadline_dag)
 {
 	pwtest_add(explicit_deadline_fields_populated_after_recalc, PWTEST_NOARG);
@@ -4248,6 +4628,19 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(driver_as_dag_sink_fan_in, PWTEST_NOARG);
 	pwtest_add(driver_as_dag_source_capture_chain, PWTEST_NOARG);
 	pwtest_add(driver_only_node, PWTEST_NOARG);
+
+	pwtest_add(timing_root_sink_chain_cumulative_is_own_slice, PWTEST_NOARG);
+	pwtest_add(timing_root_sink_long_chain, PWTEST_NOARG);
+	pwtest_add(timing_root_source_capture_is_noop, PWTEST_NOARG);
+	pwtest_add(timing_root_fan_in_sink, PWTEST_NOARG);
+	pwtest_add(timing_root_only_node, PWTEST_NOARG);
+	pwtest_add(timing_root_at_most_one, PWTEST_NOARG);
+	pwtest_add(timing_root_clear_restores_normal, PWTEST_NOARG);
+	pwtest_add(timing_root_invalid_inputs, PWTEST_NOARG);
+	pwtest_add(timing_root_with_group, PWTEST_NOARG);
+	pwtest_add(timing_root_same_value_noop, PWTEST_NOARG);
+	pwtest_add(timing_root_soft_redistribute, PWTEST_NOARG);
+	pwtest_add(timing_root_diamond_sink, PWTEST_NOARG);
 
 	return PWTEST_PASS;
 }
