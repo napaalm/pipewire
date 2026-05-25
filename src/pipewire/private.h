@@ -937,6 +937,7 @@ struct pw_impl_node {
 	 * finish; the delta is stamped into the activation's
 	 * prev_run_cycles. */
 	int cycle_fd;
+	int cycle_tid;
 
 	/* Per-node sliding-window WCET estimator used by the subgraph-
 	 * fusion cost model in context.c (Sarkar 1989 §5.3

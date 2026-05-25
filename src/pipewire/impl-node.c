@@ -1582,16 +1582,31 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 				PW_NODE_ACTIVATION_AWAKE))
 		return 0;
 
-	/* Lazy-init the per-thread perf cycle counter. process_node
-	 * always runs on the data-loop thread that owns this node, so
-	 * perf_event_open(pid=0) here binds the counter to the right
-	 * thread. -2 is the "do not retry" sentinel after a failed
-	 * open; we never raise it back to -1. */
-	if (SPA_UNLIKELY(this->cycle_fd == -1))
-		this->cycle_fd = pw_cycle_counter_open();
-	if (this->cycle_fd < 0)
-		this->cycle_fd = -2;
-	awake_cycles_local = pw_cycle_counter_read(this->cycle_fd);
+	/* Per-thread perf cycle counter. perf_event_open(pid=0) binds
+	 * to the calling thread, so the counter must be (re-)opened
+	 * whenever the executing thread changes (dynamic data-loop
+	 * migration). cycle_tid tracks which thread owns the current
+	 * fd; a mismatch triggers a reopen. -2 is the "do not retry"
+	 * sentinel after a failed open on a given thread.
+	 *
+	 * Skip for remote (server-side proxy) nodes: their
+	 * process_node merely relays the trigger to the real client
+	 * process, so the cycles measured here are relay overhead, not
+	 * audio work. The client's own process_node writes the
+	 * authoritative cycle counts into the shared activation. */
+	if (!this->remote) {
+		int cur_tid = (int)gettid();
+		if (SPA_UNLIKELY(this->cycle_fd < 0 ||
+				 this->cycle_tid != cur_tid)) {
+			if (this->cycle_fd >= 0)
+				close(this->cycle_fd);
+			this->cycle_fd = pw_cycle_counter_open();
+			this->cycle_tid = cur_tid;
+			if (this->cycle_fd < 0)
+				this->cycle_fd = -2;
+		}
+		awake_cycles_local = pw_cycle_counter_read(this->cycle_fd);
+	}
 
 	pw_log_trace_fp("%p: %s-%d process remote:%u exported:%u %"PRIu64" %"PRIu64,
 			this, this->name, this->info.id, this->remote, this->exported,
@@ -1625,7 +1640,8 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 
 	nsec = get_time_ns(data_system);
 	cpu_nsec = get_cputime_ns(data_system);
-	finish_cycles_local = pw_cycle_counter_read(this->cycle_fd);
+	if (!this->remote)
+		finish_cycles_local = pw_cycle_counter_read(this->cycle_fd);
 	was_awake = SPA_ATOMIC_CAS(a->status,
 				PW_NODE_ACTIVATION_AWAKE,
 				PW_NODE_ACTIVATION_FINISHED);
@@ -1633,12 +1649,10 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 	a->awake_cputime = awake_cpu_nsec;
 	a->finish_time = nsec;
 	a->finish_cputime = cpu_nsec;
-	/* Cycle counts: stamp the awake/finish pair so consumers can
-	 * derive a frequency-invariant WCET from finish_cycles -
-	 * awake_cycles. Both zero means the counter is disabled and
-	 * the consumer must fall back on prev_run_time. */
-	a->awake_cycles = awake_cycles_local;
-	a->finish_cycles = finish_cycles_local;
+	if (!this->remote) {
+		a->awake_cycles = awake_cycles_local;
+		a->finish_cycles = finish_cycles_local;
+	}
 
 	pw_log_trace_fp("%p: finished status:%d %"PRIu64" was_awake:%d",
 			this, status, nsec, was_awake);
@@ -1798,6 +1812,7 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 	this->name = strdup("node");
 	this->source.fd = -1;
 	this->cycle_fd = -1;        /* lazy-init in process_node */
+	this->cycle_tid = 0;
 
 	if (properties == NULL)
 		properties = pw_properties_new(NULL, NULL);
