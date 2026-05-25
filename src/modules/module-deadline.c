@@ -1394,9 +1394,18 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 		 * processing-chain order the DAG analysis computed is
 		 * preserved.  The actual graph period is enforced by the
 		 * event-driven signaling topology, not by the kernel
-		 * CBS. */
+		 * CBS.
+		 *
+		 * Linux ≥ 7.0 rejects sched_period below 100 µs
+		 * (EINVAL); clamp both sides of the implicit pair to
+		 * that floor.  For sub-100 µs nodes the EDF ordering
+		 * is lost, but all such nodes finish well within 100 µs
+		 * and the event-driven graph topology still sequences
+		 * them correctly. */
+		uint64_t kernel_period = kernel_deadline < 100000
+				? 100000 : kernel_deadline;
 		rc_sched = set_deadline_sched(g->tid, g->sum_runtime,
-				kernel_deadline, kernel_deadline,
+				kernel_period, kernel_period,
 				impl->sched_reclaim);
 		/* If the deadline syscall already reports the TID is gone
 		 * (ESRCH), don't bother with the affinity syscall on the
