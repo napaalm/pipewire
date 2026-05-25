@@ -1279,9 +1279,6 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 					(int)g->tid, g->sum_runtime,
 					kernel_deadline, g->period,
 					g->n_members, g->leader_id);
-			anchor = find_node_any_by_id(impl, g->leader_id);
-			if (anchor != NULL)
-				anchor->last_applied = false;
 			any_failure = true;
 			continue;
 		}
@@ -1405,7 +1402,6 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			 * snapshot will drop the dead follower. */
 			anchor->last_applied = false;
 		} else {
-			anchor->last_applied = false;
 			any_failure = true;
 		}
 	}

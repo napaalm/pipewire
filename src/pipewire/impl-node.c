@@ -2704,6 +2704,14 @@ retry_status:
 				ta->finish_cycles - ta->awake_cycles;
 		else
 			ta->prev_run_cycles = 0;
+		/* Propagate non-zero cycles to the node's own
+		 * activation so the profiler can always find them
+		 * via tn->rt.target.activation regardless of which
+		 * target entry it iterates. */
+		if (ta->prev_run_cycles != 0 && t->node != NULL &&
+		    t->node->rt.target.activation != ta)
+			t->node->rt.target.activation->prev_run_cycles =
+				ta->prev_run_cycles;
 	}
 
 	node->driver_start = nsec;
