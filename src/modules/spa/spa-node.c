@@ -25,6 +25,7 @@ struct impl {
 
 	struct spa_handle *handle;
 	struct spa_node *node;          /**< handle to SPA node */
+	struct pw_loop *spa_data_loop;
 
 	struct spa_hook node_listener;
 	int init_pending;
@@ -44,6 +45,12 @@ static void spa_node_free(void *data)
 	spa_hook_remove(&impl->node_listener);
 	if (impl->handle)
 		pw_unload_spa_handle(impl->handle);
+	if (impl->spa_data_loop) {
+		pw_context_release_node_loop(
+				pw_impl_node_get_context(node),
+				impl->spa_data_loop);
+		impl->spa_data_loop = NULL;
+	}
 }
 
 static void complete_init(struct impl *impl)
@@ -271,9 +278,10 @@ struct pw_impl_node *pw_spa_node_load(struct pw_context *context,
 		goto error_exit;
 	}
 
-	/* pw_context_create_node acquired the same loop via the group we
-	 * stamped (ref++).  Drop our ref -- the node owns it now. */
-	pw_context_release_node_loop(context, loop);
+	{
+		struct impl *impl = pw_impl_node_get_user_data(this);
+		impl->spa_data_loop = loop;
+	}
 	return this;
 
 error_exit:
