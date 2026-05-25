@@ -1667,6 +1667,7 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 		a->signal_time = this->driver_start;
 		calculate_stats(this, a);
 		pw_impl_node_rt_emit_complete(this);
+		a->finish_cputime = get_cputime_ns(data_system);
 	}
 
 	if (SPA_UNLIKELY(status & SPA_STATUS_DRAINED))
