@@ -56,6 +56,7 @@ struct node_data {
 	struct pw_impl_node *adapter;
 	struct pw_impl_node *follower;
 	struct spa_handle *handle;
+	struct pw_loop *follower_loop;
 	struct spa_hook adapter_listener;
 	struct pw_resource *resource;
 	struct pw_resource *bound_resource;
@@ -103,6 +104,11 @@ static void node_free(void *data)
 		pw_impl_node_destroy(nd->follower);
 	if (nd->handle)
 		pw_unload_spa_handle(nd->handle);
+	if (nd->follower_loop) {
+		pw_context_release_node_loop(nd->data->context,
+				nd->follower_loop);
+		nd->follower_loop = NULL;
+	}
 }
 
 static void node_initialized(void *data)
@@ -179,6 +185,7 @@ static void *create_object(void *_data,
 	struct node_data *nd;
 	bool linger, do_register;
 	struct spa_handle *handle = NULL;
+	struct pw_loop *follower_loop = NULL;
 	const struct pw_properties *p;
 
 	if (properties == NULL)
@@ -216,7 +223,7 @@ static void *create_object(void *_data,
 
 	if (spa_follower == NULL) {
 		void *iface;
-		const char *factory_name;
+		const char *factory_name, *lib;
 		struct match match;
 
 		factory_name = pw_properties_get(properties, SPA_KEY_FACTORY_NAME);
@@ -227,11 +234,64 @@ static void *create_object(void *_data,
 		pw_context_conf_section_match_rules(d->context, "node.rules",
 				&properties->dict, execute_match, &match);
 
-		handle = pw_context_load_spa_handle(d->context,
-				factory_name,
-				&properties->dict);
-		if (handle == NULL)
+		/* Acquire the data-loop the follower SPA node will
+		 * register its hardware/timer fds on.  Stamp a
+		 * co-location group so that the adapter SPA handle
+		 * (created later by pw_spa_node_load inside
+		 * pw_adapter_new) joins the same loop instead of
+		 * allocating another one. */
+		if (pw_properties_get(properties, PW_KEY_NODE_LOOP_GROUP) == NULL) {
+			char group_buf[48];
+			snprintf(group_buf, sizeof(group_buf),
+					"_spa_node.%p", (void *)properties);
+			pw_properties_set(properties, PW_KEY_NODE_LOOP_GROUP,
+					group_buf);
+		}
+		follower_loop = pw_context_acquire_node_loop(
+				d->context, properties, false);
+		if (follower_loop == NULL)
 			goto error_errno;
+
+		pw_properties_set(properties, PW_KEY_NODE_LOOP_NAME,
+				follower_loop->name);
+
+		lib = pw_context_find_spa_lib(d->context, factory_name);
+		if (lib == NULL)
+			lib = spa_dict_lookup(&properties->dict,
+					SPA_KEY_LIBRARY_NAME);
+		if (lib == NULL) {
+			res = -ENOENT;
+			pw_log_warn("no library for %s: %m", factory_name);
+			goto error_res;
+		}
+
+		{
+			const struct spa_support *base;
+			struct spa_support support[18];
+			uint32_t n_support;
+
+			base = pw_context_get_support(d->context, &n_support);
+			if (n_support > 18)
+				n_support = 18;
+			memcpy(support, base, n_support * sizeof(*support));
+
+			if (n_support >= 2) {
+				support[n_support - 2] = SPA_SUPPORT_INIT(
+					SPA_TYPE_INTERFACE_DataSystem,
+					follower_loop->system);
+				support[n_support - 1] = SPA_SUPPORT_INIT(
+					SPA_TYPE_INTERFACE_DataLoop,
+					follower_loop->loop);
+			}
+
+			handle = pw_load_spa_handle(lib, factory_name,
+					&properties->dict,
+					n_support, support);
+		}
+		if (handle == NULL) {
+			res = -errno;
+			goto error_res;
+		}
 
 		if ((res = spa_handle_get_interface(handle, SPA_TYPE_INTERFACE_Node, &iface)) < 0)
 			goto error_res;
@@ -261,6 +321,8 @@ static void *create_object(void *_data,
 	nd->adapter = adapter;
 	nd->follower = follower;
 	nd->handle = handle;
+	nd->follower_loop = follower_loop;
+	follower_loop = NULL;
 	nd->resource = resource;
 	nd->new_id = new_id;
 	nd->linger = linger;
@@ -293,6 +355,8 @@ error_cleanup:
 	pw_properties_free(properties);
 	if (handle)
 		pw_unload_spa_handle(handle);
+	if (follower_loop)
+		pw_context_release_node_loop(d->context, follower_loop);
 	errno = -res;
 	return NULL;
 }
