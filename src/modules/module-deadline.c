@@ -395,6 +395,8 @@ struct sample {
 	uint64_t runtime_ns;
 	uint64_t cycles;
 	uint64_t period_ns;
+	uint8_t  xrun;
+	uint8_t  _pad[7];
 };
 
 /* Topology snapshot for one driver. Populated only on the main loop
@@ -475,6 +477,8 @@ struct node {
 	 * a transient mis-observation just lets one extra sample
 	 * through. */
 	uint32_t warmup_samples_remaining;
+
+	uint32_t last_xrun_count;
 
 	/* Adaptive-conformal upper-runtime-budget estimator
 	 * (Romano, Patterson & Candes 2019; Gibbs & Candes 2021).
@@ -2035,7 +2039,8 @@ static inline uint8_t sample_cpu_to_mode_class(const struct impl *impl,
 static void apply_sample(struct impl *impl, struct node *n,
 		uint64_t runtime, uint64_t cycles,
 		uint32_t sample_cpu, uint64_t period,
-		uint32_t sample_rate_hz, uint32_t quantum_frames)
+		uint32_t sample_rate_hz, uint32_t quantum_frames,
+		bool xrun)
 {
 	if (n->period != period) {
 		if (n->conformal != NULL)
@@ -2178,29 +2183,26 @@ static void apply_sample(struct impl *impl, struct node *n,
 		}
 	}
 
-	/* Feed the conformal estimator the same sample. The observation
-	 * flow obeys the prequential discipline internally (score
-	 * computed against pre-observation EWMA state). */
-	if (runtime > 0 && n->conformal != NULL && sample_ref > 0.0)
-		(void)rt_conformal_observe(n->conformal, (uint64_t)sample_ref);
+	if (!xrun) {
+		if (runtime > 0 && n->conformal != NULL && sample_ref > 0.0)
+			(void)rt_conformal_observe(n->conformal,
+					(uint64_t)sample_ref);
 
-	/* Dual-write into the mode-keyed table. The mode key
-	 * partitions samples by (rate, quantum, core_class), so the
-	 * same value flows into a different per-mode estimator instance
-	 * than the legacy single one. This is what makes a node's
-	 * statistics survive a rate or quantum change without a reset,
-	 * and what gives the class-aware budget query (eventually
-	 * consumed by the heterogeneous worst-fit dispatch) a separate
-	 * window per LITTLE / BIG placement. */
-	if (runtime > 0 && n->conformal_table != NULL && sample_ref > 0.0) {
-		struct rt_conformal_mode_key key = {
-			.sample_rate_hz = sample_rate_hz,
-			.quantum_frames = quantum_frames,
-			.core_class     = sample_cpu_to_mode_class(impl,
-					sample_cpu),
-		};
-		(void)rt_conformal_table_observe(n->conformal_table, &key,
-				(uint64_t)sample_ref);
+		if (runtime > 0 && n->conformal_table != NULL &&
+		    sample_ref > 0.0) {
+			struct rt_conformal_mode_key key = {
+				.sample_rate_hz = sample_rate_hz,
+				.quantum_frames = quantum_frames,
+				.core_class     = sample_cpu_to_mode_class(
+						impl, sample_cpu),
+			};
+			(void)rt_conformal_table_observe(n->conformal_table,
+					&key, (uint64_t)sample_ref);
+		}
+	} else {
+		pw_log_debug("node %u: dropping xrun-tainted sample "
+				"(runtime=%" PRIu64 " ns) from conformal "
+				"observation", n->node_id, runtime);
 	}
 
 	/* Refresh the per-node WCET from the admission predicate. While
@@ -2504,7 +2506,7 @@ static void recalc_params_sync(struct node *drv)
 				SPA_ATOMIC_LOAD(na->prev_run_cycles),
 				n->last_applied ? n->last_cpu : SAMPLE_CPU_UNKNOWN,
 				period, node->target_rate.denom,
-				node->target_quantum);
+				node->target_quantum, false);
 
 		if (n_followers >= followers_cap) {
 			uint32_t new_cap = followers_cap * 2;
@@ -2611,7 +2613,8 @@ static void recalc_params_sync(struct node *drv)
 
 /* RT-context: push samples into drv's ring. Drops if full (worker is
  * lagging); the WCET sketch tail stats absorb the loss naturally. */
-static void rt_push_samples(struct node *drv, uint64_t period)
+static void rt_push_samples(struct node *drv, uint64_t period,
+		bool driver_incomplete)
 {
 	struct pw_impl_node *node = drv->node;
 	struct pw_node_target *t;
@@ -2675,6 +2678,14 @@ static void rt_push_samples(struct node *drv, uint64_t period)
 		s->runtime_ns = runtime;
 		s->cycles = SPA_ATOMIC_LOAD(t->activation->prev_run_cycles);
 		s->period_ns = period;
+
+		uint32_t xc = SPA_ATOMIC_LOAD(t->activation->xrun_count);
+		bool target_xrun = (n_lookup != NULL &&
+				xc != n_lookup->last_xrun_count);
+		if (n_lookup != NULL)
+			n_lookup->last_xrun_count = xc;
+		s->xrun = (uint8_t)(driver_incomplete || target_xrun);
+
 		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
 	}
 }
@@ -2741,7 +2752,8 @@ static void worker_drain_samples(struct impl *impl, struct node *drv)
 				quantum = drv->node->target_quantum;
 			}
 			apply_sample(impl, n, s->runtime_ns, s->cycles,
-					s->cpu, s->period_ns, rate_hz, quantum);
+					s->cpu, s->period_ns, rate_hz, quantum,
+					s->xrun);
 		}
 
 		processed += sizeof(struct sample);
@@ -4129,7 +4141,7 @@ static void worker_wake_func(void *data, uint64_t count SPA_UNUSED)
 /* RT-context dispatcher: measures CPU time and routes to sync or
  * async body. Kept short so async-mode hook never grows beyond a
  * ring write + an eventfd signal. */
-static void rt_hook(void *data)
+static void rt_hook_impl(void *data, bool driver_incomplete)
 {
 	struct node *drv = data;
 	struct pw_impl_node *node = drv->node;
@@ -4145,7 +4157,7 @@ static void rt_hook(void *data)
 	} else {
 		uint64_t period = SPA_NSEC_PER_SEC * node->target_quantum
 				  / node->target_rate.denom;
-		rt_push_samples(drv, period);
+		rt_push_samples(drv, period, driver_incomplete);
 		/* CAS 0->1 to coalesce many RT cycles into one worker
 		 * pass; only signal the eventfd on the 0->1 transition.
 		 * If the worker is already scheduled (CAS fails because
@@ -4163,10 +4175,13 @@ static void rt_hook(void *data)
 		hist_record(drv, t1 - t0);
 }
 
+static void rt_hook_complete(void *data)   { rt_hook_impl(data, false); }
+static void rt_hook_incomplete(void *data) { rt_hook_impl(data, true);  }
+
 static const struct pw_impl_node_rt_events node_rt_events = {
 	PW_VERSION_IMPL_NODE_RT_EVENTS,
-	.complete = rt_hook,
-	.incomplete = rt_hook,
+	.complete   = rt_hook_complete,
+	.incomplete = rt_hook_incomplete,
 };
 
 static void set_driver_hook_state(struct node *n, bool enabled)
