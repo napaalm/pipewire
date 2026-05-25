@@ -88,6 +88,14 @@ typedef struct {
 
 	uint64_t period;
 	uint64_t generation;
+
+	/* When driver.schedule is active, the id of the driver node
+	 * in the followers array. The reconcile layer marks this node
+	 * as the timing root of the scheduling DAG so the deadline-
+	 * splitting pass treats it as a source regardless of its
+	 * data-flow edges. 0 means "no timing root" (either
+	 * driver.schedule is off or the driver was not admitted). */
+	uint32_t timing_root_id;
 } reconcile_topo_t;
 
 /*

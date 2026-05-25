@@ -2594,6 +2594,16 @@ static void recalc_params_sync(struct node *drv)
 	rtopo.period = period;
 	rtopo.generation = drv->topo.generation;
 
+	rtopo.timing_root_id = 0;
+	if (impl->driver_schedule) {
+		for (uint32_t si = 0; si < n_followers; si++) {
+			if (followers[si].id == drv->node_id) {
+				rtopo.timing_root_id = drv->node_id;
+				break;
+			}
+		}
+	}
+
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);
 	apply_sched_groups(impl, drv);
@@ -4020,6 +4030,16 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 	rtopo.n_edges = admitted_edges;
 	rtopo.period = t->period;
 	rtopo.generation = SPA_ATOMIC_LOAD(t->generation);
+
+	rtopo.timing_root_id = 0;
+	if (impl->driver_schedule) {
+		for (i = 0; i < admitted_count; i++) {
+			if (followers[i].id == drv->node_id) {
+				rtopo.timing_root_id = drv->node_id;
+				break;
+			}
+		}
+	}
 
 	sched_groups_reset(&impl->sched_groups);
 	(void)reconcile_apply(drv->reconcile, &rtopo, sched_cb, impl);

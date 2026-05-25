@@ -404,6 +404,24 @@ static dag_t *build_dag_from_topo(reconcile_state_t *state,
 		return NULL;
 	}
 
+	if (topo->timing_root_id != 0) {
+		bool root_kept = false;
+		for (i = 0; i < n_kept; i++) {
+			if (kept_ids[i] == topo->timing_root_id) {
+				root_kept = true;
+				break;
+			}
+		}
+		if (root_kept) {
+			if (dag_set_node_timing_root(dag, topo->timing_root_id,
+							true) < 0) {
+				free(kept_ids);
+				dag_destroy(dag);
+				return NULL;
+			}
+		}
+	}
+
 	free(kept_ids);
 	return dag;
 }

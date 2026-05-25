@@ -105,6 +105,7 @@ struct dag_node {
 	uint32_t group_id;
 
 	bool fictitious;
+	bool is_timing_root;
 	uint64_t remaining_deadline;
 	uint64_t longest_len;
 	int longest_next;
@@ -313,6 +314,19 @@ int dag_set_node_wcet(dag_t *g, uint32_t id, uint64_t wcet);
  * the assignment actually changes, so calling this with the current
  * value is a no-op. */
 int dag_set_node_group(dag_t *g, uint32_t id, uint32_t group_id);
+
+/* Mark a node as the timing root of the DAG. The timing root is
+ * always activated first by hardware (the driver's ALSA interrupt),
+ * regardless of its position in the data-flow graph. The deadline-
+ * splitting, cumulative-deadline, and local-deadline passes treat
+ * the timing root as a source: its deadline slice is proportional
+ * to its WCET on the critical path, its cumulative deadline is its
+ * own slice (not stacked after predecessors), and its local deadline
+ * equals its cumulative deadline. At most one node per DAG may be
+ * the timing root; setting a second clears the first. Returns 0 on
+ * success, -1 with errno ENOENT (unknown id) or EINVAL (null dag).
+ * Marks dirty only when the flag actually changes. */
+int dag_set_node_timing_root(dag_t *g, uint32_t id, bool is_root);
 
 /* O(log N) lookup of a real or fictitious node by id. Returns
  * NULL if the id is not in the graph. The returned pointer is

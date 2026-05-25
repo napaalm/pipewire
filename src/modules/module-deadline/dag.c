@@ -453,6 +453,7 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->tid = tid;
 
 	n->fictitious = fictitious;
+	n->is_timing_root = false;
 	n->remaining_deadline = 0;
 	n->longest_len = 0;
 	n->longest_next = -1;
@@ -799,6 +800,35 @@ int dag_set_node_group(dag_t *g, uint32_t id, uint32_t group_id)
 	 * The cost of redoing the deadline split is negligible relative
 	 * to a fresh recomputation; the alternative (a finer-grained
 	 * "cpu-dirty" flag) would not pay back the bookkeeping. */
+	dag_mark_dirty(g);
+	return 0;
+}
+
+int dag_set_node_timing_root(dag_t *g, uint32_t id, bool is_root)
+{
+	if (!g) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	dag_node_t *n = find_node(g, id);
+	if (!n) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (n->is_timing_root == is_root)
+		return 0;
+
+	if (is_root) {
+		dag_node_t *cur;
+		spa_list_for_each(cur, &g->nodes, link) {
+			if (cur != n && cur->is_timing_root)
+				cur->is_timing_root = false;
+		}
+	}
+
+	n->is_timing_root = is_root;
 	dag_mark_dirty(g);
 	return 0;
 }
@@ -1998,6 +2028,36 @@ static int assign_deadlines_iterative(dag_t *g)
 	fictitious_sink->deadline_assigned = true;
 	fictitious_sink->remaining_deadline = 0;
 
+	/* Pre-assign the timing root's deadline slice proportionally
+	 * using the full critical-path WCET before the main loop runs.
+	 * The critical path WCET is fictitious_src->longest_len (the
+	 * longest weighted source-to-sink chain, populated by
+	 * dag_populate_longest_paths). The timing root's proportional
+	 * share is computed against that global denominator rather than
+	 * the sub-path the main loop would see (which is just
+	 * [root, fict_sink] when the root is a DAG sink). The
+	 * assign_or_tighten semantics in the main loop ensure the
+	 * pre-assignment is kept when the main loop's path-based
+	 * computation would produce a looser value. */
+	{
+		uint64_t critical_path_wcet = fictitious_src->longest_len;
+		for (uint32_t i = 0; i < g->indexed_count; i++) {
+			dag_node_t *n = g->indexed_nodes[i];
+			if (!n->is_timing_root || n->fictitious)
+				continue;
+			if (critical_path_wcet > 0) {
+				uint64_t root_wcet = node_runtime_value(g, n);
+				uint64_t slice = proportional_deadline(
+						g->deadline, root_wcet,
+						critical_path_wcet);
+				if (slice == 0)
+					slice = 1;
+				assign_or_tighten_deadline(n, slice);
+			}
+			break;
+		}
+	}
+
 	for (uint32_t i = 0; i < g->indexed_count; i++) {
 		dag_node_t *node = g->indexed_nodes[i];
 		uint64_t available_deadline = 0;
@@ -2008,6 +2068,8 @@ static int assign_deadlines_iterative(dag_t *g)
 		int path_nodes = 0;
 
 		if (node == fictitious_src) {
+			available_deadline = g->deadline;
+		} else if (node->is_timing_root) {
 			available_deadline = g->deadline;
 		} else {
 			spa_list_for_each(e, &node->incoming, dst_link) {
@@ -2027,6 +2089,14 @@ static int assign_deadlines_iterative(dag_t *g)
 		}
 
 		node->remaining_deadline = available_deadline;
+
+		if (node->is_timing_root && node->deadline_assigned) {
+			assigned_deadline = node->deadline;
+			node->remaining_deadline = available_deadline > assigned_deadline ?
+				available_deadline - assigned_deadline : 0;
+			continue;
+		}
+
 		path_len = compute_longest_path(g, node, fictitious_sink,
 				g->ws_path, &path_nodes);
 		if (path_nodes == 0 || (node != fictitious_sink && path_len == 0)) {
@@ -2575,6 +2645,11 @@ static void dag_assign_cumulative_deadlines(dag_t *g)
 			continue;
 		}
 
+		if (n->is_timing_root) {
+			n->cumulative_deadline = n->deadline;
+			continue;
+		}
+
 		spa_list_for_each(e, &n->incoming, dst_link) {
 			if (e->src->fictitious)
 				continue;
@@ -2603,6 +2678,11 @@ bool dag_compute_local_deadlines(dag_t *g)
 			continue;
 		}
 
+		if (n->is_timing_root) {
+			n->local_deadline = n->cumulative_deadline;
+			goto validate;
+		}
+
 		spa_list_for_each(e, &n->incoming, dst_link) {
 			if (e->src->fictitious)
 				continue;
@@ -2610,7 +2690,11 @@ bool dag_compute_local_deadlines(dag_t *g)
 			 * cumulative deadline must be <= this node's.
 			 * Failure means the analysis layer produced
 			 * inconsistent cumulative milestones, which would
-			 * also break the path-sum constraint. */
+			 * also break the path-sum constraint. Edges to
+			 * the timing root are cross-cycle dependencies
+			 * and are exempt (the timing root's cumulative
+			 * is its own slice, intentionally before its
+			 * DAG predecessors' milestones). */
 			if (e->src->cumulative_deadline > n->cumulative_deadline) {
 				pw_log_error("non-monotonic cumulative deadline "
 					     "along edge %u -> %u "
@@ -2633,6 +2717,7 @@ bool dag_compute_local_deadlines(dag_t *g)
 		} else {
 			n->local_deadline = n->cumulative_deadline - max_pred;
 		}
+validate:
 
 		/* Source nodes (no real predecessor) must publish a
 		 * strictly positive cumulative deadline: they're
@@ -2920,7 +3005,11 @@ bool dag_soft_redistribute_deadlines(dag_t *g,
 		return false;
 	}
 
-	/* Proportional cumulative deadline assignment. */
+	/* Proportional cumulative deadline assignment. The timing root
+	 * is treated as a source: its cumulative deadline is its own
+	 * WCET-proportional share of the global budget, placed at the
+	 * start of the period (i.e. frac = root.wcet / global_longest
+	 * instead of in_path[i] / global_longest). */
 	for (uint32_t i = 0; i < n; i++) {
 		dag_node_t *node = order[i];
 		double frac;
@@ -2930,7 +3019,11 @@ bool dag_soft_redistribute_deadlines(dag_t *g,
 			node->cumulative_deadline = 0;
 			continue;
 		}
-		frac = (double)in_path[i] / (double)global_longest;
+		if (node->is_timing_root) {
+			frac = (double)node->wcet / (double)global_longest;
+		} else {
+			frac = (double)in_path[i] / (double)global_longest;
+		}
 		if (frac <= 0.0)
 			frac = 0.0;
 		if (frac > 1.0)
@@ -2946,7 +3039,8 @@ bool dag_soft_redistribute_deadlines(dag_t *g,
 	 * walks g->indexed_nodes, which may not be built when the soft
 	 * heuristic runs after dag_recalculate has failed. Compute the
 	 * local deadline in place using the topological order we just
-	 * built. */
+	 * built. The timing root is treated as a source (local equals
+	 * cumulative). */
 	for (uint32_t i = 0; i < n; i++) {
 		dag_node_t *node = order[i];
 		uint64_t max_pred = 0;
@@ -2955,6 +3049,12 @@ bool dag_soft_redistribute_deadlines(dag_t *g,
 
 		if (node->fictitious) {
 			node->local_deadline = 0;
+			continue;
+		}
+		if (node->is_timing_root) {
+			node->local_deadline = node->cumulative_deadline;
+			if (node->local_deadline > g->period)
+				node->local_deadline = g->period;
 			continue;
 		}
 		spa_list_for_each(e, &node->incoming, dst_link) {
