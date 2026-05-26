@@ -2697,6 +2697,37 @@ static void rt_push_samples(struct node *drv, uint64_t period,
 		s->xrun = (uint8_t)(driver_incomplete || target_xrun);
 
 		spa_ringbuffer_write_update(&drv->ring, widx + sizeof(struct sample));
+
+		/* Pick up deferred xrun runtime.  When a node completes
+		 * after the driver has started the next cycle (xrun),
+		 * process_node / signal_sync deposit the real completed
+		 * runtime in xrun_run_time.  XCHG atomically reads and
+		 * clears so each deferred sample is consumed once.
+		 * Pushed as a non-xrun sample: the measurement is a
+		 * valid completed runtime and should feed the WCET
+		 * estimator. */
+		uint64_t deferred_rt =
+			SPA_ATOMIC_XCHG(t->activation->xrun_run_time, 0);
+		if (deferred_rt != 0 && deferred_rt <= UINT64_MAX / 2) {
+			uint32_t widx2;
+			int32_t filled2 = spa_ringbuffer_get_write_index(
+					&drv->ring, &widx2);
+			if (filled2 >= 0 &&
+					(uint32_t)filled2 < buf_size_bytes) {
+				uint32_t off2 = (widx2 % buf_size_bytes);
+				struct sample *s2 = (struct sample *)
+					((uint8_t *)drv->ring_slots + off2);
+				s2->node_id = tnode->info.id;
+				s2->cpu = s->cpu;
+				s2->runtime_ns = deferred_rt;
+				s2->cycles = SPA_ATOMIC_XCHG(
+					t->activation->xrun_run_cycles, 0);
+				s2->period_ns = period;
+				s2->xrun = 0;
+				spa_ringbuffer_write_update(&drv->ring,
+						widx2 + sizeof(struct sample));
+			}
+		}
 	}
 }
 

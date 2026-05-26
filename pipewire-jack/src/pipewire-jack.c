@@ -2182,22 +2182,37 @@ static inline void signal_sync(struct client *c)
 	uint64_t fin_cputime = get_cputime_ns_local(c->l->system);
 	uint64_t awake_cputime = activation->awake_cputime;
 	activation->finish_cputime = fin_cputime;
-	if (fin_cputime >= awake_cputime && awake_cputime != 0 && fin_cputime != 0)
-		SPA_ATOMIC_STORE(activation->prev_run_time, fin_cputime - awake_cputime);
 
-	/* Stamp the per-cycle CPU cycle count alongside the wall-clock
-	 * cputime. trigger_targets in impl-node copies awake/finish into
-	 * prev_run_cycles for daemon-driven nodes; JACK clients drive
-	 * their own activation, so we compute and store it here. Both
-	 * zero means the perf counter is disabled and consumers must
-	 * fall back on prev_run_time. */
+	/* Compute runtime delta at the completion point (no race with
+	 * the driver).  old_status == AWAKE means normal completion;
+	 * anything else means the driver already moved on (xrun) and
+	 * consumed stale prev_run fields -- deposit the real runtime
+	 * in the deferred xrun_run fields for later pickup. */
+	if (fin_cputime >= awake_cputime && awake_cputime != 0 && fin_cputime != 0) {
+		uint64_t run_time = fin_cputime - awake_cputime;
+		if (old_status == PW_NODE_ACTIVATION_AWAKE)
+			SPA_ATOMIC_STORE(activation->prev_run_time, run_time);
+		else
+			SPA_ATOMIC_STORE(activation->xrun_run_time, run_time);
+	}
+
+	/* Stamp the per-cycle CPU cycle count alongside the cputime.
+	 * JACK clients drive their own activation, so we compute and
+	 * store it here.  Both zero means the perf counter is disabled
+	 * and consumers must fall back on prev_run_time. */
 	uint64_t fin_cycles = pw_cycle_counter_read(c->rt.cycle_fd);
 	uint64_t awake_cycles = c->rt.awake_cycles;
 	activation->finish_cycles = fin_cycles;
-	if (fin_cycles >= awake_cycles && awake_cycles != 0 && fin_cycles != 0)
-		SPA_ATOMIC_STORE(activation->prev_run_cycles, fin_cycles - awake_cycles);
-	else
-		SPA_ATOMIC_STORE(activation->prev_run_cycles, 0);
+	if (fin_cycles >= awake_cycles && awake_cycles != 0 && fin_cycles != 0) {
+		uint64_t run_cycles = fin_cycles - awake_cycles;
+		if (old_status == PW_NODE_ACTIVATION_AWAKE)
+			SPA_ATOMIC_STORE(activation->prev_run_cycles, run_cycles);
+		else
+			SPA_ATOMIC_STORE(activation->xrun_run_cycles, run_cycles);
+	} else {
+		if (old_status == PW_NODE_ACTIVATION_AWAKE)
+			SPA_ATOMIC_STORE(activation->prev_run_cycles, 0);
+	}
 
 
 	if (c->async || old_status != PW_NODE_ACTIVATION_AWAKE)

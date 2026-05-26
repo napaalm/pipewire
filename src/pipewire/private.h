@@ -689,6 +689,16 @@ struct pw_node_activation {
 	uint64_t driver_start_time;
 	uint64_t driver_start_cputime;
 	uint64_t driver_start_cycles;
+
+	/* Deferred runtime from an xrun cycle.  When a node finishes
+	 * processing after the driver has already started the next
+	 * cycle (xrun), prev_run_time / prev_run_cycles cannot be
+	 * used because the driver read them from stale timing fields.
+	 * The completing node deposits its measured runtime here
+	 * instead; consumers pick it up via SPA_ATOMIC_XCHG on the
+	 * next sample-collection pass.  Zero means no pending sample. */
+	uint64_t xrun_run_time;
+	uint64_t xrun_run_cycles;
 };
 
 static inline uint64_t get_time_ns(struct spa_system *system)

@@ -1661,6 +1661,31 @@ static inline int process_node(void *data, uint64_t awake_nsec, uint64_t awake_c
 		else
 			a->awake_cycles = awake_cycles_local;
 		a->finish_cycles = finish_cycles_local;
+
+		/* Compute prev_run_time / prev_run_cycles at the point
+		 * where awake and finish stamps are authoritative (same
+		 * thread, no race with the driver).  Remote nodes have
+		 * their client compute this (signal_sync / pw-jack).
+		 *
+		 * was_awake == true  ⇒ normal completion.
+		 * was_awake == false ⇒ xrun: the driver already consumed
+		 *   stale prev_run fields, so deposit the real runtime
+		 *   in xrun_run_time/cycles for deferred pickup. */
+		uint64_t run_time = 0, run_cycles = 0;
+		if (a->finish_cputime >= a->awake_cputime &&
+				a->awake_cputime != 0 && a->finish_cputime != 0)
+			run_time = a->finish_cputime - a->awake_cputime;
+		if (a->finish_cycles != 0 && a->awake_cycles != 0 &&
+				a->finish_cycles >= a->awake_cycles)
+			run_cycles = a->finish_cycles - a->awake_cycles;
+
+		if (was_awake) {
+			SPA_ATOMIC_STORE(a->prev_run_time, run_time);
+			SPA_ATOMIC_STORE(a->prev_run_cycles, run_cycles);
+		} else {
+			SPA_ATOMIC_STORE(a->xrun_run_time, run_time);
+			SPA_ATOMIC_STORE(a->xrun_run_cycles, run_cycles);
+		}
 	}
 
 	pw_log_trace_fp("%p: finished status:%d %"PRIu64" was_awake:%d",
@@ -2735,20 +2760,10 @@ retry_status:
 		ta->prev_signal_time = ta->signal_time;
 		ta->prev_awake_time = ta->awake_time;
 		ta->prev_finish_time = ta->finish_time;
-		ta->prev_run_time = ta->finish_cputime - ta->awake_cputime;
-		/* Mirror the nanosecond's "previous-cycle" semantics for
-		 * cycles. finish_cycles == 0 means the executor did not
-		 * record cycle counts (perf disabled or unsupported); we
-		 * propagate 0 so the consumer can fall back. The cycle
-		 * counter is monotonic per-thread so finish > awake by
-		 * construction when both reads succeed. */
-		if (ta->finish_cycles != 0 && ta->awake_cycles != 0 &&
-				ta->finish_cycles >= ta->awake_cycles)
-			ta->prev_run_cycles =
-				ta->finish_cycles - ta->awake_cycles;
-		else
-			ta->prev_run_cycles = 0;
-		/* Propagate non-zero cycles to the node's own
+		/* prev_run_time and prev_run_cycles are now computed
+		 * at the completion point by the node itself (see
+		 * process_node for local nodes, signal_sync for JACK
+		 * clients).  Propagate cycles to the node's own
 		 * activation so the profiler can always find them
 		 * via tn->rt.target.activation regardless of which
 		 * target entry it iterates. */
