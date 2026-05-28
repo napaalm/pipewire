@@ -1147,16 +1147,13 @@ PWTEST(reconcile_g11_cb_receives_per_node_values_for_group)
 PWTEST(reconcile_g12_group_overcapacity_returns_failure_state)
 {
 	/* When a TID-grouped chain's summed density overflows the
-	 * configured cpus.utilization, the strict admission gate
-	 * refuses the placement (EAGAIN). Pre-soft-fallback this
-	 * left the callback uncalled and the operator with no
-	 * SCHED_DEADLINE applied anywhere. After the
-	 * dag_recalculate_soft fallback landed, EAGAIN triggers a
-	 * retry that drops admission and emits one callback per
-	 * follower with kernel-valid (runtime, deadline, period)
-	 * tuples and a SOFT_DEGRADED feasibility verdict. The
-	 * point of this test is now to pin that soft path:
-	 * over-capacity never silently drops the schedule. */
+	 * configured cpus.utilization, dag_recalculate still
+	 * produces a schedule (the feasibility gate has been
+	 * removed). The reconcile layer classifies the result as
+	 * SOFT_DEGRADED because the density exceeds the
+	 * admission ceiling, but every follower receives valid
+	 * (runtime, deadline, period) tuples. Over-capacity never
+	 * silently drops the schedule. */
 	struct topo5 t;
 	reconcile_state_t *s = reconcile_init(2, 0.55, NULL, 0.01, true);
 	struct cb_ctx cb = { 0 };
@@ -1176,7 +1173,7 @@ PWTEST(reconcile_g12_group_overcapacity_returns_failure_state)
 	/* Per-node density 0.30 each; summed on one CPU = 0.60 > 0.55. */
 	pwtest_int_eq(reconcile_apply(s, &rt, cb_record, &cb), 0);
 
-	/* Both grouped followers get emitted by the soft fallback. */
+	/* Both grouped followers receive a schedule. */
 	pwtest_int_eq((int)cb.calls, 2);
 	for (i = 0; i < cb.calls; i++) {
 		pwtest_bool_true(cb.last[i].runtime > 0);
@@ -1185,9 +1182,11 @@ PWTEST(reconcile_g12_group_overcapacity_returns_failure_state)
 		pwtest_bool_true(cb.last[i].period == rt.period);
 	}
 
-	/* Soft path forces the SOFT_DEGRADED verdict. */
+	/* The density (0.60) is below 1.0 so the EDF classifier accepts.
+	 * The admission_ceiling (0.55) is a diagnostic threshold only;
+	 * the schedule is kernel-feasible. */
 	reconcile_state_feasibility(s, &feas);
-	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
+	pwtest_int_eq(feas.mode, RECONCILE_MODE_HARD);
 
 	reconcile_fini(s);
 	return PWTEST_PASS;
@@ -1302,19 +1301,14 @@ PWTEST(reconcile_mode_density_overload_flips_soft)
 
 	pwtest_ptr_notnull(s);
 
-	/* On 1 CPU with admission_ceiling=1.0 the placer's density-
-	 * style admission test rejects all three chain followers'
-	 * combined density. The dispatcher catches the failure,
-	 * retries via dag_recalculate_soft (which drops the
-	 * admission gate), and the post-recalc classification still
-	 * sees density > 1 because three nodes share the only CPU,
-	 * so the verdict is SOFT_DEGRADED. The fallback override
-	 * stamps reason="soft_fallback" to record that the soft path
-	 * was used. */
+	/* On 1 CPU the critical path (240000) far exceeds the period
+	 * (100000), so every node's deadline slice is a small fraction
+	 * of the period. The per-CPU density exceeds 1 and the
+	 * classifier stamps SOFT_DEGRADED. */
 	(void)reconcile_apply(s, &rt, cb_record, &cb);
 	reconcile_state_feasibility(s, &feas);
 	pwtest_int_eq(feas.mode, RECONCILE_MODE_SOFT_DEGRADED);
-	pwtest_str_eq(feas.reason, "soft_fallback");
+	pwtest_str_eq(feas.reason, "edf_infeasible");
 	pwtest_int_eq((int)feas.consecutive_hard_passes, 0);
 
 	/* Reapplying the same infeasible topology leaves the mode

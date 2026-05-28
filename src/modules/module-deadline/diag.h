@@ -489,19 +489,6 @@ struct rt_diag_param_node {
 	uint8_t  conformal_last_invalidation_reason;
 
 	/*
-	 * Soft-mode risk-aware redistribution surface. The
-	 * `budget_clipped` flag is set by the soft heuristic when this
-	 * follower's wcet exceeded its assigned local deadline after
-	 * the cumulative-deadline redistribution; the apply path then
-	 * caps the kernel runtime to fit. The graph-level
-	 * `risk_objective_value` aggregate is mirrored on every
-	 * follower for parser convenience -- it is the same number for
-	 * every follower in a given snapshot.
-	 */
-	bool     budget_clipped;
-	double   risk_objective_value;
-
-	/*
 	 * Predicted vs scheduled runtime split.
 	 *
 	 * `predicted_runtime_ns` is the runtime estimate the analysis
@@ -618,6 +605,7 @@ struct rt_diag_combined {
 	uint64_t period_ns;
 	uint64_t deadline_ns;
 	const char *mode;                 /* "prototype" today */
+	bool        hard_mode;
 	const char *feasibility_method;   /* "none" today */
 	const char *feasibility_status;   /* "n/a" today */
 

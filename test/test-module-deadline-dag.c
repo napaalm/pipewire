@@ -621,8 +621,7 @@ PWTEST(fork_join_fails_on_peak_concurrency)
 	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
 
 	res = dag_recalculate(g);
-	pwtest_int_eq(res, -1);
-	pwtest_int_eq(errno, EAGAIN);
+	pwtest_int_eq(res, 0);
 	pwtest_bool_true(dag_has_unrelated_subset(g, middle_parallel, 2));
 	pwtest_bool_false(dag_unrelated_has_fictitious_nodes(g));
 
@@ -1868,9 +1867,9 @@ PWTEST(feasibility_tight_critical_path)
 	return PWTEST_PASS;
 }
 
-/* critical-path WCET exceeds the global
- * deadline. dag_recalculate must fail with EAGAIN; the DAG stays
- * dirty, deadlines/cpus are cleared. */
+/* critical-path WCET exceeds the global deadline. dag_recalculate
+ * still succeeds (no feasibility gate); all nodes get a valid
+ * assignment with positive local deadlines and CPU placements. */
 PWTEST(feasibility_critical_path_overrun)
 {
 	dag_t *g = dag_create(20, 20, 1.0f, 1, NULL);
@@ -1883,84 +1882,7 @@ PWTEST(feasibility_critical_path_overrun)
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 
-	errno = 0;
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
-	pwtest_bool_true(g->dirty);
-
-	a = find_node_by_id(g, 1);
-	b = find_node_by_id(g, 2);
-	c = find_node_by_id(g, 3);
-	pwtest_ptr_notnull(a);
-	pwtest_ptr_notnull(b);
-	pwtest_ptr_notnull(c);
-	pwtest_bool_false(a->deadline_assigned);
-	pwtest_bool_false(b->deadline_assigned);
-	pwtest_bool_false(c->deadline_assigned);
-	pwtest_int_eq((int)a->cpu, (int)DAG_CPU_INVALID);
-	pwtest_int_eq((int)b->cpu, (int)DAG_CPU_INVALID);
-	pwtest_int_eq((int)c->cpu, (int)DAG_CPU_INVALID);
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
-/* U-feas-min: a graph whose total per-node 1-ns reservation exceeds
- * the global deadline. Even with zero-WCET-style trivial work the
- * analyser cannot allocate a positive deadline to every node, so
- * recalc must fail. We use 3 nodes and a global deadline of 2 to
- * force the violation. */
-PWTEST(feasibility_min_deadline_reservation)
-{
-	dag_t *g = dag_create(2, 2, 1.0f, 1, NULL);
-
-	pwtest_ptr_notnull(g);
-	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
-	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
-	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
-
-	/* critical path = 3, deadline = 2 -> overrun fails too, but the
-	 * point is to exercise the min-reservation guard. Use a separate
-	 * graph in which the critical path is exactly the deadline but
-	 * the node count's 1-ns reservation overflows the budget. */
-	errno = 0;
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
-	pwtest_bool_true(g->dirty);
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
-/* dag_recalculate_soft: critical-path overrun (the same workload as
- * feasibility_critical_path_overrun) must produce a complete
- * SCHED_DEADLINE-valid assignment when run through the soft variant.
- * Every real node ends up with a CPU, a non-zero local_deadline, and
- * the soft heuristic flags the nodes whose wcet exceeds their
- * redistributed slice as budget_clipped. */
-PWTEST(recalculate_soft_critical_path_overrun_assigns_all_nodes)
-{
-	dag_t *g = dag_create(20, 20, 1.0f, 1, NULL);
-	dag_node_t *a, *b, *c;
-	uint32_t clipped_total;
-
-	pwtest_ptr_notnull(g);
-	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
-	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
-	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
-
-	/* The strict pipeline rejects (critical path 30 > deadline 20). */
-	errno = 0;
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
-	pwtest_bool_true(g->dirty);
-
-	/* The soft pipeline produces a complete assignment. */
-	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
 	pwtest_bool_false(g->dirty);
 
 	a = find_node_by_id(g, 1);
@@ -1979,57 +1901,86 @@ PWTEST(recalculate_soft_critical_path_overrun_assigns_all_nodes)
 	pwtest_int_ne((int)b->cpu, (int)DAG_CPU_INVALID);
 	pwtest_int_ne((int)c->cpu, (int)DAG_CPU_INVALID);
 
-	/* Soft redistribution: 30 wcet over a 20-budget chain forces at
-	 * least one node to clip. */
-	clipped_total = (a->budget_clipped ? 1u : 0u) +
-			(b->budget_clipped ? 1u : 0u) +
-			(c->budget_clipped ? 1u : 0u);
-	pwtest_bool_true(clipped_total > 0);
-
 	dag_destroy(g);
 	return PWTEST_PASS;
 }
 
-/* dag_recalculate_soft on a workload that strictly fails admission_ceiling
- * because every node lands on the only CPU. The relaxed placer must
- * still complete the placement (no EAGAIN) and every node gets the
- * same CPU. */
-PWTEST(recalculate_soft_relaxed_placement_overrides_admission_ceiling)
+/* U-feas-min: a graph whose total per-node 1-ns reservation exceeds
+ * the global deadline. Even with the critical-path feasibility gate
+ * removed, the deadline-splitting stage fails because the budget is
+ * too small to produce valid cumulative deadlines for all nodes. */
+PWTEST(feasibility_min_deadline_reservation)
 {
-	dag_t *g = dag_create(100, 100, 0.10f, 1, NULL);
-	dag_node_t *a, *b;
+	dag_t *g = dag_create(2, 2, 1.0f, 1, NULL);
 
 	pwtest_ptr_notnull(g);
-	pwtest_int_eq(add_real_node(g, 1, 60, 201), 0);
-	pwtest_int_eq(add_real_node(g, 2, 60, 202), 0);
+	pwtest_int_eq(add_real_node(g, 1, 1, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 1, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 1, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
 
 	errno = 0;
 	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
-
-	pwtest_int_eq(dag_recalculate_soft(g), 0);
-	a = find_node_by_id(g, 1);
-	b = find_node_by_id(g, 2);
-	pwtest_ptr_notnull(a);
-	pwtest_ptr_notnull(b);
-	pwtest_int_eq((int)a->cpu, 0);
-	pwtest_int_eq((int)b->cpu, 0);
-	pwtest_bool_true(a->local_deadline > 0);
-	pwtest_bool_true(b->local_deadline > 0);
+	pwtest_int_eq(errno, EINVAL);
+	pwtest_bool_true(g->dirty);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
 }
 
-/* dag_recalculate_soft on an empty DAG: same fast-path as the strict
- * variant (no nodes -> clean, dirty=false). */
-PWTEST(recalculate_soft_empty_graph_is_noop)
+/* A chain A(10)->B(10)->C(10) with period/deadline = 20: critical
+ * path 30 > deadline 20. dag_recalculate succeeds (no feasibility
+ * gate), all nodes get positive local deadlines and valid CPU
+ * assignments. At least one node on the critical path has
+ * wcet > local_deadline, confirming the apply layer would need to
+ * clamp the budget. */
+PWTEST(critical_path_exceeds_deadline_still_assigns)
 {
-	dag_t *g = dag_create(100, 100, 0.95f, 1, NULL);
+	dag_t *g = dag_create(20, 20, 1.0f, 1, NULL);
+	dag_node_t *a, *b, *c;
 
 	pwtest_ptr_notnull(g);
-	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_int_eq(add_real_node(g, 1, 10, 101), 0);
+	pwtest_int_eq(add_real_node(g, 2, 10, 102), 0);
+	pwtest_int_eq(add_real_node(g, 3, 10, 103), 0);
+	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
+	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
+
+	pwtest_int_eq(dag_recalculate(g), 0);
 	pwtest_bool_false(g->dirty);
+
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	c = find_node_by_id(g, 3);
+	pwtest_ptr_notnull(a);
+	pwtest_ptr_notnull(b);
+	pwtest_ptr_notnull(c);
+
+	/* Every node gets a positive local deadline not exceeding the
+	 * global period. */
+	pwtest_bool_true(a->local_deadline > 0);
+	pwtest_bool_true(b->local_deadline > 0);
+	pwtest_bool_true(c->local_deadline > 0);
+	pwtest_bool_true(a->local_deadline <= 20);
+	pwtest_bool_true(b->local_deadline <= 20);
+	pwtest_bool_true(c->local_deadline <= 20);
+
+	/* Every node gets a valid CPU assignment. */
+	pwtest_int_ne((int)a->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_ne((int)b->cpu, (int)DAG_CPU_INVALID);
+	pwtest_int_ne((int)c->cpu, (int)DAG_CPU_INVALID);
+
+	/* At least one node on the critical path has wcet > local_deadline,
+	 * confirming the budget would need clamping at the apply layer. */
+	{
+		uint32_t overcommitted = 0;
+		if (a->wcet > a->local_deadline) overcommitted++;
+		if (b->wcet > b->local_deadline) overcommitted++;
+		if (c->wcet > c->local_deadline) overcommitted++;
+		pwtest_bool_true(overcommitted > 0);
+	}
+
 	dag_destroy(g);
 	return PWTEST_PASS;
 }
@@ -2435,8 +2386,7 @@ PWTEST(equal_load_ties_choose_lowest_cpu)
  *   - group members co-locate (positive case);
  *   - distinct groups don't unify;
  *   - ungrouped neighbours are unaffected;
- *   - infeasible group placement returns EAGAIN rather than
- *     splitting the group;
+ *   - formerly-infeasible group placement now succeeds;
  *   - dag_set_node_group input validation;
  *   - group_id survives a recalc;
  *   - clearing back to 0 returns to default worst-fit behaviour.
@@ -2571,9 +2521,8 @@ PWTEST(group_ungrouped_neighbour_unaffected)
 PWTEST(group_overcapacity_returns_eagain)
 {
 	/* A group of two nodes whose summed individual densities
-	 * exceed the per-CPU cap returns EAGAIN. Splitting the group
-	 * across CPUs is forbidden by contract, so admission must
-	 * fail rather than spread. */
+	 * exceed the per-CPU cap. With the feasibility gate removed,
+	 * dag_recalculate still succeeds and co-locates them. */
 	dag_t *g = dag_create(100, 100, 0.55f, 2, NULL);
 	dag_node_t *a, *b;
 
@@ -2588,12 +2537,13 @@ PWTEST(group_overcapacity_returns_eagain)
 	b = find_node_by_id(g, 2);
 	pwtest_bool_true(a->cpu != b->cpu);
 
-	/* With grouping it fails admission. */
+	/* With grouping: still succeeds, nodes co-located. */
 	pwtest_int_eq(dag_set_node_group(g, 1, 9), 0);
 	pwtest_int_eq(dag_set_node_group(g, 2, 9), 0);
-	errno = 0;
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -2841,9 +2791,9 @@ PWTEST(group_many_groups_each_co_locates)
 
 PWTEST(group_eagain_recoverable_after_clear)
 {
-	/* Overcapacity returns EAGAIN; clearing the offending group
-	 * lets the next recalc succeed. The DAG must not be left in a
-	 * permanently-broken state by a transient infeasible placement. */
+	/* With the feasibility gate removed, the grouped placement
+	 * succeeds even when density exceeds the per-CPU cap. Clearing
+	 * the group changes placement from co-located to spread. */
 	dag_t *g = dag_create(100, 100, 0.55f, 2, NULL);
 	dag_node_t *a, *b;
 
@@ -2853,15 +2803,13 @@ PWTEST(group_eagain_recoverable_after_clear)
 	pwtest_int_eq(dag_set_node_group(g, 1, 5), 0);
 	pwtest_int_eq(dag_set_node_group(g, 2, 5), 0);
 
-	errno = 0;
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
-	/* On failure dag_recalculate leaves dirty set so a retry
-	 * actually retries. */
-	pwtest_bool_true(g->dirty);
+	/* Grouped placement succeeds; nodes co-located. */
+	pwtest_int_eq(dag_recalculate(g), 0);
+	a = find_node_by_id(g, 1);
+	b = find_node_by_id(g, 2);
+	pwtest_int_eq((int)a->cpu, (int)b->cpu);
 
-	/* Clear the group on one member; the two now spread across CPUs
-	 * and admission succeeds. */
+	/* Clear the group on one member; the two now spread across CPUs. */
 	pwtest_int_eq(dag_set_node_group(g, 2, 0), 0);
 	pwtest_int_eq(dag_recalculate(g), 0);
 	a = find_node_by_id(g, 1);
@@ -3116,9 +3064,8 @@ PWTEST(hetero_admission_rejects_workload_that_only_fits_at_full_capacity)
 	/* Two independent nodes, each raw util 0.8. With ceiling 0.9 and
 	 * two CPUs at full capacity, the worst-fit places one per CPU and
 	 * the workload trivially fits. With CPU 1 dropped to 0.5
-	 * relative_capacity, that node's relative util becomes 1.6 > 0.9
-	 * so neither CPU can take the second node and assign_cpus
-	 * returns EAGAIN. */
+	 * relative_capacity, the workload is infeasible on that CPU but
+	 * dag_recalculate still succeeds (no feasibility gate). */
 	dag_t *g_homo = dag_create(100, 100, 0.90, 2, NULL);
 	pwtest_ptr_notnull(g_homo);
 	pwtest_int_eq(add_real_node(g_homo, 1, 80, 101), 0);
@@ -3134,8 +3081,7 @@ PWTEST(hetero_admission_rejects_workload_that_only_fits_at_full_capacity)
 	pwtest_int_eq(add_real_node(g, 1, 80, 101), 0);
 	pwtest_int_eq(add_real_node(g, 2, 80, 102), 0);
 
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
+	pwtest_int_eq(dag_recalculate(g), 0);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -3145,7 +3091,8 @@ PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
 {
 	/* Critical path of 60 ns fits the 100 ns deadline at reference
 	 * capacity (60 <= 100) but not at min capacity 0.5
-	 * (scaled_deadline = 100 * 0.5 = 50; 60 > 50 -> EAGAIN). */
+	 * (scaled_deadline = 100 * 0.5 = 50; 60 > 50). With the
+	 * feasibility gate removed, both cases succeed. */
 	double rel_homo[2] = { 1.0, 1.0 };
 	dag_t *g_homo = dag_create(100, 100, 0.90, 2, rel_homo);
 	pwtest_ptr_notnull(g_homo);
@@ -3158,8 +3105,7 @@ PWTEST(hetero_feasibility_scaled_by_slowest_cpu)
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 60, 101), 0);
 
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(errno, EAGAIN);
+	pwtest_int_eq(dag_recalculate(g), 0);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -3382,33 +3328,24 @@ PWTEST(predicted_and_scheduled_cleared_on_dirty)
 
 PWTEST(predicted_and_scheduled_diverge_under_soft_clamp)
 {
-	/* Build an over-budget chain so the soft fallback clips at
-	 * least one node, then verify scheduled < predicted on that
-	 * node while equal elsewhere. */
+	/* Build an over-budget chain (critical path 160 > deadline 100).
+	 * dag_recalculate succeeds (no feasibility gate); both runtime
+	 * fields are populated and positive for every node. */
 	dag_t *g = dag_create(100, 100, 0.95, 2, NULL);
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 80, 101), 0);
 	pwtest_int_eq(add_real_node(g, 2, 80, 102), 0);
 	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
 
-	/* Hard mode rejects this with EAGAIN -- critical path 160 ns
-	 * > deadline 100 ns -- so the soft fallback runs. */
-	pwtest_int_eq(dag_recalculate(g), -1);
-	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
 
-	uint32_t clipped = 0;
 	for (uint32_t id = 1; id <= 2; id++) {
 		dag_node_t *n = find_node_by_id(g, id);
 		pwtest_int_lt(0, (int)n->predicted_runtime_ns);
 		pwtest_int_lt(0, (int)n->scheduled_runtime_ns);
-		/* Either equal (uncipped) or scheduled < predicted
-		 * (clipped). The soft path may apply the clip to one
-		 * or both of these nodes; at least one must be
-		 * clipped for the test workload. */
-		if (n->scheduled_runtime_ns < n->predicted_runtime_ns)
-			clipped++;
+		/* scheduled_runtime <= predicted_runtime always holds. */
+		pwtest_bool_true(n->scheduled_runtime_ns <= n->predicted_runtime_ns);
 	}
-	pwtest_int_lt(0, (int)clipped);
 
 	dag_destroy(g);
 	return PWTEST_PASS;
@@ -3853,138 +3790,6 @@ PWTEST(unrelated_collapse_no_groups_matches_baseline)
 	return PWTEST_PASS;
 }
 
-PWTEST(soft_redistribute_chain_proportional)
-{
-	/* A chain A(100) -> B(200) -> C(300) with a 1000ns end-to-end
-	 * deadline gets cumulative deadlines proportional to the
-	 * cumulative WCET: A=100/600, B=300/600, C=600/600 of D.
-	 * Sum equals 1000ns. */
-	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
-	double obj = -1.0;
-	uint32_t clipped = 99;
-	pwtest_ptr_notnull(g);
-
-	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 200, 1002, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
-	pwtest_int_eq(dag_recalculate(g), 0);
-
-	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
-	pwtest_int_eq((int)clipped, 0);
-	pwtest_bool_true(obj == 0.0);
-
-	{
-		dag_node_t *a = dag_find_node(g, 1);
-		dag_node_t *b = dag_find_node(g, 2);
-		dag_node_t *c = dag_find_node(g, 3);
-		pwtest_ptr_notnull(a);
-		pwtest_ptr_notnull(b);
-		pwtest_ptr_notnull(c);
-		/* A's cumulative ~= 100/600 * 1000 = 166ns. */
-		pwtest_bool_true(a->cumulative_deadline >= 150);
-		pwtest_bool_true(a->cumulative_deadline <= 200);
-		/* B's cumulative ~= 300/600 * 1000 = 500ns. */
-		pwtest_bool_true(b->cumulative_deadline >= 450);
-		pwtest_bool_true(b->cumulative_deadline <= 550);
-		/* C's cumulative = D = 1000. */
-		pwtest_int_eq((int)c->cumulative_deadline, 1000);
-		/* Local deadlines must satisfy wcet <= local <= period. */
-		pwtest_bool_true(a->wcet <= a->local_deadline);
-		pwtest_bool_true(b->wcet <= b->local_deadline);
-		pwtest_bool_true(c->wcet <= c->local_deadline);
-		pwtest_bool_false(dag_node_budget_clipped(g, 1));
-		pwtest_bool_false(dag_node_budget_clipped(g, 2));
-		pwtest_bool_false(dag_node_budget_clipped(g, 3));
-	}
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
-PWTEST(soft_redistribute_overload_clips_nodes)
-{
-	/* A chain A(800) -> B(500) -> C(300) with end-to-end 1000ns
-	 * cannot fit: path sum 1600 > 1000. The hard-mode splitter
-	 * (dag_recalculate) refuses the workload; the soft-mode
-	 * heuristic runs directly on the DAG and produces a clipped
-	 * proportional assignment. A's wcet (800) > local (500) means
-	 * the budget got clipped against the redistributed deadline;
-	 * the objective records the overflow as a unitless fraction
-	 * of the end-to-end deadline. */
-	dag_t *g = dag_create(1000, 1000, 1.0, 4, NULL);
-	double obj = -1.0;
-	uint32_t clipped = 0;
-	pwtest_ptr_notnull(g);
-
-	pwtest_int_eq(dag_add_node(g, 1, 800, 1001, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 500, 1002, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 300, 1003, false), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 3), 0);
-	/* dag_recalculate is expected to refuse this workload; the
-	 * soft heuristic must work on the un-analysed DAG. */
-	(void)dag_recalculate(g);
-
-	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, &clipped));
-	pwtest_bool_true(clipped >= 1);
-	pwtest_bool_true(obj > 0.0);
-	pwtest_bool_true(dag_node_budget_clipped(g, 1));
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
-PWTEST(soft_redistribute_diamond_keeps_monotonicity)
-{
-	/* A diamond A -> B -> D, A -> C -> D with A=B=C=D=100 (so
-	 * path sum 300, longest 300). The redistribution must keep
-	 * cumulative_deadline monotonic along every edge. */
-	dag_t *g = dag_create(1200, 1200, 1.0, 4, NULL);
-	double obj = -1.0;
-	pwtest_ptr_notnull(g);
-
-	pwtest_int_eq(dag_add_node(g, 1, 100, 1001, false), 0);
-	pwtest_int_eq(dag_add_node(g, 2, 100, 1002, false), 0);
-	pwtest_int_eq(dag_add_node(g, 3, 100, 1003, false), 0);
-	pwtest_int_eq(dag_add_node(g, 4, 100, 1004, false), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 2), 0);
-	pwtest_int_eq(dag_add_edge(g, 1, 3), 0);
-	pwtest_int_eq(dag_add_edge(g, 2, 4), 0);
-	pwtest_int_eq(dag_add_edge(g, 3, 4), 0);
-	pwtest_int_eq(dag_recalculate(g), 0);
-
-	pwtest_bool_true(dag_soft_redistribute_deadlines(g, &obj, NULL));
-
-	{
-		dag_node_t *a = dag_find_node(g, 1);
-		dag_node_t *b = dag_find_node(g, 2);
-		dag_node_t *c = dag_find_node(g, 3);
-		dag_node_t *d = dag_find_node(g, 4);
-		pwtest_ptr_notnull(a);
-		pwtest_ptr_notnull(b);
-		pwtest_ptr_notnull(c);
-		pwtest_ptr_notnull(d);
-		pwtest_bool_true(a->cumulative_deadline <= b->cumulative_deadline);
-		pwtest_bool_true(a->cumulative_deadline <= c->cumulative_deadline);
-		pwtest_bool_true(b->cumulative_deadline <= d->cumulative_deadline);
-		pwtest_bool_true(c->cumulative_deadline <= d->cumulative_deadline);
-	}
-
-	dag_destroy(g);
-	return PWTEST_PASS;
-}
-
-PWTEST(soft_redistribute_rejects_invalid_inputs)
-{
-	double obj;
-	uint32_t clipped;
-	pwtest_bool_false(dag_soft_redistribute_deadlines(NULL, &obj, &clipped));
-	pwtest_bool_false(dag_node_budget_clipped(NULL, 0));
-	return PWTEST_PASS;
-}
-
 /* --------------------------------------------------------------- *
  * Driver-as-DAG-node shapes. When module-deadline runs with
  * driver.schedule=on, the snapshot path includes the driver in
@@ -4424,13 +4229,13 @@ PWTEST(timing_root_same_value_noop)
 	return PWTEST_PASS;
 }
 
-/* Soft redistribute with timing root: the redistribution should
- * handle the timing root without crashing, and the timing root
- * should have local == cumulative in the redistributed schedule. */
+/* Infeasible workload with timing root: dag_recalculate succeeds
+ * (no feasibility gate) and the timing root has
+ * local == cumulative in the resulting schedule. */
 PWTEST(timing_root_soft_redistribute)
 {
 	const uint32_t driver_id = 10000;
-	/* Period 500 with total WCET 600 → infeasible, triggers soft. */
+	/* Period 500 with total WCET 600 -- critical path exceeds deadline. */
 	dag_t *g = dag_create(500, 500, 0.95f, 1, NULL);
 	pwtest_ptr_notnull(g);
 	pwtest_int_eq(add_real_node(g, 1, 200, 1001), 0);
@@ -4438,12 +4243,7 @@ PWTEST(timing_root_soft_redistribute)
 	pwtest_int_eq(dag_add_edge(g, 1, driver_id), 0);
 	pwtest_int_eq(dag_set_node_timing_root(g, driver_id, true), 0);
 
-	/* dag_recalculate should fail (critical path 600 > deadline 500). */
-	int rc = dag_recalculate(g);
-	pwtest_int_eq(rc, -1);
-
-	/* Soft fallback. */
-	pwtest_int_eq(dag_recalculate_soft(g), 0);
+	pwtest_int_eq(dag_recalculate(g), 0);
 
 	dag_node_t *d = find_node_by_id(g, driver_id);
 	pwtest_bool_true(d->cumulative_deadline > 0);
@@ -4540,11 +4340,7 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(feasibility_tight_critical_path, PWTEST_NOARG);
 	pwtest_add(feasibility_critical_path_overrun, PWTEST_NOARG);
 	pwtest_add(feasibility_min_deadline_reservation, PWTEST_NOARG);
-	pwtest_add(recalculate_soft_critical_path_overrun_assigns_all_nodes,
-			PWTEST_NOARG);
-	pwtest_add(recalculate_soft_relaxed_placement_overrides_admission_ceiling,
-			PWTEST_NOARG);
-	pwtest_add(recalculate_soft_empty_graph_is_noop, PWTEST_NOARG);
+	pwtest_add(critical_path_exceeds_deadline_still_assigns, PWTEST_NOARG);
 	pwtest_add(cpu_placement_orders_by_descending_density, PWTEST_NOARG);
 	pwtest_add(cpu_placement_equal_density_lowest_cpu, PWTEST_NOARG);
 	pwtest_add(cp_aware_chain_plus_independent_placement, PWTEST_NOARG);
@@ -4618,11 +4414,6 @@ PWTEST_SUITE(module_deadline_dag)
 	pwtest_add(unrelated_collapse_group_relation_via_non_rep_member, PWTEST_NOARG);
 	pwtest_add(unrelated_collapse_mixed_grouped_and_ungrouped, PWTEST_NOARG);
 	pwtest_add(unrelated_collapse_no_groups_matches_baseline, PWTEST_NOARG);
-
-	pwtest_add(soft_redistribute_chain_proportional, PWTEST_NOARG);
-	pwtest_add(soft_redistribute_overload_clips_nodes, PWTEST_NOARG);
-	pwtest_add(soft_redistribute_diamond_keeps_monotonicity, PWTEST_NOARG);
-	pwtest_add(soft_redistribute_rejects_invalid_inputs, PWTEST_NOARG);
 
 	pwtest_add(driver_as_dag_sink_chain, PWTEST_NOARG);
 	pwtest_add(driver_as_dag_sink_fan_in, PWTEST_NOARG);

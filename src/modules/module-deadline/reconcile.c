@@ -54,23 +54,6 @@ struct reconcile_state {
 	 * hysteresis contract. */
 	struct reconcile_feasibility feas;
 
-	/*
-	 * Soft-mode redistribution surfacing. Refreshed on every
-	 * reconcile_dispatch_contracted call:
-	 *   * `last_risk_objective` is the aggregate clipped-runtime
-	 *     fraction returned by dag_soft_redistribute_deadlines on
-	 *     the macro DAG; zero in HARD mode.
-	 *   * `clipped_followers` is a sorted ascending array of the
-	 *     follower IDs whose macro-node was budget-clipped after
-	 *     the redistribution. Lookups go through
-	 *     reconcile_state_node_budget_clipped (bsearch). Empty
-	 *     between passes; reallocated geometrically.
-	 */
-	double    last_risk_objective;
-	uint32_t *clipped_followers;
-	uint32_t  n_clipped_followers;
-	uint32_t  cap_clipped_followers;
-
 	/* Iterative-recalc bound. 0 or 1 means "use the legacy single-
 	 * shot dag_recalculate path"; >= 2 means "use
 	 * dag_recalculate_heterogeneous with this round cap". The cap
@@ -128,71 +111,6 @@ reconcile_state_t *reconcile_init(uint32_t n_cpus,
 bool reconcile_state_has_persistent_dag(const reconcile_state_t *state)
 {
 	return state != NULL && state->persistent && state->dag != NULL;
-}
-
-bool reconcile_state_node_budget_clipped(
-		const reconcile_state_t *state, uint32_t follower_id)
-{
-	uint32_t lo, hi;
-	if (state == NULL || state->clipped_followers == NULL)
-		return false;
-	lo = 0;
-	hi = state->n_clipped_followers;
-	while (lo < hi) {
-		uint32_t mid = lo + (hi - lo) / 2;
-		uint32_t v = state->clipped_followers[mid];
-		if (v < follower_id)
-			lo = mid + 1;
-		else if (v > follower_id)
-			hi = mid;
-		else
-			return true;
-	}
-	return false;
-}
-
-double reconcile_state_risk_objective(const reconcile_state_t *state)
-{
-	return state ? state->last_risk_objective : 0.0;
-}
-
-static void clipped_followers_reset(reconcile_state_t *state)
-{
-	if (state == NULL)
-		return;
-	state->n_clipped_followers = 0;
-}
-
-static int clipped_followers_add_sorted(reconcile_state_t *state,
-		uint32_t id)
-{
-	uint32_t lo = 0, hi = state->n_clipped_followers;
-	while (lo < hi) {
-		uint32_t mid = lo + (hi - lo) / 2;
-		if (state->clipped_followers[mid] < id)
-			lo = mid + 1;
-		else if (state->clipped_followers[mid] > id)
-			hi = mid;
-		else
-			return 0; /* already present */
-	}
-	if (state->n_clipped_followers == state->cap_clipped_followers) {
-		uint32_t new_cap = state->cap_clipped_followers > 0
-			? state->cap_clipped_followers * 2u : 8u;
-		uint32_t *new_buf = realloc(state->clipped_followers,
-				(size_t)new_cap * sizeof(*new_buf));
-		if (new_buf == NULL)
-			return -ENOMEM;
-		state->clipped_followers = new_buf;
-		state->cap_clipped_followers = new_cap;
-	}
-	memmove(&state->clipped_followers[lo + 1],
-			&state->clipped_followers[lo],
-			(size_t)(state->n_clipped_followers - lo) *
-				sizeof(*state->clipped_followers));
-	state->clipped_followers[lo] = id;
-	state->n_clipped_followers++;
-	return 0;
 }
 
 uint32_t reconcile_state_node_required_external_inputs(
@@ -296,7 +214,6 @@ void reconcile_fini(reconcile_state_t *state)
 		return;
 	reconcile_drop(state);
 	free(state->relative_capacity);
-	free(state->clipped_followers);
 	free(state);
 }
 
@@ -839,7 +756,6 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 	struct dag *macro_dag = NULL;
 	dag_node_t *n;
 	int r;
-	bool soft_fallback_used = false;
 
 	/* Filter unsound fusion groups before contraction. A rejected
 	 * group has its members' group_ids cleared, which makes the
@@ -886,64 +802,23 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 	}
 	if (recalc_ret < 0) {
 		int e = errno;
-		/* The macro-dag analysis rejected the schedule -- the
-		 * most common cause is the worst-fit placer failing
-		 * admission_ceiling, which is itself a density-style
-		 * test and therefore the same signal the SOFT mode
-		 * classification expects. Stamp the feas state
-		 * accordingly before falling back so an operator
-		 * sees the transition; the fallback then runs the
-		 * per-original-node analysis as a best-effort
-		 * scheduler. */
 		if (state->feas.mode != RECONCILE_MODE_SOFT_DEGRADED) {
 			pw_log_warn("HDL-W030-CRITICAL-PATH-INFEASIBLE: "
 				"reconcile: contracted-DAG analysis "
-				"rejected the schedule (%m); retrying with "
-				"soft fallback (proportional deadlines + "
-				"relaxed placement); hard-real-time "
+				"rejected the schedule (%m); falling back "
+				"to per-node deadline split; hard-real-time "
 				"guarantees dropped");
 		}
-
-		/* Retry on EAGAIN with the soft variant. EAGAIN means
-		 * the strict feasibility gate or the admission-aware
-		 * worst-fit refused; the soft variant skips both gates
-		 * and produces a kernel-valid tuple for every node, so
-		 * SCHED_DEADLINE still gets applied (with budget_clipped
-		 * markers on the overshooting nodes). The post-recalc
-		 * feasibility classification below then runs on the soft
-		 * assignment and naturally lands on SOFT_DEGRADED because
-		 * a clipped node makes density > 1; that overrides
-		 * whatever we'd stamp here, so we don't pre-set it. */
-		if (e == EAGAIN && dag_recalculate_soft(macro_dag) == 0) {
-			pw_log_warn("HDL-W050-CPU-OVERUTILIZED-RESCALED: "
-				"reconcile: soft fallback accepted a "
-				"relaxed placement (some CPU may exceed "
-				"admission_ceiling); emitting SCHED_DEADLINE "
-				"with budget_clipped markers on overshooting "
-				"followers");
-			soft_fallback_used = true;
-			/* Fall through to the success path: apply the
-			 * macro-DAG schedule back to cg and run the
-			 * existing feasibility / soft redistribution /
-			 * emission flow on it. The post-recalc
-			 * classification may decide the relaxed
-			 * placement is kernel-feasible (density <= 1
-			 * even when it violates the user-configured
-			 * admission ceiling) and stamp HARD; that's
-			 * overridden back to SOFT_DEGRADED below
-			 * because we *did* drop the user's contract. */
-		} else {
-			state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
-			state->feas.density_passed = false;
-			state->feas.dbf_passed = false;
-			state->feas.consecutive_hard_passes = 0;
-			snprintf(state->feas.reason, sizeof(state->feas.reason),
-					"placer_rejected");
-			dag_destroy(macro_dag);
-			contracted_dag_destroy(cg);
-			errno = e;
-			return dag_foreach_node(state_dag, sched_cb, sched_data);
-		}
+		state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
+		state->feas.density_passed = false;
+		state->feas.dbf_passed = false;
+		state->feas.consecutive_hard_passes = 0;
+		snprintf(state->feas.reason, sizeof(state->feas.reason),
+				"placer_rejected");
+		dag_destroy(macro_dag);
+		contracted_dag_destroy(cg);
+		errno = e;
+		return dag_foreach_node(state_dag, sched_cb, sched_data);
 	}
 
 	contracted_dag_apply_dag_schedule(cg, macro_dag);
@@ -1031,110 +906,13 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 		state->feas = f;
 	}
 
-	/* When the soft fallback was used, the placement violated the
-	 * user-configured admission_ceiling. The post-recalc classifier
-	 * checks the kernel-side bound (density <= 1) which can still
-	 * pass on a relaxed-but-not-overloaded placement, so the verdict
-	 * above may flip back to HARD. That hides from the operator the
-	 * fact that we dropped their contract. Force SOFT_DEGRADED and
-	 * stamp a dedicated reason so the snapshot reflects the actual
-	 * mode the daemon is running in. */
-	if (soft_fallback_used) {
-		state->feas.mode = RECONCILE_MODE_SOFT_DEGRADED;
-		state->feas.consecutive_hard_passes = 0;
-		snprintf(state->feas.reason, sizeof(state->feas.reason),
-				"soft_fallback");
-	}
-
-	/*
-	 * Risk-aware deadline redistribution. In SOFT_DEGRADED mode
-	 * rewrite the macro-node cumulative and local deadlines so a
-	 * proportional share of the end-to-end budget is granted to
-	 * every node along its critical path -- a Sarkar 1989-style
-	 * critical-path split adapted to the soft case where the
-	 * total path work may exceed the end-to-end deadline. Nodes
-	 * whose wcet still exceeds their redistributed local deadline
-	 * after the rewrite are marked budget_clipped so the
-	 * follower-level diagnostic surfaces the bottleneck.
-	 *
-	 * The function returns false if the macro-DAG has degenerate
-	 * topology (no real nodes or a zero longest path); the per-CPU
-	 * scaling pass below stays as the always-on safety net.
-	 */
-	clipped_followers_reset(state);
-	state->last_risk_objective = 0.0;
-	if (state->feas.mode == RECONCILE_MODE_SOFT_DEGRADED) {
-		double obj = 0.0;
-		uint32_t clipped = 0;
-		if (dag_soft_redistribute_deadlines(macro_dag, &obj,
-					&clipped)) {
-			pw_log_debug("reconcile: soft redistribution "
-					"objective=%.6f clipped_nodes=%u",
-					obj, clipped);
-			/* Push the rewritten deadlines back into the
-			 * contracted_node side-table so the per-follower
-			 * emission below picks up the new values. */
-			contracted_dag_apply_dag_schedule(cg, macro_dag);
-			state->last_risk_objective = obj;
-			if (clipped > 0) {
-				dag_node_t *macro_n;
-				spa_list_for_each(macro_n, &macro_dag->nodes, link) {
-					contracted_node_t *cn;
-					const struct contracted_member *m;
-					if (macro_n->fictitious)
-						continue;
-					if (!macro_n->budget_clipped)
-						continue;
-					cn = contracted_owner(cg, macro_n->id);
-					if (cn == NULL)
-						continue;
-					/* Every follower in this macro
-					 * shares the clipped flag. */
-					spa_list_for_each(m, &cn->members,
-							link) {
-						(void)clipped_followers_add_sorted(
-							state, m->id);
-					}
-				}
-			}
-		}
-	}
-
-	/* Per-CPU soft-redistribution scaling. In SOFT_DEGRADED mode
-	 * the contracted analysis already decided the schedule does
-	 * not meet every deadline on every activation. To bound the
-	 * damage on overloaded CPUs, scale every macro-node's runtime
-	 * budget on a CPU c by min(1.0, 1.0 / density(c)); the
-	 * resulting per-CPU sum of (R / D) is <= 1 and the kernel
-	 * grants no more than that fraction of CPU time per period,
-	 * which is the "least bad" deterministic redistribution the
-	 * plan calls for. Tasks may miss their actual demand --
-	 * xruns are possible -- but the system stays kernel-valid
-	 * and other CPUs are unaffected. In HARD mode the scales
-	 * are all 1.0 (no change). */
-	double *cpu_scale = NULL;
-	if (state->feas.mode == RECONCILE_MODE_SOFT_DEGRADED &&
-			state->n_cpus > 0) {
-		cpu_scale = calloc(state->n_cpus, sizeof(*cpu_scale));
-		if (cpu_scale != NULL) {
-			uint32_t cpu;
-			for (cpu = 0; cpu < state->n_cpus; cpu++) {
-				double d = dag_per_cpu_density(macro_dag, cpu);
-				cpu_scale[cpu] = (d > 1.0) ? (1.0 / d) : 1.0;
-			}
-		}
-	}
-
 	/* Per-follower emission. For each real node in state_dag, look
 	 * up its owning macro-node and emit sched_cb with the macro's
 	 * (cumulative_deadline, local_deadline, cpu). Runtime: each
 	 * follower reports its own wcet so sched_groups.sum_runtime
 	 * aggregates to sum_of_members; the macro's overhead is folded
 	 * into the leader's report so the final sum equals the macro-
-	 * node's effective WCET. In SOFT_DEGRADED mode the runtime is
-	 * scaled down by the per-CPU soft-redistribution factor
-	 * computed above, with a 1ns floor to keep the kernel call
-	 * valid. */
+	 * node's effective WCET. */
 	spa_list_for_each(n, &state_dag->nodes, link) {
 		contracted_node_t *cn;
 		const struct contracted_member *leader;
@@ -1154,16 +932,6 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 
 		cpu = (cn->cpu < 0) ? 0u : (uint32_t)cn->cpu;
 
-		if (cpu_scale != NULL && cpu < state->n_cpus) {
-			double s = cpu_scale[cpu];
-			if (s > 0.0 && s < 1.0) {
-				double scaled = (double)runtime * s;
-				if (scaled < 1.0)
-					scaled = 1.0;  /* runtime > 0 floor */
-				runtime = (uint64_t)scaled;
-			}
-		}
-
 		{
 			uint32_t fusion_leader_id = (leader != NULL)
 				? leader->id : n->id;
@@ -1173,8 +941,6 @@ static int reconcile_dispatch_contracted(reconcile_state_t *state,
 					period_ns, cpu, fusion_leader_id);
 		}
 	}
-
-	free(cpu_scale);
 
 	dag_destroy(macro_dag);
 	contracted_dag_destroy(cg);

@@ -672,7 +672,7 @@ PWTEST(diag_json_empty_combined)
 	const char expected[] =
 		"{\"module\":\"module-deadline\","
 		"\"driver_id\":0,\"generation\":0,\"period_ns\":0,"
-		"\"deadline_ns\":0,\"mode\":\"prototype\","
+		"\"deadline_ns\":0,\"mode\":\"prototype\",\"hard_mode\":false,"
 		"\"feasibility\":{\"method\":\"none\",\"status\":\"n/a\"},"
 		"\"raw_graph\":{\"nodes\":[],\"edges\":[]},"
 		"\"scheduling_dag\":{\"nodes\":[],\"edges\":[],\"excluded_edges\":[]},"
@@ -705,7 +705,7 @@ PWTEST(diag_json_full_golden)
 	const char expected[] =
 		"{\"module\":\"module-deadline\","
 		"\"driver_id\":63,\"generation\":3,\"period_ns\":21333333,"
-		"\"deadline_ns\":21333333,\"mode\":\"prototype\","
+		"\"deadline_ns\":21333333,\"mode\":\"prototype\",\"hard_mode\":false,"
 		"\"feasibility\":{\"method\":\"none\",\"status\":\"n/a\"},"
 		"\"raw_graph\":{\"nodes\":["
 		"{\"id\":63,\"driver_id\":63,\"tid\":302388,\"flags\":[\"driver\",\"data_loop\"],\"name\":\"alsa-sink\"}"
@@ -733,8 +733,6 @@ PWTEST(diag_json_full_golden)
 		"\"last_prediction_ns\":0,\"last_score\":0.000000,"
 		"\"last_budget_ns\":0,"
 		"\"last_invalidation_reason\":\"none\"},"
-		"\"budget_clipped\":false,"
-		"\"risk_objective_value\":0.000000,"
 		"\"predicted_runtime_ns\":92000,"
 		"\"scheduled_runtime_ns\":85494,"
 		"\"budget_used_bootstrap\":true}]},"

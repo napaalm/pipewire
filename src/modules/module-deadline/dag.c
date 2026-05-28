@@ -60,7 +60,6 @@ static void dag_invalidate_schedule(dag_t *g)
 		n->local_deadline = 0;
 		n->remaining_deadline = 0;
 		n->cpu = DAG_CPU_INVALID;
-		n->budget_clipped = false;
 		n->predicted_runtime_ns = 0;
 		n->scheduled_runtime_ns = 0;
 	}
@@ -463,7 +462,6 @@ int dag_add_node(dag_t *g, uint32_t id, uint64_t wcet, pid_t tid, bool fictitiou
 	n->local_deadline = 0;
 	n->cpu = DAG_CPU_INVALID;
 	n->deadline_assigned = false;
-	n->budget_clipped = false;
 	spa_list_init(&n->outgoing);
 	spa_list_init(&n->incoming);
 	spa_list_append(&g->nodes, &n->link);
@@ -2230,16 +2228,13 @@ static bool prefer_cpu_choice(double projected, uint32_t cpu,
  * papers/Casini-PartitionedFP-RTSS2018.pdf -- worst-fit/best-fit
  * heuristics where the ordering of the input list dominates the
  * resulting feasibility ratio. */
-/* Worst-fit CPU placement. `relax=false` is the default hard-mode
- * gate against g->admission_ceiling: a node is only accepted on a CPU
- * whose projected utilisation stays at or below the ceiling, and the
- * whole pass fails with EAGAIN if no CPU passes the gate. `relax=true`
- * is the soft-mode fallback used by dag_recalculate_soft: the gate is
- * dropped so the placer always picks the least-projected CPU, even if
- * the resulting partition's density exceeds the ceiling. The
- * placement order (utilisation-descending, with co-location groups
- * forced onto the leader's CPU) is identical so the soft and hard
- * outputs are directly comparable. */
+/* Worst-fit CPU placement. When `relax=true` (the default path in
+ * dag_recalculate) the placer always picks the least-projected CPU
+ * regardless of g->admission_ceiling; `relax=false` rejects a node
+ * whose projected utilisation would exceed the ceiling (EAGAIN).
+ * The placement order (critical-path-priority descending, with
+ * co-location groups forced onto the leader's CPU) is identical in
+ * both modes. */
 static int assign_cpus_internal(dag_t *g, bool relax)
 {
 	uint32_t count = g->indexed_count;
@@ -2436,11 +2431,6 @@ static int assign_cpus_internal(dag_t *g, bool relax)
 	free(cpu_peak);
 	free(info);
 	return 0;
-}
-
-static int assign_cpus(dag_t *g)
-{
-	return assign_cpus_internal(g, false);
 }
 
 double dag_per_cpu_density(const dag_t *g, uint32_t cpu)
@@ -2764,364 +2754,6 @@ validate:
 	return true;
 }
 
-/*
- * Soft-mode deadline redistribution. The algorithm is a single pass
- * along the topological order: for every real node compute the
- * "cumulative WCET along the heaviest in-path" and the
- * "cumulative WCET along the heaviest out-path", combine them into
- * the longest path that traverses the node, and assign a cumulative
- * deadline proportional to the in-path fraction of that path.
- *
- * The scratch arrays are sized at indexed_count so the pass is
- * O(n + e) with no allocation after dag_recalculate has built the
- * indexed-nodes cache. The function returns false on missing inputs
- * or kernel-invalid output; the caller falls back to the existing
- * apply-time clamp in that case.
- */
-/*
- * Internal topological-sort helper used by the soft-mode
- * redistribution. The hard-mode analysis cache (indexed_nodes) may
- * have been dropped by dag_invalidate_analysis when the splitter
- * rejected the workload, so this helper builds its own dense order
- * by Kahn's algorithm. Returns the order and node count in *out_*;
- * the caller frees the returned arrays. Returns 0 on success or a
- * negative errno on failure.
- */
-static int dag_soft_topo_order(dag_t *g, dag_node_t ***out_order,
-		uint32_t *out_count)
-{
-	dag_node_t **order = NULL;
-	uint32_t   *indegree = NULL;
-	uint32_t   *queue = NULL;
-	uint32_t    n = 0;
-	uint32_t    head = 0, tail = 0;
-	uint32_t    produced = 0;
-	dag_node_t *node;
-
-	spa_list_for_each(node, &g->nodes, link)
-		n++;
-	if (n == 0)
-		return -EINVAL;
-
-	order = calloc(n, sizeof(*order));
-	indegree = calloc(n, sizeof(*indegree));
-	queue = calloc(n, sizeof(*queue));
-	if (order == NULL || indegree == NULL || queue == NULL) {
-		free(order); free(indegree); free(queue);
-		return -ENOMEM;
-	}
-
-	/* Assign dense indices and tally in-degree. */
-	{
-		uint32_t i = 0;
-		spa_list_for_each(node, &g->nodes, link) {
-			node->index = i;
-			indegree[i] = 0;
-			i++;
-		}
-	}
-	{
-		uint32_t i = 0;
-		spa_list_for_each(node, &g->nodes, link) {
-			dag_edge_t *e;
-			uint32_t d = 0;
-			spa_list_for_each(e, &node->incoming, dst_link)
-				d++;
-			indegree[i] = d;
-			if (d == 0)
-				queue[tail++] = i;
-			order[i] = node;
-			i++;
-		}
-	}
-
-	while (head < tail) {
-		uint32_t idx = queue[head++];
-		dag_node_t *m = order[idx];
-		dag_edge_t *e;
-		produced++;
-		spa_list_for_each(e, &m->outgoing, src_link) {
-			uint32_t di = e->dst->index;
-			if (indegree[di] > 0 && --indegree[di] == 0)
-				queue[tail++] = di;
-		}
-	}
-
-	free(indegree);
-	free(queue);
-
-	if (produced != n) {
-		free(order);
-		return -EINVAL; /* cycle */
-	}
-
-	/* Re-order `order[]` so positions 0..n-1 follow the dequeue
-	 * sequence. The queue array was indexing-into-order; to expose
-	 * the topological order we walk dequeue order and emit nodes
-	 * accordingly. Simpler: redo with a second pass. */
-	{
-		dag_node_t **topo = calloc(n, sizeof(*topo));
-		uint32_t   *indeg2 = calloc(n, sizeof(*indeg2));
-		uint32_t   *q2 = calloc(n, sizeof(*q2));
-		uint32_t    h = 0, t = 0;
-		uint32_t    out = 0;
-		if (topo == NULL || indeg2 == NULL || q2 == NULL) {
-			free(topo); free(indeg2); free(q2); free(order);
-			return -ENOMEM;
-		}
-		for (uint32_t i = 0; i < n; i++) {
-			dag_edge_t *e;
-			uint32_t d = 0;
-			spa_list_for_each(e, &order[i]->incoming, dst_link)
-				d++;
-			indeg2[i] = d;
-			if (d == 0)
-				q2[t++] = i;
-		}
-		while (h < t) {
-			uint32_t idx = q2[h++];
-			dag_edge_t *e;
-			topo[out++] = order[idx];
-			spa_list_for_each(e, &order[idx]->outgoing, src_link) {
-				uint32_t di = e->dst->index;
-				if (indeg2[di] > 0 && --indeg2[di] == 0)
-					q2[t++] = di;
-			}
-		}
-		free(indeg2);
-		free(q2);
-		free(order);
-		order = topo;
-	}
-
-	/* Refresh the per-node `index` field so it matches the
-	 * topological order positions. dag_compute_local_deadlines
-	 * does not depend on index, so this only matters for callers
-	 * that inspect the field directly. */
-	for (uint32_t i = 0; i < n; i++)
-		order[i]->index = i;
-
-	*out_order = order;
-	*out_count = n;
-	return 0;
-}
-
-bool dag_soft_redistribute_deadlines(dag_t *g,
-		double *out_objective,
-		uint32_t *out_clipped_count)
-{
-	dag_node_t **order = NULL;
-	uint64_t *in_path = NULL;
-	uint64_t *out_path = NULL;
-	uint64_t global_longest = 0;
-	uint32_t clipped = 0;
-	uint32_t n = 0;
-	double objective = 0.0;
-	uint64_t end_to_end;
-	int rc;
-
-	if (out_objective != NULL)
-		*out_objective = 0.0;
-	if (out_clipped_count != NULL)
-		*out_clipped_count = 0;
-	if (g == NULL) {
-		errno = EINVAL;
-		return false;
-	}
-
-	end_to_end = g->deadline != 0 ? g->deadline : g->period;
-	if (end_to_end == 0) {
-		errno = EINVAL;
-		return false;
-	}
-
-	rc = dag_soft_topo_order(g, &order, &n);
-	if (rc < 0) {
-		errno = -rc;
-		return false;
-	}
-
-	in_path  = calloc(n, sizeof(*in_path));
-	out_path = calloc(n, sizeof(*out_path));
-	if (in_path == NULL || out_path == NULL) {
-		free(order); free(in_path); free(out_path);
-		errno = ENOMEM;
-		return false;
-	}
-
-	/* Forward pass: cum_wcet along the heaviest in-path. */
-	for (uint32_t i = 0; i < n; i++) {
-		dag_node_t *node = order[i];
-		uint64_t best_pred = 0;
-		dag_edge_t *e;
-
-		if (node->fictitious) {
-			in_path[i] = 0;
-			continue;
-		}
-		spa_list_for_each(e, &node->incoming, dst_link) {
-			if (e->src->fictitious)
-				continue;
-			if (in_path[e->src->index] > best_pred)
-				best_pred = in_path[e->src->index];
-		}
-		in_path[i] = best_pred + node->wcet;
-	}
-
-	/* Backward pass: rem_wcet along the heaviest out-path. */
-	for (uint32_t i = n; i > 0; i--) {
-		uint32_t idx = i - 1;
-		dag_node_t *node = order[idx];
-		uint64_t best_succ = 0;
-		dag_edge_t *e;
-
-		if (node->fictitious) {
-			out_path[idx] = 0;
-			continue;
-		}
-		spa_list_for_each(e, &node->outgoing, src_link) {
-			if (e->dst->fictitious)
-				continue;
-			if (out_path[e->dst->index] > best_succ)
-				best_succ = out_path[e->dst->index];
-		}
-		out_path[idx] = best_succ + node->wcet;
-	}
-
-	/* Global longest path (through any node). */
-	for (uint32_t i = 0; i < n; i++) {
-		dag_node_t *node = order[i];
-		uint64_t l;
-		if (node->fictitious)
-			continue;
-		l = in_path[i] + out_path[i] - node->wcet;
-		if (l > global_longest)
-			global_longest = l;
-	}
-
-	if (global_longest == 0) {
-		free(order); free(in_path); free(out_path);
-		errno = EINVAL;
-		return false;
-	}
-
-	/* Proportional cumulative deadline assignment. The timing root
-	 * is treated as a source: its cumulative deadline is its own
-	 * WCET-proportional share of the global budget, placed at the
-	 * start of the period (i.e. frac = root.wcet / global_longest
-	 * instead of in_path[i] / global_longest). */
-	for (uint32_t i = 0; i < n; i++) {
-		dag_node_t *node = order[i];
-		double frac;
-		uint64_t cum;
-
-		if (node->fictitious) {
-			node->cumulative_deadline = 0;
-			continue;
-		}
-		if (node->is_timing_root) {
-			frac = (double)node->wcet / (double)global_longest;
-		} else {
-			frac = (double)in_path[i] / (double)global_longest;
-		}
-		if (frac <= 0.0)
-			frac = 0.0;
-		if (frac > 1.0)
-			frac = 1.0;
-		cum = (uint64_t)((double)end_to_end * frac);
-		if (cum == 0)
-			cum = 1; /* keep strictly positive */
-		node->cumulative_deadline = cum;
-		node->deadline_assigned = true;
-	}
-
-	/* Refresh local_deadline directly: dag_compute_local_deadlines
-	 * walks g->indexed_nodes, which may not be built when the soft
-	 * heuristic runs after dag_recalculate has failed. Compute the
-	 * local deadline in place using the topological order we just
-	 * built. The timing root is treated as a source (local equals
-	 * cumulative). */
-	for (uint32_t i = 0; i < n; i++) {
-		dag_node_t *node = order[i];
-		uint64_t max_pred = 0;
-		dag_edge_t *e;
-		bool has_real_pred = false;
-
-		if (node->fictitious) {
-			node->local_deadline = 0;
-			continue;
-		}
-		if (node->is_timing_root) {
-			node->local_deadline = node->cumulative_deadline;
-			if (node->local_deadline > g->period)
-				node->local_deadline = g->period;
-			continue;
-		}
-		spa_list_for_each(e, &node->incoming, dst_link) {
-			if (e->src->fictitious)
-				continue;
-			has_real_pred = true;
-			if (e->src->cumulative_deadline > max_pred)
-				max_pred = e->src->cumulative_deadline;
-		}
-		if (!has_real_pred) {
-			node->local_deadline = node->cumulative_deadline;
-		} else if (node->cumulative_deadline > max_pred) {
-			node->local_deadline = node->cumulative_deadline - max_pred;
-		} else {
-			node->local_deadline = 1; /* monotonicity violation:
-			                            fall back to a token
-			                            value; the apply path
-			                            will catch the clip. */
-		}
-		if (node->local_deadline > g->period)
-			node->local_deadline = g->period;
-	}
-
-	/* Mark clipped nodes and accumulate the risk-objective. */
-	for (uint32_t i = 0; i < n; i++) {
-		dag_node_t *node = order[i];
-		if (node->fictitious)
-			continue;
-		if (node->wcet > node->local_deadline) {
-			node->budget_clipped = true;
-			clipped++;
-			objective += (double)(node->wcet - node->local_deadline) /
-					(double)end_to_end;
-		} else {
-			node->budget_clipped = false;
-		}
-	}
-
-	free(order);
-	free(in_path);
-	free(out_path);
-
-	if (out_clipped_count != NULL)
-		*out_clipped_count = clipped;
-	if (out_objective != NULL)
-		*out_objective = objective;
-
-	if (clipped > 0) {
-		pw_log_warn("HDL-W040-RUNTIME-CLAMPED: "
-				"soft redistribute clipped %u node(s) "
-				"to local_deadline (risk_objective=%.4f); "
-				"those nodes will use scheduled_runtime = "
-				"local_deadline as a degraded reservation",
-				(unsigned)clipped, objective);
-	}
-
-	return true;
-}
-
-bool dag_node_budget_clipped(const dag_t *g, uint32_t id)
-{
-	dag_node_t *n;
-	if (g == NULL)
-		return false;
-	n = dag_find_node((dag_t *)g, id);
-	return n != NULL && n->budget_clipped;
-}
 
 int dag_recalculate(dag_t *g)
 {
@@ -3185,16 +2817,6 @@ int dag_recalculate(dag_t *g)
 		dag_populate_longest_paths(g);
 	}
 
-	/* Feasibility gate. A graph whose critical path alone exceeds
-	 * the global deadline, or whose minimum per-node deadline
-	 * reservation does, will fail with EAGAIN before any
-	 * assignment runs. The DAG stays dirty so the next caller-side
-	 * recalc retries. */
-	if (dag_check_feasibility(g) < 0) {
-		dag_mark_dirty(g);
-		return -1;
-	}
-
 	if (assign_deadlines_iterative(g) < 0) {
 		dag_mark_dirty(g);
 		return -1;
@@ -3219,19 +2841,15 @@ int dag_recalculate(dag_t *g)
 		return -1;
 	}
 
-	if (assign_cpus(g) < 0) {
+	if (assign_cpus_internal(g, true) < 0) {
 		dag_mark_dirty(g);
 		return -1;
 	}
 
-	/* Publish the named predicted / scheduled runtimes for every
-	 * real node. On the hard-mode path both fields take the same
-	 * value (no clamping has happened yet); the soft fallback
-	 * rewrites `scheduled_runtime_ns` for any node it had to clip
-	 * against its assigned local deadline. The predicted value
-	 * honours the iterative recalc's runtime overlay (when set),
-	 * so the operator-facing surface sees the placement-stretched
-	 * estimate that drove the converged split. */
+	/* Publish predicted / scheduled runtimes for every real
+	 * node. Both fields take the same value here; the apply
+	 * layer in module-deadline.c clamps scheduled_runtime_ns
+	 * for nodes whose WCET exceeds their deadline slice. */
 	for (uint32_t i = 0; i < g->indexed_count; i++) {
 		dag_node_t *n = g->indexed_nodes[i];
 		if (n == NULL || n->fictitious)
@@ -3252,145 +2870,6 @@ int dag_recalculate(dag_t *g)
 	return 0;
 }
 
-/* Soft-mode counterpart of dag_recalculate.
- *
- * When the strict hard-mode pipeline fails because the critical path
- * alone exceeds the slowest-CPU-scaled deadline (or the minimum
- * per-node reservation does), every downstream caller used to fall
- * back to dag_foreach_node(state_dag, ...) which itself triggers the
- * same dag_check_feasibility gate and also fails -- so no node gets
- * any SCHED_DEADLINE parameters and the "hard realtime dropped"
- * transition is observationally a no-op.
- *
- * This variant produces a kernel-valid (runtime, deadline, period,
- * cpu) tuple for every real node by:
- *
- *   1. Reusing the same analysis prep as dag_recalculate (indexed
- *      nodes, successors, unrelated sets, fictitious endpoints,
- *      longest paths). Identical inputs, identical caches.
- *   2. Skipping dag_check_feasibility: the soft fallback's whole
- *      point is to keep going when the strict gate refuses.
- *   3. Running dag_soft_redistribute_deadlines instead of the
- *      assign_deadlines_iterative / dag_assign_cumulative_deadlines /
- *      dag_compute_local_deadlines chain. The redistribution sets
- *      cumulative_deadline, local_deadline, deadline_assigned and
- *      budget_clipped per node; it never fails on a non-degenerate
- *      DAG with a positive end-to-end deadline.
- *   4. Mirroring local_deadline to the legacy `deadline` field so
- *      assign_cpus's utilisation arithmetic has a valid denominator
- *      (the placer uses min(deadline, period)).
- *   5. Calling assign_cpus_internal(g, true): the relaxed worst-fit
- *      that picks the least-projected CPU even when no CPU passes
- *      the admission ceiling.
- *
- * Returns 0 on success (g->dirty cleared), -1 on any of the
- * structural failures (cycle in the DAG, OOM, empty graph). On
- * failure g is left dirty so a future caller can retry the strict
- * pipeline.
- *
- * The function does not attempt to detect that strict feasibility
- * has been restored -- the reconcile layer keeps calling
- * dag_recalculate first and only falls back here on EAGAIN, so the
- * promotion path remains the strict one and the hysteresis-driven
- * SOFT_DEGRADED -> HARD transition fires from the existing
- * post-recalc classification block.
- */
-int dag_recalculate_soft(dag_t *g)
-{
-	int ret;
-	bool analysis_cached;
-
-	if (!g) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (spa_list_is_empty(&g->nodes)) {
-		dag_invalidate_analysis(g);
-		g->dirty = false;
-		return 0;
-	}
-
-	dag_invalidate_schedule(g);
-
-	analysis_cached = (g->indexed_nodes != NULL);
-
-	if (!analysis_cached) {
-		dag_node_t **sources, **sinks;
-		uint32_t nsources, nsinks;
-		find_sources_and_sinks(g, &sources, &nsources, &sinks, &nsinks);
-
-		if (nsources == 0 || nsinks == 0) {
-			free(sources);
-			free(sinks);
-			dag_mark_dirty(g);
-			errno = EINVAL;
-			return -1;
-		}
-
-		ret = dag_build_analysis(g, sources, nsources, sinks, nsinks);
-		free(sources);
-		free(sinks);
-		if (ret != 0) {
-			dag_mark_dirty(g);
-			return -1;
-		}
-	} else {
-		dag_populate_longest_paths(g);
-	}
-
-	{
-		double obj = 0.0;
-		uint32_t clipped = 0;
-		if (!dag_soft_redistribute_deadlines(g, &obj, &clipped)) {
-			dag_mark_dirty(g);
-			return -1;
-		}
-	}
-
-	/* assign_cpus reads min(deadline, period) as the per-node
-	 * denominator. dag_soft_redistribute_deadlines only populates
-	 * cumulative_deadline and local_deadline; copy the latter into
-	 * the legacy field so the placer's utilisation arithmetic
-	 * matches the hard-mode contract. */
-	{
-		dag_node_t *n;
-		spa_list_for_each(n, &g->nodes, link) {
-			if (!n->fictitious)
-				n->deadline = n->local_deadline;
-		}
-	}
-
-	if (assign_cpus_internal(g, true) < 0) {
-		dag_mark_dirty(g);
-		return -1;
-	}
-
-	/* Publish predicted vs scheduled runtimes for the soft path.
-	 * `predicted` is the analysis-layer estimate (wcet, or the
-	 * overlay value if one was installed for the iterative
-	 * recalc); `scheduled` is the kernel-facing value, which on a
-	 * budget-clipped node is the assigned local_deadline (the
-	 * clamp the soft path imposed) and otherwise equals predicted.
-	 * Operator diagnostics can compare the two to see how badly
-	 * the soft mode had to degrade the reservation. */
-	for (uint32_t i = 0; i < g->indexed_count; i++) {
-		dag_node_t *n = g->indexed_nodes[i];
-		if (n == NULL || n->fictitious)
-			continue;
-		uint64_t r = node_runtime_value(g, n);
-		n->predicted_runtime_ns = r;
-		if (n->budget_clipped && n->local_deadline > 0 &&
-				n->local_deadline < r) {
-			n->scheduled_runtime_ns = n->local_deadline;
-		} else {
-			n->scheduled_runtime_ns = r;
-		}
-	}
-
-	g->dirty = false;
-	return 0;
-}
 
 int dag_foreach_node(dag_t *g, dag_node_callback_t cb, void *data)
 {

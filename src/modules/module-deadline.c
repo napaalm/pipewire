@@ -461,6 +461,7 @@ struct node {
 	 * BOOTSTRAP -> VALID/SHIFT flips it positive and the next
 	 * reconcile pass admits the follower. */
 	uint64_t wcet;
+	uint64_t peak_runtime_ns;
 	uint64_t period;
 
 	/* Decremented in apply_sample; while > 0 the incoming sample is
@@ -760,6 +761,12 @@ struct impl {
 		DEADLINE_ON_INFEASIBLE_APPLY_DEGRADED,
 		DEADLINE_ON_INFEASIBLE_REJECT_NEW_GRAPH,
 	}                     on_infeasible;
+
+	/* Hard mode: CBS throttling is disabled (runtime = deadline for
+	 * every node) and the peak observed runtime replaces the
+	 * conformal estimator for deadline splitting.  Opt-in via
+	 * deadline.hard-mode = true.  Time isolation is NOT enforced. */
+	bool                  hard_mode;
 
 	/* Async worker. Created at init when deadline policy is available;
 	 * NULL when sync_mode is true. */
@@ -1287,33 +1294,27 @@ static void apply_sched_groups(struct impl *impl, struct node *drv)
 			continue;
 		}
 
-		/* Soft-degraded throttling cap. When the analysis
-		 * publishes a tuple with runtime > deadline (typically a
-		 * follower whose measured WCET overshot its splitter
-		 * slice), the kernel would reject the syscall. Rather
-		 * than silently skipping -- which leaves the previous
-		 * params in place and provides no soft redistribution
-		 * floor -- ship the smallest valid value: a runtime of
-		 * 95 % of the local deadline. The follower then runs on
-		 * CBS but at a budget below its observed demand, so it
-		 * may be throttled and miss deadlines. This is exactly
-		 * the operator-visible "throttling risk is expected"
-		 * behaviour the soft objective calls for. The
-		 * any_failure flag below routes the mode through
-		 * reconcile_state_force_soft so the snapshot reflects
-		 * that the hard claim is no longer valid. */
+		/* Hard mode: CBS throttling disabled.  Every node
+		 * gets runtime = deadline so the CBS budget equals
+		 * the full deadline slice.  A node that exceeds its
+		 * slice gets a deadline push (fresh budget, later
+		 * absolute deadline) instead of being throttled. */
+		if (impl->hard_mode) {
+			g->sum_runtime = kernel_deadline;
+		}
+
+		/* Per-node runtime clamp.  When a node's WCET
+		 * exceeds its proportional deadline slice, clamp
+		 * runtime = deadline -- the maximum valid CBS budget.
+		 * Only the offending node is affected; peers keep
+		 * their original budgets. */
 		if (g->sum_runtime > kernel_deadline) {
-			uint64_t capped = (uint64_t)((double)kernel_deadline
-					* 0.95);
-			if (capped == 0)
-				capped = 1;
-			pw_log_warn("sched: throttling tid=%d "
+			pw_log_info("sched: clamping tid=%d "
 				"runtime %" PRIu64 " -> %" PRIu64
-				" to fit deadline %" PRIu64 " (soft cap)",
-				(int)g->tid, g->sum_runtime, capped,
+				" (= deadline)",
+				(int)g->tid, g->sum_runtime,
 				kernel_deadline);
-			g->sum_runtime = capped;
-			any_failure = true;
+			g->sum_runtime = kernel_deadline;
 		}
 
 		/* Driver-aware lookup: a sched group whose leader_id resolves
@@ -2050,7 +2051,11 @@ static void apply_sample(struct impl *impl, struct node *n,
 			rt_conformal_table_invalidate_all(n->conformal_table,
 					RT_CONF_INVALIDATED_PERIOD);
 		n->wcet = 0;
+		n->peak_runtime_ns = 0;
 	}
+
+	if (runtime > n->peak_runtime_ns)
+		n->peak_runtime_ns = runtime;
 
 	/* Lazy-init the adaptive-conformal estimator with the module's
 	 * configured knobs. The estimator runs unconditionally so the
@@ -3524,21 +3529,6 @@ static int populate_params_snapshot(struct impl *impl,
 				rt_conformal_last_invalidation_reason(c);
 		}
 
-		/*
-		 * Soft-mode budget_clipped / risk_objective_value
-		 * surfacing. The flag lives on the dag_node after
-		 * dag_soft_redistribute_deadlines; queried by id via
-		 * the reconcile state so we do not need to thread the
-		 * pointer through the snapshot path. The graph-level
-		 * objective is mirrored on every follower for parser
-		 * convenience -- the same number on every node in a
-		 * given snapshot.
-		 */
-		pn.budget_clipped = reconcile_state_node_budget_clipped(
-				drv->reconcile, n_iter->info.id);
-		pn.risk_objective_value =
-			reconcile_state_risk_objective(drv->reconcile);
-
 		r = rt_diag_params_snapshot_add_node(snap, &pn);
 		if (r < 0)
 			return r;
@@ -3624,6 +3614,7 @@ static void dump_combined_json_main(struct impl *impl, struct node *drv)
 		reconcile_state_feasibility(drv->reconcile, &feas);
 		c.mode = (feas.mode == RECONCILE_MODE_HARD)
 			? "hard" : "soft_degraded";
+		c.hard_mode = impl->hard_mode;
 		if (feas.density_passed)
 			c.feasibility_method = "density";
 		else if (feas.dbf_passed)
@@ -4026,7 +4017,11 @@ static void worker_apply_dag(struct impl *impl, struct node *drv)
 		 * entry whichever it is. */
 		struct node *n = find_node_any_by_id(impl,
 				t->nodes[i].id);
-		uint64_t w = n ? n->wcet : 0;
+		uint64_t w;
+		if (impl->hard_mode)
+			w = n ? n->peak_runtime_ns : 0;
+		else
+			w = n ? n->wcet : 0;
 		if (w == 0)
 			continue;
 		followers[admitted_count].id = t->nodes[i].id;
@@ -5008,6 +5003,19 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 					"reject-new-graph)", s);
 		}
 	}
+
+	impl->hard_mode = pw_properties_get_bool(props,
+			"deadline.hard-mode", false);
+	if (impl->hard_mode)
+		pw_log_warn("HDL-W001-HARD-MODE: hard mode is ENABLED.  CBS "
+			"throttling is DISABLED (runtime = deadline for every "
+			"node); WCET (peak observed runtime) replaces the "
+			"conformal estimator for deadline splitting.  Time "
+			"isolation between audio processing nodes is NOT "
+			"enforced -- a slow node may delay all lower-priority "
+			"peers on the same CPU.  This mode trades determinism "
+			"and isolation for maximum throughput and minimum "
+			"xruns.");
 
 	impl->driver_schedule = pw_properties_get_bool(props,
 			"driver.schedule", false);

@@ -862,15 +862,11 @@ static void json_write_params_section(FILE *out, const struct rt_diag_params_sna
 			diag_fprintf_double(out, 6, n->conformal_last_score);
 			fprintf(out,
 				",\"last_budget_ns\":%llu,"
-				"\"last_invalidation_reason\":\"%s\"},"
-				"\"budget_clipped\":%s,"
-				"\"risk_objective_value\":",
+				"\"last_invalidation_reason\":\"%s\"}",
 				(unsigned long long)n->conformal_last_budget_ns,
 				rt_conformal_invalidation_reason_name(
 					(enum rt_conformal_invalidation_reason)
-					n->conformal_last_invalidation_reason),
-				n->budget_clipped ? "true" : "false");
-			diag_fprintf_double(out, 6, n->risk_objective_value);
+					n->conformal_last_invalidation_reason));
 			/*
 			 * Predicted vs scheduled runtime split (commit
 			 * ce117a0d2 added the struct fields; this is the
@@ -919,6 +915,7 @@ void rt_diag_render_json(const struct rt_diag_combined *c, FILE *out)
 		(unsigned long long)c->deadline_ns);
 	fputs("\"mode\":", out);
 	json_write_escaped(out, mode);
+	fprintf(out, ",\"hard_mode\":%s", c->hard_mode ? "true" : "false");
 	fputs(",\"feasibility\":{\"method\":", out);
 	json_write_escaped(out, feas_method);
 	fputs(",\"status\":", out);
